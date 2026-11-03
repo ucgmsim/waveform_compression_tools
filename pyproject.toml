@@ -1,0 +1,105 @@
+[build-system]
+requires = ["setuptools", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "waveform_compression_tools"
+description = "Store float32 waveforms as FLAC, one stream per trace, and check them"
+authors = [{ name = "ucgmsim" }]
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dynamic = ["version"]
+dependencies = [
+  "numpy",
+  "xarray",
+  "h5py",
+  "h5netcdf",
+  "pyflac==3.0.0",
+  "typer",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "hypothesis[numpy]", "pytest-cov"]
+dev = ["ruff", "deptry", "ty"]
+
+[project.scripts]
+waveform-compression-tools = "waveform_compression_tools.cli:app"
+
+[tool.deptry]
+pep621_dev_dependency_groups = ["test", "dev"]
+
+# h5netcdf is used only through xarray's `engine` argument.
+[tool.deptry.per_rule_ignores]
+DEP002 = ["h5netcdf"]
+
+[tool.setuptools_scm]
+
+[tool.setuptools]
+packages = ["waveform_compression_tools"]
+
+[tool.ruff.lint]
+extend-select = [
+  # isort imports
+  "I",
+  # Use r'\s+' rather than '\s+'
+  "W605",
+  # All the naming errors, like using camel case for function names.
+  "N",
+  # Missing docstrings in classes, methods, and functions
+  "D101",
+  "D102",
+  "D103",
+  "D105",
+  "D107",
+  # Use f-string instead of a format call
+  "UP032",
+  # Standard library import is deprecated
+  "UP035",
+  # Missing function argument type-annotation
+  "ANN001",
+  # Using except without specifying an exception type to catch
+  "BLE001",
+]
+ignore = ["D104"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.isort]
+known-first-party = ["waveform_compression_tools"]
+
+[tool.ruff.lint.per-file-ignores]
+# Ignore no docstring in __init__.py
+"__init__.py" = ["D104"]
+# Ignore docstring errors in tests folder
+"tests/**.py" = ["D"]
+"**/test*.py" = ["D"]
+
+[tool.npdlint]
+include = ["waveform_compression_tools"]
+extend-exclude = ["**/__init__.py"]
+
+[tool.numpydoc_validation]
+checks = [
+  "GL05",
+  "GL08",
+  "GL10",
+  "PR01",
+  "PR02",
+  "PR03",
+  "PR04",
+  "PR05",
+  "PR06",
+  "PR07",
+  "RT01",
+  "RT02",
+  "RT03",
+  "RT04",
+  "YD01",
+]
+# remember to use single quotes for regex in TOML
+exclude = [ # don't report on objects that match any of these regex
+  '\.undocumented_method$',
+  '\.__repr__$',
+]

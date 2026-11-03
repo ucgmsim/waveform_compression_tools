@@ -1,0 +1,150 @@
+from collections.abc import Callable
+
+import numpy as np
+import pytest
+import xarray as xr
+
+from waveform_compression_tools.codec import (
+    STANDARD_DIMS,
+    NotStandardLayout,
+    check_standard,
+    decode_block,
+    encode_block,
+    max_relative_error,
+    within_one_step,
+)
+
+# Total FLAC bytes for each kit file and setting, as measured with an independent
+# implementation of this encoder (level 5, float64 gains).
+KIT_FLAC_BYTES = {
+    "A.lf": {32: 722_764, 24: 276_475, 17: 162_256},
+    "A.hf": {32: 881_307, 24: 514_114, 17: 253_797},
+    "A.bb": {32: 1_264_501, 24: 615_835, 17: 297_263},
+    "D.lf": {32: 5_809_568, 24: 2_165_814, 17: 988_995},
+    "J.bbbin_275MB": {32: 1_141_390, 24: 608_484, 17: 284_822},
+}
+
+# The largest error over the peak that each setting can report: one step, which is
+# 1 / full_scale(bits) of the peak, rounded up.
+RELATIVE_ERROR_LIMIT = {32: 4.7e-10, 24: 1.2e-7, 17: 1.6e-5}
+
+
+def pack(
+    streams: list[bytes], shape: tuple[int, int]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Lay the streams end to end; return the bytes and each stream's start and size."""
+    nbytes = np.array([len(s) for s in streams], dtype=np.int64)
+    starts = np.cumsum(nbytes) - nbytes
+    compressed = np.frombuffer(b"".join(streams), dtype=np.uint8)
+    return compressed, starts.reshape(shape), nbytes.reshape(shape)
+
+
+def round_trip(w: np.ndarray, bits: int) -> np.ndarray:
+    """Encode a block, lay its streams end to end, and decode it."""
+    block = encode_block(w, bits)
+    compressed, starts, nbytes = pack(block.streams, block.gains.shape)
+    offsets = np.zeros_like(block.gains)
+    return decode_block(compressed, starts, nbytes, block.gains, offsets, w.shape[2])
+
+
+def random_walks(shape: tuple[int, int, int], seed: int = 0) -> np.ndarray:
+    """Return float32 traces that wander like seismograms, each on its own scale."""
+    rng = np.random.default_rng(seed)
+    walks = np.cumsum(rng.normal(size=shape), axis=2)
+    scales = 10.0 ** rng.uniform(-3, 2, shape[:2])
+    return (walks * scales[..., None]).astype(np.float32)
+
+
+@pytest.mark.parametrize("name", KIT_FLAC_BYTES)
+@pytest.mark.parametrize("bits", [32, 24, 17])
+def test_kit_sizes_match_the_reference(
+    kit: Callable[[str], np.ndarray], name: str, bits: int
+) -> None:
+    block = encode_block(kit(name), bits)
+    assert sum(map(len, block.streams)) == pytest.approx(
+        KIT_FLAC_BYTES[name][bits], rel=0.01
+    )
+
+
+@pytest.mark.parametrize("bits", [32, 24, 17])
+def test_kit_round_trip_within_one_step(
+    kit: Callable[[str], np.ndarray], bits: int
+) -> None:
+    w = kit("A.bb")
+    back = round_trip(w, bits)
+    assert within_one_step(w, back, encode_block(w, bits).gains)
+    assert max_relative_error(w, back).max() <= RELATIVE_ERROR_LIMIT[bits]
+
+
+@pytest.mark.parametrize(
+    "ds",
+    [
+        xr.Dataset(
+            {
+                "waveform": (
+                    ("station", "component", "time"),
+                    np.zeros((2, 3, 4), np.float32),
+                )
+            }
+        ),
+        xr.Dataset({"waveform": (STANDARD_DIMS, np.zeros((3, 2, 4), np.float64))}),
+        xr.Dataset({"other": (STANDARD_DIMS, np.zeros((3, 2, 4), np.float32))}),
+    ],
+)
+def test_check_standard_refuses(ds: xr.Dataset) -> None:
+    with pytest.raises(NotStandardLayout):
+        check_standard(ds)
+
+
+# The tests below pin behaviour that the tests above leave open.
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+def test_block_with_a_non_finite_sample_is_refused(bad: float) -> None:
+    w = random_walks((3, 2, 100))
+    w[2, 1, 50] = bad
+    with pytest.raises(ValueError, match="non-finite"):
+        encode_block(w)
+
+
+@pytest.mark.parametrize("bits", [32, 24, 17])
+@pytest.mark.parametrize("nt", [1, 2, 4095, 4096, 4097, 10_001, 147_499])
+def test_round_trip_at_any_length_within_one_step(bits: int, nt: int) -> None:
+    # Long traces make streams over 8 KiB, which libFLAC's wrapper refuses if it is
+    # handed a numpy slice instead of bytes.
+    w = random_walks((3, 2, nt), seed=nt)
+    back = round_trip(w, bits)
+    assert back.dtype == np.float32 and back.shape == w.shape
+    assert within_one_step(w, back, encode_block(w, bits).gains)
+    assert max_relative_error(w, back).max() <= RELATIVE_ERROR_LIMIT[bits]
+
+
+def flip_a_byte(stream: bytes) -> bytes:
+    damaged = bytearray(stream)
+    damaged[len(damaged) // 2] ^= 0xFF
+    return bytes(damaged)
+
+
+@pytest.mark.parametrize("off", [1.0, -0.5, 1e-30])
+def test_a_trace_of_zeros_has_to_come_back_as_exact_zeros(off: float) -> None:
+    # A trace of zeros has a gain of 1, so one step would let it decode to anything
+    # within 1 of zero.
+    original = random_walks((3, 2, 50))
+    original[:, 0] = 0.0
+    gains = encode_block(original).gains
+    assert np.all(gains[:, 0] == 1) and within_one_step(original, original, gains)
+    decoded = original.copy()
+    decoded[1, 0, 25] = off
+    assert not within_one_step(original, decoded, gains)
+
+
+@pytest.mark.parametrize("bad", [0.0, -2.0, np.inf, -np.inf, np.nan])
+def test_within_one_step_fails_with_a_gain_that_is_not_finite_and_positive(
+    bad: float,
+) -> None:
+    # Even a perfect decode fails: no right gain is zero, negative or infinite, and a
+    # zero gain would make a step infinitely long.
+    original = random_walks((3, 2, 50))
+    gains = encode_block(original).gains.copy()
+    gains[2, 1] = bad
+    assert not within_one_step(original, original.copy(), gains)
