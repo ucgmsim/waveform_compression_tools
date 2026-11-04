@@ -17,12 +17,14 @@ that Typer refuses; and `EXIT_REFUSED` for an input that can't be used as it is 
 `waveform_compression_tools.errors.Refused`). A command that succeeds prints a summary
 to standard output. One that fails or refuses prints exactly one line to standard
 error, ``waveform-compression-tools: <path>: <reason>``, where the path names the file
-the problem is about, and leaves nothing at its destination; only a compressed file
-whose record can't be written stays. A file already at a destination is replaced only
+the problem is about and the reason doesn't name it again at its start, and leaves
+nothing at its destination; only a compressed file whose record can't be written
+stays. A file already at a destination, compress's record included, is replaced only
 with ``--overwrite``.
 """
 
 import logging
+import os
 import time
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager
@@ -59,17 +61,29 @@ _EXPECTED = (OSError, ValueError, CheckFailed)
 # libFLAC's errors as it encodes a trace.
 _ENCODING = (pyflac.EncoderInitException, pyflac.EncoderProcessException)
 
-# pyflac logs each error libFLAC reports while decoding, and the exception that follows
-# says it again. A command says what went wrong in its one line, so the log goes nowhere.
-logging.getLogger("pyflac").addHandler(logging.NullHandler())
-logging.getLogger("pyflac").propagate = False
-
 # Plain help and error text: the paragraphs of a command's help are reflowed, and the
 # output is the same whether or not Rich is installed.
 app = typer.Typer(
     help="Store float32 waveforms as FLAC, one stream per trace, and check them.",
     rich_markup_mode=None,
 )
+
+
+@app.callback()
+def _quiet_pyflac() -> None:
+    """Send pyflac's log nowhere, before any command runs.
+
+    pyflac logs each error that libFLAC reports while it decodes, and the exception that
+    follows says it again. A command says what went wrong in its one line. This is done
+    when the app runs, not when this module is imported, so that a program that only
+    imports it keeps its logging as it was.
+    """
+    log = logging.getLogger("pyflac")
+    # A handler of its own, so that Python's last-resort handler doesn't print a record
+    # that no other handler sees.
+    if not any(isinstance(handler, logging.NullHandler) for handler in log.handlers):
+        log.addHandler(logging.NullHandler())
+    log.propagate = False
 
 
 def _reason(error: Exception) -> str:
@@ -100,6 +114,9 @@ def _reason(error: Exception) -> str:
 def _say(path: Path, reason: str) -> None:
     """Print a command's one error line to standard error.
 
+    The line names the file once: a reason that starts with ``"<path>: "`` or
+    ``"<path> "``, as many of this package's messages do, loses that start.
+
     Parameters
     ----------
     path : Path
@@ -107,6 +124,10 @@ def _say(path: Path, reason: str) -> None:
     reason : str
         What went wrong.
     """
+    for start in (f"{path}: ", f"{path} "):
+        if reason.startswith(start) and len(reason) > len(start):
+            reason = reason[len(start) :]
+            break
     line = f"{_PROGRAM}: {path}: {reason}"
     # A message of several lines, as some of xarray's are, is joined into one.
     typer.echo(" ".join(line.splitlines()), err=True)
@@ -161,6 +182,8 @@ def _about(
 ) -> Generator[None]:
     """Turn any error in a block into a `_Stop` that names the file it is about.
 
+    An `OSError` that says which file it is about names that file instead.
+
     Parameters
     ----------
     path : Path
@@ -188,6 +211,10 @@ def _about(
             if isinstance(error, kinds):
                 path = other
                 break
+        if isinstance(error, OSError) and isinstance(
+            error.filename, str | bytes | os.PathLike
+        ):
+            path = Path(os.fsdecode(error.filename))
         raise _Stop(path, error) from error
 
 
@@ -464,12 +491,15 @@ def compress(
             metavar="PATH",
             dir_okay=False,
             help="Write a JSON record of the run to PATH, whatever its outcome. A "
-            "record already there is replaced.",
+            "file already there is replaced only with --overwrite.",
         ),
     ] = None,
     overwrite: Annotated[
         bool,
-        typer.Option("--overwrite", help="Replace a file already at DST."),
+        typer.Option(
+            "--overwrite",
+            help="Replace a file already at DST, or at the record's PATH.",
+        ),
     ] = False,
 ) -> None:
     """Compress a netCDF file of waveforms to FLAC, and check it.
@@ -487,11 +517,14 @@ def compress(
 
     The compressed file is checked as it is written, against the samples read, unless
     --no-check is given. It appears at DST only when it is complete, and has passed
-    the check if one is made. A file already at DST is replaced only with --overwrite.
+    the check if one is made. A file already at DST, or at the record's PATH, is
+    replaced only with --overwrite.
 
     With --record, a JSON record of the run is written to PATH whether the file is
     compressed, refused or fails: the input's and the output's paths, sizes and content
-    hashes, the setting, the check's largest error, and the time spent. If the record
+    hashes, the setting, the check's largest error, and the time spent. A file already
+    at PATH is refused first, before the input is read, unless --overwrite is given;
+    that refusal writes no record, so the earlier one stays as it was. If the record
     can't be written, the run fails, though a compressed file stays at DST.
 
     The command exits with status 0 when the file is compressed, 1 when the run fails,
@@ -513,17 +546,25 @@ def compress(
     record : Path, optional
         Where to write the record of the run.
     overwrite : bool, default False
-        Whether to replace a file already at `dst`.
+        Whether to replace a file already at `dst`, or at `record`.
 
     Raises
     ------
     typer.Exit
-        With `EXIT_REFUSED` if the file is refused, and `EXIT_FAILED` if the run fails
-        or the record can't be written.
+        With `EXIT_REFUSED` if the file, or a file already at `record`, is refused,
+        and `EXIT_FAILED` if the run fails or the record can't be written.
     """
     start = time.perf_counter()
     if record is not None:
         _refuse_a_record_over(record, src, dst)
+        # The record is a destination too, checked before the input is read. Refusing it
+        # writes no record, so an earlier one, which may say that DST is complete, stays
+        # as it was.
+        try:
+            with _about(record):
+                destinations.refuse_overwriting(src, record, overwrite)
+        except _Stop as stop:
+            stop.exit()
     seconds = {"hash": 0.0, "compress": 0.0, "check": 0.0}
     input_hash: str | None = None
     result: files.CompressResult | None = None

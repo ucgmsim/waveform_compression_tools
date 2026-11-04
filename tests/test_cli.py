@@ -3,6 +3,8 @@ import json
 import logging
 import logging.handlers
 import struct
+import subprocess
+import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -15,7 +17,7 @@ import pytest
 import xarray as xr
 from typer.testing import CliRunner, Result
 
-from waveform_compression_tools import cli, files
+from waveform_compression_tools import bbbin, cli, files
 from waveform_compression_tools.bbbin import read_bbbin
 from waveform_compression_tools.cli import (
     EXIT_FAILED,
@@ -82,8 +84,9 @@ def assert_exit(result: Result, status: int) -> None:
 
 def assert_stopped(result: Result, status: int, path: Path) -> str:
     # A refusal or a failure: its status, and exactly one line on stderr in the published
-    # form, naming the file the problem is about, with nothing on stdout. Returns the
-    # reason the line gives.
+    # form, naming the file the problem is about, with nothing on stdout. The reason
+    # doesn't name that file again at its start, as some of the library's messages do.
+    # Returns the reason the line gives.
     assert_exit(result, status)
     lines = result.stderr.splitlines()
     assert len(lines) == 1 and result.stderr == f"{lines[0]}\n", result.stderr
@@ -92,6 +95,7 @@ def assert_stopped(result: Result, status: int, path: Path) -> str:
     assert result.stdout == ""
     reason = lines[0].removeprefix(prefix)
     assert reason.strip() != ""
+    assert not reason.startswith((f"{path}: ", f"{path} ")), result.stderr
     return reason
 
 
@@ -280,6 +284,7 @@ def test_compress_ok_writes_a_record(
 REFUSALS = {
     "the same path": ("dst", False, "overwrite"),  # SameFile
     "the output exists": ("dst", False, "exists"),  # OutputExists
+    "a text file": ("src", False, "isn't an HDF5 file"),  # NotStandardLayout
     "already compressed": ("src", False, "compressed already"),  # AlreadyCompressed
     "an HDF5 group": ("src", False, "groups"),  # HasGroups
     "a float64 waveform": ("src", False, "float32"),  # NotStandardLayout
@@ -318,6 +323,9 @@ def refused_input(
         dst.write_bytes(b"an earlier file")
     elif case == "the same path":
         dst = src
+    elif case == "a text file":
+        src = folder / "notes.nc"
+        src.write_text("station,pga\nS000000,0.12\n")
     return src, dst
 
 
@@ -335,8 +343,14 @@ def test_each_refusal_exits_3_with_one_line_and_a_record(
     # Nothing is written but the record: the input, and a file already at the
     # destination, are as they were, and no partial file is left.
     assert contents(tmp_path) == {**before, "rec.json": rec.read_bytes()}
+    # The record keeps the library's whole message, which names its file.
     record = read_record(rec)
-    assert (record["status"], record["reason"]) == ("refused", reason)
+    assert record["status"] == "refused" and record["reason"].endswith(reason)
+    if case == "already compressed":
+        # That message, "SRC is compressed already", leads with the file, which the
+        # line names only once.
+        assert result.stderr.count(str(src)) == 1
+        assert record["reason"] == f"{src} {reason}"
     assert record["input"] == {
         "path": str(src),
         "bytes": src.stat().st_size,
@@ -523,10 +537,13 @@ def test_bits_out_of_range_is_a_usage_error(
 # failures are the damage table's and the failed write's.
 SAME_CODES = [
     ("decompress", "a file that isn't compressed", 0, "not compressed"),
+    ("decompress", "a text file", 0, "isn't an HDF5 file, so it is not compressed"),
     ("decompress", "an unknown format version", 0, "format version 2"),
     ("verify", "a file that isn't compressed", 1, "not compressed"),
+    ("verify", "a text file", 1, "isn't an HDF5 file, so it is not compressed"),
     ("verify", "an unknown setting", 1, "bits must be from 8 to 32"),
     ("verify", "an original that isn't in the standard layout", 0, "float32"),
+    ("verify", "an original that is a text file", 0, "isn't an HDF5 file"),
     ("convert-bbbin", "a file that isn't a BB.bin", 0, "not a BB.bin file"),
     ("convert-bbbin", "text that isn't ASCII", 0, "ASCII"),
 ]
@@ -549,8 +566,14 @@ def test_decompress_verify_and_convert_use_the_same_codes(
             f[GROUP].attrs["format_version"] = 2
         elif case == "an unknown setting":
             f[GROUP].attrs["bits"] = 33
+    text = tmp_path / "notes.nc"
+    text.write_text("station,pga\nS000000,0.12\n")
     if case == "a file that isn't compressed":
         packed = original
+    elif case == "a text file":
+        packed = text
+    elif case == "an original that is a text file":
+        original = text
     elif case == "an original that isn't in the standard layout":
         ds = standard_dataset(3, nt=100)
         ds["waveform"] = ds["waveform"].astype(np.float64)
@@ -573,20 +596,43 @@ def test_decompress_verify_and_convert_use_the_same_codes(
     assert contents(tmp_path) == before  # Nothing is written.
 
 
-@pytest.mark.parametrize("command", ["compress", "decompress", "convert-bbbin"])
+@pytest.mark.parametrize(
+    ("command", "earlier"),
+    [
+        ("compress", "DST"),
+        ("decompress", "DST"),
+        ("convert-bbbin", "DST"),
+        ("compress", "a record"),
+        ("compress", "a finished run"),
+    ],
+)
 def test_overwrite_replaces_an_existing_destination(
-    tmp_path: Path, standard_dataset: StandardDataset, command: str
+    tmp_path: Path, standard_dataset: StandardDataset, command: str, earlier: str
 ) -> None:
+    # A file already at the destination, or at compress's record, is replaced only if
+    # asked. The record is checked first, before the input is read, so a rerun of a
+    # finished file that isn't asked to replace them leaves its "ok" record as it was,
+    # rather than writing a "refused" one over it.
     src = an_input(command, tmp_path, standard_dataset)
-    dst = tmp_path / "out.nc"
-    dst.write_bytes(b"an earlier file")
+    dst, rec = tmp_path / "out.nc", tmp_path / "rec.json"
+    args: list[str | Path] = [command, src, dst]
+    if earlier != "DST":
+        args += ["--record", rec]
+    if earlier == "DST":
+        dst.write_bytes(b"an earlier file")
+    elif earlier == "a record":
+        rec.write_bytes(b"an earlier record")
+    else:
+        assert_exit(run(*args), EXIT_OK)
     before = contents(tmp_path)
-    reason = assert_stopped(run(command, src, dst), EXIT_REFUSED, dst)
-    assert "exists" in reason
-    assert contents(tmp_path) == before
-    assert_exit(run(command, src, dst, "--overwrite"), EXIT_OK)
-    assert not partial_of(dst).exists()
+    named = dst if earlier == "DST" else rec
+    assert "exists" in assert_stopped(run(*args), EXIT_REFUSED, named)
+    assert contents(tmp_path) == before  # Nothing is written, not even a record.
+    assert_exit(run(*args, "--overwrite"), EXIT_OK)
+    assert not partial_of(dst).exists() and not partial_of(rec).exists()
     assert_complete(command, src, dst)
+    if earlier != "DST":
+        assert read_record(rec)["status"] == "ok"
 
 
 def test_decompress_gives_back_the_standard_layout(
@@ -734,6 +780,43 @@ def test_a_failed_write_leaves_no_partial_file_and_keeps_the_old_one(
         assert shown in assert_stopped(result, EXIT_FAILED, named)
         assert command != "compress" or read_record(rec)["status"] == "failed"
     assert dst.read_bytes() == b"an earlier file" and not partial_of(dst).exists()
+
+
+def test_an_os_error_names_the_file_it_is_about(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An OSError that says which file it is about names that file, whatever step raised
+    # it: here, reading the BB.bin fails inside convert-bbbin, whose other failures are
+    # its output's.
+    src, dst = tmp_path / "BB.bin", tmp_path / "BB.nc"
+    write_bbbin(src, ["S000000", "S000001"], nt=20)
+
+    def fail_to_read(path: Path) -> xr.Dataset:
+        raise OSError(errno.EIO, "Input/output error", str(path))
+
+    monkeypatch.setattr(bbbin, "read_bbbin", fail_to_read)
+    reason = assert_stopped(run("convert-bbbin", src, dst), EXIT_FAILED, src)
+    assert "Input/output error" in reason
+    assert [p.name for p in tmp_path.iterdir()] == ["BB.bin"]
+
+
+def test_importing_the_command_line_leaves_logging_alone() -> None:
+    # pyflac's logger is quietened when a command runs, not when cli.py is imported, so
+    # a program that only imports it keeps its logging as it was. This needs a fresh
+    # interpreter, started as this one was so that it imports the same package.
+    code = (
+        "import logging, waveform_compression_tools.cli; "
+        "log = logging.getLogger('pyflac'); "
+        "assert log.propagate and not log.handlers, (log.propagate, log.handlers)"
+    )
+    flags = ["-S"] if sys.flags.no_site else []
+    imported = subprocess.run(
+        [sys.executable, *flags, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,  # The child's own error is shown below instead.
+    )
+    assert imported.returncode == 0, imported.stderr
 
 
 @pytest.mark.parametrize("command", ["compress", "decompress", "convert-bbbin"])

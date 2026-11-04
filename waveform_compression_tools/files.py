@@ -70,6 +70,7 @@ from .errors import (
     HasGroups,
     NotCompressed,
     NotStandardLayout,
+    Refused,
     UnknownFormat,
 )
 from .quantise import full_scale
@@ -516,6 +517,33 @@ def _in_block(stations: np.ndarray, s0: int, s1: int) -> slice:
     return slice(int(k0), int(k1))
 
 
+def _refuse_unless_hdf5(path: Path, refusal: type[Refused], consequence: str) -> None:
+    """Refuse a file that is there but isn't HDF5: it isn't the kind of file asked for.
+
+    A file that isn't there is left to fail as it would, and so is one that can't be
+    read, whose check raises `PermissionError`, and an HDF5 file that was cut short,
+    which keeps its signature and fails when it is opened. Those aren't refusals: the
+    file may be the right kind, and the run went wrong.
+
+    Parameters
+    ----------
+    path : Path
+        The file.
+    refusal : type[Refused]
+        What to raise.
+    consequence : str
+        What that means for the file, to end the message: ``"is not compressed"``,
+        say.
+
+    Raises
+    ------
+    Refused
+        `refusal`, if `path` is a regular file that `h5py.is_hdf5` says isn't HDF5.
+    """
+    if path.is_file() and not h5py.is_hdf5(path):
+        raise refusal(f"{path} isn't an HDF5 file, so it {consequence}")
+
+
 def _refuse_subgroups(path: Path) -> None:
     """Refuse an HDF5 file that holds a group besides its root.
 
@@ -544,11 +572,11 @@ def check_compressible(src: Path, dst: Path, overwrite: bool = False) -> None:
     """Refuse a file that can't be compressed as it is, before any sample is read.
 
     These are the refusals that need no samples, made in this order: `dst` is `src`, a
-    file is at `dst` already, `src` is compressed already, it holds an HDF5 group, it
-    isn't in the standard layout, and every station is real. Only metadata and station
-    names are read, so a refused file costs no full read. `compress_file` calls this
-    first. The refusals that need the samples, of a NaN or an infinity and of a fill
-    value inside a trace's range, come during its pass.
+    file is at `dst` already, `src` isn't an HDF5 file, it is compressed already, it
+    holds an HDF5 group, it isn't in the standard layout, and every station is real.
+    Only metadata and station names are read, so a refused file costs no full read.
+    `compress_file` calls this first. The refusals that need the samples, of a NaN or
+    an infinity and of a fill value inside a trace's range, come during its pass.
 
     Parameters
     ----------
@@ -571,7 +599,7 @@ def check_compressible(src: Path, dst: Path, overwrite: bool = False) -> None:
     HasGroups
         If `src` holds an HDF5 group besides its root.
     NotStandardLayout
-        If `src` is not in the standard layout (see
+        If `src` is a file that isn't HDF5, is not in the standard layout (see
         `waveform_compression_tools.codec.check_standard`), has no ``station``
         coordinate along the station dimension, has a station whose name is bytes that
         aren't ASCII, has no stations, or has a waveform attribute that can't be
@@ -581,6 +609,7 @@ def check_compressible(src: Path, dst: Path, overwrite: bool = False) -> None:
         If every station of `src` is real, so it stays exact as it is.
     """
     refuse_overwriting(src, dst, overwrite)
+    _refuse_unless_hdf5(src, NotStandardLayout, "isn't netCDF in the standard layout")
     if is_compressed(src):
         raise AlreadyCompressed(f"{src} is compressed already")
     _refuse_subgroups(src)
@@ -1428,7 +1457,7 @@ def decompress_file(path: Path) -> xr.Dataset:
     Raises
     ------
     NotCompressed
-        If `path` holds no compressed waveform.
+        If `path` is a file that isn't HDF5, or holds no compressed waveform.
     UnknownFormat
         If it is in a format version other than 1, or has a setting outside 8 to 32.
     ValueError
@@ -1438,6 +1467,7 @@ def decompress_file(path: Path) -> xr.Dataset:
     pyflac.DecoderProcessException
         If a stream is damaged.
     """
+    _refuse_unless_hdf5(path, NotCompressed, "is not compressed")
     with h5py.File(path, "r") as f:
         streams = _open_streams(f, path)
         n_component, n_station = streams.starts.shape
@@ -1493,10 +1523,11 @@ def verify_file(
     Raises
     ------
     NotStandardLayout
-        If `original` is not in the standard layout, has no ``station`` coordinate,
-        or has a station whose name is bytes that are not ASCII.
+        If `original` is a file that isn't HDF5, is not in the standard layout, has no
+        ``station`` coordinate, or has a station whose name is bytes that are not
+        ASCII.
     NotCompressed
-        If `compressed` holds no compressed waveform.
+        If `compressed` is a file that isn't HDF5, or holds no compressed waveform.
     UnknownFormat
         If `compressed` is in a format version other than 1, or has a setting outside
         8 to 32.
@@ -1509,6 +1540,10 @@ def verify_file(
         If a stream is damaged.
     """
     start = time.perf_counter()
+    _refuse_unless_hdf5(
+        original, NotStandardLayout, "isn't netCDF in the standard layout"
+    )
+    _refuse_unless_hdf5(compressed, NotCompressed, "is not compressed")
     worst = np.float64(0.0)
     with (
         xr.open_dataset(original, engine="h5netcdf") as ds,
