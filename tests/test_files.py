@@ -14,6 +14,7 @@ import pytest
 import xarray as xr
 
 from waveform_compression_tools import files
+from waveform_compression_tools.bbbin import convert_bbbin, read_bbbin
 from waveform_compression_tools.codec import (
     STANDARD_DIMS,
     EncodedBlock,
@@ -21,14 +22,18 @@ from waveform_compression_tools.codec import (
     max_relative_error,
     within_one_step,
 )
+from waveform_compression_tools.content_hash import content_hash
+from waveform_compression_tools.destinations import refuse_overwriting, write_netcdf
 from waveform_compression_tools.files import (
     GROUP,
+    check_compressible,
     compress_file,
     decompress_file,
     is_compressed,
     verify_file,
 )
 from waveform_compression_tools.quantise import full_scale, gain_for, quantise
+from waveform_compression_tools.record import write_record
 from waveform_compression_tools.stream import encode_stream
 
 StandardDataset = Callable[..., xr.Dataset]
@@ -133,6 +138,32 @@ def test_round_trip_every_station(
     check = verify_file(src, dst, block_stations=344)
     assert check.passed
     assert check.max_relative_error == max_relative_error(original, decoded).max()
+
+
+def test_every_path_can_be_a_string(
+    tmp_path: Path, make_bbbin: Callable[..., np.ndarray]
+) -> None:
+    # Wherever a function takes a path, a string does as well as a Path: here each of
+    # them in turn, from a BB.bin to the record of its compression.
+    bb, nc, packed, back, rec = (
+        str(tmp_path / name)
+        for name in ("BB.bin", "bb.nc", "bb.flac.nc", "back.nc", "rec.json")
+    )
+    names = ["S000000", "KIKS", "S000002"]
+    make_bbbin(Path(bb), nstat=3, nt=200, endian="<", names=names)
+    assert read_bbbin(bb)["waveform"].shape == (3, 3, 200)
+    assert convert_bbbin(bb, nc) == Path(nc)
+    refuse_overwriting(nc, packed)
+    check_compressible(nc, packed)
+    assert compress_file(nc, packed, bits=24).n_exact == 1
+    assert is_compressed(packed)
+    assert verify_file(nc, packed).passed
+    write_netcdf(decompress_file(packed), back)
+    with xr.open_dataset(back, engine="h5netcdf") as got:
+        assert got["waveform"].shape == (3, 3, 200)
+    assert content_hash(packed) == content_hash(Path(packed))
+    write_record({"status": "ok"}, rec)
+    assert json.loads(Path(rec).read_text()) == {"status": "ok"}
 
 
 def test_a_file_whose_components_are_x_y_z_comes_back_with_its_labels(

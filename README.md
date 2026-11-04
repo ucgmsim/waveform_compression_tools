@@ -248,7 +248,7 @@ bb = read_bbbin(Path("BB.bin"))  # a Dataset in the standard layout
 convert_bbbin(Path("BB.bin"), Path("bb.nc"))  # the same, written to a netCDF file
 ```
 
-Pass paths as `pathlib.Path` objects, not strings.
+A path can be given as a string or as a `pathlib.Path` object.
 
 - `compress_file(src, dst, bits=32, level=5, block_stations=None, check=True, overwrite=False)` returns a `CompressResult`: `bytes_in` and `bytes_out`, `n_traces`, `n_exact` (the real stations), `bits`, `checked`, `max_relative_error` (None without the check), and the wall and CPU time spent reading, encoding, writing and checking, from `read_s` to `check_cpu_s`. It first calls `check_compressible(src, dst, overwrite)`, which makes the refusals that need no samples, and which can be called on its own.
 - `verify_file(original, compressed, block_stations=None)` returns a `VerifyResult`: `passed`, `max_relative_error`, `n_exact` and `verify_s`. A file that doesn't agree gives `passed=False`; it doesn't raise.

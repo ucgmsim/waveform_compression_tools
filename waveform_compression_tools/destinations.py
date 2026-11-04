@@ -14,7 +14,7 @@ import xarray as xr
 from .errors import OutputExists, SameFile
 
 
-def fresh_partial(dst: Path) -> Path:
+def fresh_partial(dst: str | os.PathLike[str]) -> Path:
     """Clear the name a file for `dst` is written under, and return it.
 
     That name is `dst` with ``.partial`` added. Whatever is there is removed: a partial
@@ -22,7 +22,7 @@ def fresh_partial(dst: Path) -> Path:
 
     Parameters
     ----------
-    dst : Path
+    dst : str or os.PathLike
         Where the file is to go.
 
     Returns
@@ -30,13 +30,15 @@ def fresh_partial(dst: Path) -> Path:
     Path
         `dst` with ``.partial`` added, with nothing there now.
     """
-    partial = Path(f"{dst}.partial")
+    partial = Path(f"{Path(dst)}.partial")
     if os.path.lexists(partial):
         partial.unlink()  # A link itself, never its target.
     return partial
 
 
-def refuse_overwriting(src: Path, dst: Path, overwrite: bool = False) -> None:
+def refuse_overwriting(
+    src: str | os.PathLike[str], dst: str | os.PathLike[str], overwrite: bool = False
+) -> None:
     """Refuse to write `dst` where that would destroy `src`, or replace a file unasked.
 
     A file is written to `dst` with ``.partial`` added, once whatever is at that name
@@ -45,9 +47,9 @@ def refuse_overwriting(src: Path, dst: Path, overwrite: bool = False) -> None:
 
     Parameters
     ----------
-    src : Path
+    src : str or os.PathLike
         The file that is read.
-    dst : Path
+    dst : str or os.PathLike
         The file that is written.
     overwrite : bool, default False
         Whether a file already at `dst` may be replaced.
@@ -61,6 +63,7 @@ def refuse_overwriting(src: Path, dst: Path, overwrite: bool = False) -> None:
         If something is at `dst` already, a broken link included, and `overwrite` is
         false.
     """
+    src, dst = Path(src), Path(dst)
     partial = Path(f"{dst}.partial")
     same = src.resolve() in (dst.resolve(), partial.resolve())
     if not same and src.exists():
@@ -74,7 +77,7 @@ def refuse_overwriting(src: Path, dst: Path, overwrite: bool = False) -> None:
         raise OutputExists(f"{dst} exists already, and is replaced only if asked")
 
 
-def write_netcdf(ds: xr.Dataset, dst: Path) -> None:
+def write_netcdf(ds: xr.Dataset, dst: str | os.PathLike[str]) -> None:
     """Write a dataset to a netCDF file that appears at `dst` only when it is complete.
 
     It is written by xarray with the h5netcdf engine to `dst` with ``.partial`` added,
@@ -86,10 +89,11 @@ def write_netcdf(ds: xr.Dataset, dst: Path) -> None:
     ----------
     ds : xr.Dataset
         The dataset to write.
-    dst : Path
+    dst : str or os.PathLike
         Where to write the file. A file already there is replaced (see
         `refuse_overwriting`, which a caller makes first).
     """
+    dst = Path(dst)
     partial = fresh_partial(dst)
     try:
         ds.to_netcdf(partial, engine="h5netcdf")

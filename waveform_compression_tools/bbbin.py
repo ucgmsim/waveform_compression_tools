@@ -108,7 +108,7 @@ def _layout(head: bytes, size: int) -> tuple[str, int, int] | None:
     return None
 
 
-def read_bbbin(path: Path) -> xr.Dataset:
+def read_bbbin(path: str | os.PathLike[str]) -> xr.Dataset:
     """Read a BB.bin file into a dataset in the standard layout.
 
     The whole file is read into memory. A BB.bin file is typically about 0.5 GiB, and
@@ -122,7 +122,7 @@ def read_bbbin(path: Path) -> xr.Dataset:
 
     Parameters
     ----------
-    path : Path
+    path : str or os.PathLike
         The BB.bin file.
 
     Returns
@@ -151,6 +151,7 @@ def read_bbbin(path: Path) -> xr.Dataset:
     ValueError
         If the file shrinks while it is read.
     """
+    path = Path(path)
     with path.open("rb") as f:
         size = os.fstat(f.fileno()).st_size
         head = f.read(_HEAD_BYTES)
@@ -205,7 +206,9 @@ def read_bbbin(path: Path) -> xr.Dataset:
     )
 
 
-def convert_bbbin(src: Path, dst: Path, overwrite: bool = False) -> Path:
+def convert_bbbin(
+    src: str | os.PathLike[str], dst: str | os.PathLike[str], overwrite: bool = False
+) -> Path:
     """Convert a BB.bin file to a netCDF file in the standard layout.
 
     The destination is checked first (see
@@ -217,9 +220,9 @@ def convert_bbbin(src: Path, dst: Path, overwrite: bool = False) -> Path:
 
     Parameters
     ----------
-    src : Path
+    src : str or os.PathLike
         The BB.bin file.
-    dst : Path
+    dst : str or os.PathLike
         Where to write the netCDF file.
     overwrite : bool, default False
         Whether to replace a file already at `dst`. `src` itself is never replaced.
@@ -227,7 +230,7 @@ def convert_bbbin(src: Path, dst: Path, overwrite: bool = False) -> Path:
     Returns
     -------
     Path
-        `dst`.
+        `dst`, as a Path.
 
     Raises
     ------
@@ -239,6 +242,7 @@ def convert_bbbin(src: Path, dst: Path, overwrite: bool = False) -> Path:
     NotBBBin
         If `src` is not a BB.bin file (see `read_bbbin`). Nothing is written.
     """
+    src, dst = Path(src), Path(dst)
     refuse_overwriting(src, dst, overwrite)
     write_netcdf(read_bbbin(src), dst)
     return dst

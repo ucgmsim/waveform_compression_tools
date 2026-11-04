@@ -115,14 +115,14 @@ def make_record(
     }
 
 
-def write_record(record: dict, path: Path) -> None:
+def write_record(record: dict, path: str | os.PathLike[str]) -> None:
     """Write a record as strict JSON, appearing at `path` complete or not at all.
 
     Parameters
     ----------
     record : dict
         The record from `make_record`.
-    path : Path
+    path : str or os.PathLike
         Where to write it. An earlier file there is replaced only on success. It is
         written with ``.partial`` added first, once whatever is at that name is
         removed (see `waveform_compression_tools.destinations.fresh_partial`).
@@ -132,6 +132,7 @@ def write_record(record: dict, path: Path) -> None:
     ValueError
         If the record holds a NaN or infinity, which JSON cannot carry.
     """
+    path = Path(path)
     partial = fresh_partial(path)
     try:
         text = json.dumps(record, indent=2, allow_nan=False) + "\n"

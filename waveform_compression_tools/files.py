@@ -609,7 +609,9 @@ def _refuse_subgroups(path: Path) -> None:
         )
 
 
-def check_compressible(src: Path, dst: Path, overwrite: bool = False) -> None:
+def check_compressible(
+    src: str | os.PathLike[str], dst: str | os.PathLike[str], overwrite: bool = False
+) -> None:
     """Refuse a file that can't be compressed as it is, before any sample is read.
 
     These are the refusals that need no samples, made in this order: `dst` is `src`, a
@@ -621,9 +623,9 @@ def check_compressible(src: Path, dst: Path, overwrite: bool = False) -> None:
 
     Parameters
     ----------
-    src : Path
+    src : str or os.PathLike
         The netCDF file to compress.
-    dst : Path
+    dst : str or os.PathLike
         Where the compressed file is to go.
     overwrite : bool, default False
         Whether a file already at `dst` may be replaced.
@@ -651,6 +653,7 @@ def check_compressible(src: Path, dst: Path, overwrite: bool = False) -> None:
     AllStationsReal
         If every station of `src` is real, so it stays exact as it is.
     """
+    src, dst = Path(src), Path(dst)
     refuse_overwriting(src, dst, overwrite)
     _refuse_unless_hdf5(src, NotStandardLayout, "isn't netCDF in the standard layout")
     if is_compressed(src):
@@ -676,8 +679,8 @@ def check_compressible(src: Path, dst: Path, overwrite: bool = False) -> None:
 
 
 def compress_file(
-    src: Path,
-    dst: Path,
+    src: str | os.PathLike[str],
+    dst: str | os.PathLike[str],
     bits: int = 32,
     level: int = 5,
     block_stations: int | None = None,
@@ -723,11 +726,11 @@ def compress_file(
 
     Parameters
     ----------
-    src : Path
+    src : str or os.PathLike
         The netCDF file to compress, in the standard layout (see
         `waveform_compression_tools.codec.check_standard`), with a ``station``
         coordinate that names its stations, and no HDF5 group besides its root.
-    dst : Path
+    dst : str or os.PathLike
         Where to write the compressed file.
     bits : int, default 32
         The quantisation setting, from 8 to 32.
@@ -770,6 +773,7 @@ def compress_file(
         If libFLAC fails to encode a trace, or to finish its stream.
     """
     full_scale(bits)  # Refuses a setting outside 8 to 32 before the file is opened.
+    src, dst = Path(src), Path(dst)
     stopwatch = _Stopwatch()
     check_compressible(src, dst, overwrite)
     partial = fresh_partial(dst)
@@ -1482,12 +1486,12 @@ def _check_reopened(
                 )
 
 
-def decompress_file(path: Path) -> xr.Dataset:
+def decompress_file(path: str | os.PathLike[str]) -> xr.Dataset:
     """Decompress a file written by `compress_file`.
 
     Parameters
     ----------
-    path : Path
+    path : str or os.PathLike
         The compressed file.
 
     Returns
@@ -1513,6 +1517,7 @@ def decompress_file(path: Path) -> xr.Dataset:
     pyflac.DecoderProcessException
         If a stream is damaged.
     """
+    path = Path(path)
     _refuse_unless_hdf5(path, NotCompressed, "is not compressed")
     with h5py.File(path, "r") as f:
         streams = _open_streams(f, path)
@@ -1530,7 +1535,9 @@ def decompress_file(path: Path) -> xr.Dataset:
 
 
 def verify_file(
-    original: Path, compressed: Path, block_stations: int | None = None
+    original: str | os.PathLike[str],
+    compressed: str | os.PathLike[str],
+    block_stations: int | None = None,
 ) -> VerifyResult:
     """Check a compressed file against its original, a block of stations at a time.
 
@@ -1550,9 +1557,9 @@ def verify_file(
 
     Parameters
     ----------
-    original : Path
+    original : str or os.PathLike
         The netCDF file that was compressed, in the standard layout.
-    compressed : Path
+    compressed : str or os.PathLike
         The file `compress_file` wrote from it.
     block_stations : int, optional
         The most stations read and decoded at once. By default a block holds about
@@ -1586,6 +1593,7 @@ def verify_file(
         If a stream is damaged.
     """
     start = time.perf_counter()
+    original, compressed = Path(original), Path(compressed)
     _refuse_unless_hdf5(
         original, NotStandardLayout, "isn't netCDF in the standard layout"
     )
@@ -1626,12 +1634,12 @@ def verify_file(
     )
 
 
-def is_compressed(path: Path) -> bool:
+def is_compressed(path: str | os.PathLike[str]) -> bool:
     """Say whether a file was written by `compress_file`.
 
     Parameters
     ----------
-    path : Path
+    path : str or os.PathLike
         The file.
 
     Returns
@@ -1640,6 +1648,7 @@ def is_compressed(path: Path) -> bool:
         True if `path` is an HDF5 file with the group ``_flac_compressed_waveform``,
         and False otherwise, as when it does not exist.
     """
+    path = Path(path)
     if not h5py.is_hdf5(path):
         return False
     with h5py.File(path, "r") as f:
