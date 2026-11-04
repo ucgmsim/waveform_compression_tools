@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from waveform_compression_tools import __version__
+from waveform_compression_tools.destinations import fresh_partial
 from waveform_compression_tools.files import _FORMAT_VERSION
 
 RECORD_VERSION = 1
@@ -122,14 +123,16 @@ def write_record(record: dict, path: Path) -> None:
     record : dict
         The record from `make_record`.
     path : Path
-        Where to write it. An earlier file there is replaced only on success.
+        Where to write it. An earlier file there is replaced only on success. It is
+        written with ``.partial`` added first, once whatever is at that name is
+        removed (see `waveform_compression_tools.destinations.fresh_partial`).
 
     Raises
     ------
     ValueError
         If the record holds a NaN or infinity, which JSON cannot carry.
     """
-    partial = path.with_name(path.name + ".partial")
+    partial = fresh_partial(path)
     try:
         text = json.dumps(record, indent=2, allow_nan=False) + "\n"
         partial.write_text(text)

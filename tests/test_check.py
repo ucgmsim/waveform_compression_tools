@@ -320,7 +320,9 @@ def test_damage_after_the_pass_fails_the_structure_check(
 REFUSALS = {
     "the same path": (SameFile, True, "overwrite"),
     "a link to it": (SameFile, True, "overwrite"),
+    "a hard link to it": (SameFile, True, "overwrite"),
     "its own partial": (SameFile, True, "overwrite"),
+    "a hard link to it at its partial": (SameFile, True, "overwrite"),
     "the output exists": (OutputExists, True, "exists"),
     "a broken link at the output": (OutputExists, True, "exists"),
     "already compressed": (AlreadyCompressed, True, "compressed already"),
@@ -398,6 +400,12 @@ def refused_input(
         return src, src, False
     if case == "a link to it":
         dst.symlink_to(src)
+    elif case == "a hard link to it":
+        # Another name for the input, which no comparison of names can see.
+        dst.hardlink_to(src)
+    elif case == "a hard link to it at its partial":
+        dst.write_bytes(b"an earlier file")
+        partial_of(dst).hardlink_to(src)
     elif case == "a broken link at the output":
         # Nothing to read there, but replacing the link would be overwriting.
         dst.symlink_to(folder / "missing.nc")

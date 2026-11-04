@@ -62,7 +62,7 @@ from .codec import (
     max_relative_error,
     within_one_step,
 )
-from .destinations import refuse_overwriting
+from .destinations import fresh_partial, refuse_overwriting
 from .errors import (
     AllStationsReal,
     AlreadyCompressed,
@@ -590,8 +590,9 @@ def check_compressible(src: Path, dst: Path, overwrite: bool = False) -> None:
     Raises
     ------
     SameFile
-        If `dst`, or `dst` with ``.partial`` added, resolves to `src`, whatever
-        `overwrite` says (see `waveform_compression_tools.destinations`).
+        If `dst`, or `dst` with ``.partial`` added, is `src`, by its name, through a
+        link, or as a hard link to it, whatever `overwrite` says (see
+        `waveform_compression_tools.destinations`).
     OutputExists
         If something is at `dst` already and `overwrite` is false.
     AlreadyCompressed
@@ -647,9 +648,11 @@ def compress_file(
     at a time, so memory holds one block and its streams, never the whole waveform.
     The real stations' traces (see `waveform_compression_tools.stations`) are also
     copied exactly, a block at a time. The compressed file is written to `dst` with
-    ``.partial`` added, and renamed to `dst` when it is complete. If anything goes
-    wrong, the partial file is deleted and the exception raised again, so nothing
-    appears at `dst`, and a file already there stays as it was.
+    ``.partial`` added, once whatever is at that name is removed (see
+    `waveform_compression_tools.destinations.fresh_partial`), and renamed to `dst` when
+    it is complete. If anything goes wrong, the partial file is deleted and the
+    exception raised again, so nothing appears at `dst`, and a file already there stays
+    as it was.
 
     With `check`, the compressed file is checked as it is written, against what was
     read, so the original's samples are read only once:
@@ -726,7 +729,7 @@ def compress_file(
     full_scale(bits)  # Refuses a setting outside 8 to 32 before the file is opened.
     stopwatch = _Stopwatch()
     check_compressible(src, dst, overwrite)
-    partial = Path(f"{dst}.partial")
+    partial = fresh_partial(dst)
     with xr.open_dataset(src, engine="h5netcdf") as ds:
         exact = _real_stations(ds)
         waveform = ds["waveform"]

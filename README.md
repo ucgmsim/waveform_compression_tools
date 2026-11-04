@@ -224,7 +224,7 @@ An unexpected error's reason starts with its type, such as `RuntimeError: …`. 
 - A run that is killed, by a time limit, the out-of-memory killer or SIGKILL, may leave `DST.partial` behind. The next run replaces it, and it is safe to delete.
 - A file already at DST, or at the record's PATH, is replaced only with `--overwrite` (`overwrite=True` in Python).
 - With `--overwrite`, the earlier output stays until the new, checked file is renamed into place. If the run fails after that, while hashing the new file, the new file is deleted too, and nothing is left at DST. The input is untouched, so a rerun makes it again.
-- A destination that is the input, by its name or through a symbolic link, or whose `.partial` is, is refused, with or without `--overwrite`, so a command doesn't write over its own input. A hard link to the input under a destination's `.partial` name isn't detected.
+- A destination that is the input, by its name, through a symbolic link or as a hard link, or whose `.partial` is, is refused, with or without `--overwrite`, so a command doesn't write over its own input. Anything else at a destination's `.partial` name, a link included, is removed before the file is written, and never written through.
 
 ## Python use
 

@@ -2,6 +2,7 @@ import errno
 import json
 import logging
 import logging.handlers
+import os
 import struct
 import subprocess
 import sys
@@ -475,6 +476,32 @@ def test_a_stale_partial_is_replaced_and_the_rerun_succeeds(
     # The same command again replaces them, and finishes.
     assert_exit(run(*args), EXIT_OK)
     assert not partial_of(dst).exists() and not partial_of(rec).exists()
+    assert_complete(command, src, dst)
+    if command == "compress":
+        assert read_record(rec)["status"] == "ok"
+
+
+@pytest.mark.parametrize("command", ["compress", "decompress", "convert-bbbin"])
+def test_a_link_at_a_partial_name_is_removed_not_written_through(
+    tmp_path: Path, standard_dataset: StandardDataset, command: str
+) -> None:
+    # A symbolic link at a destination's .partial name, and at compress's record's,
+    # each to a file that has nothing to do with the run. Writing through a link would
+    # destroy its target, and the rename would then put the link at the destination.
+    src = an_input(command, tmp_path, standard_dataset)
+    dst, rec = tmp_path / "out.nc", tmp_path / "rec.json"
+    args: list[str | Path] = [command, src, dst]
+    links = {dst: tmp_path / "unrelated.nc"}
+    if command == "compress":
+        links[rec] = tmp_path / "unrelated.json"
+        args += ["--record", rec]
+    for path, target in links.items():
+        target.write_bytes(b"an unrelated file")
+        partial_of(path).symlink_to(target)
+    assert_exit(run(*args), EXIT_OK)
+    for path, target in links.items():
+        assert target.read_bytes() == b"an unrelated file"
+        assert not path.is_symlink() and not os.path.lexists(partial_of(path))
     assert_complete(command, src, dst)
     if command == "compress":
         assert read_record(rec)["status"] == "ok"
