@@ -89,12 +89,15 @@ def test_compress_checks_and_reports(
 # failed check is raised from. libFLAC finds a flipped byte. A cut between frames decodes
 # without an error, so only a count of the samples finds it. A stream cut to nothing
 # holds no frames at all. A trace of zeros given another trace's stream decodes, but not
-# to zeros, which only the one-step rule sees: the setting's bound sees a peak of 0.
+# to zeros, which only the one-step rule sees: the setting's bound sees a peak of 0. A
+# byte flipped as it is written leaves the encoder's streams as they should be, so the
+# pass finds it, raised from libFLAC's error, only by decoding what the file holds.
 STREAM_DAMAGE = {
     "a flipped byte": pyflac.DecoderProcessException,
     "a cut between frames": ValueError,
     "a cut to nothing": ValueError,
     "a trace of zeros given another's stream": None,
+    "a byte flipped as it is written": pyflac.DecoderProcessException,
 }
 
 
@@ -126,11 +129,24 @@ def test_a_corrupted_stream_fails_the_check_and_leaves_nothing(
         nbytes[c, s] = len(streams[k])
         return EncodedBlock(streams, nbytes, encoded.gains)
 
+    setitem = h5py.Dataset.__setitem__
+
+    def write_a_flipped_byte(
+        dataset: h5py.Dataset, key: object, value: np.ndarray
+    ) -> None:
+        if dataset.name == f"/{GROUP}/compressed":
+            value = value.copy()
+            value[value.size // 2] ^= 0xFF
+        setitem(dataset, key, value)
+
     ds = standard_dataset(3, nt=5_000)
     if damage == "a trace of zeros given another's stream":
         ds["waveform"][1, 2] = 0.0
     src, dst = write(ds, tmp_path / "in.nc"), tmp_path / "out.nc"
-    monkeypatch.setattr(files, "encode_block", encode_then_damage)
+    if damage == "a byte flipped as it is written":
+        monkeypatch.setattr(h5py.Dataset, "__setitem__", write_a_flipped_byte)
+    else:
+        monkeypatch.setattr(files, "encode_block", encode_then_damage)
     with pytest.raises(CheckFailed) as failure:
         compress_file(src, dst)
     # Raised from the decoder's own error, if there was one.
@@ -228,17 +244,23 @@ def test_an_altered_exact_station_fails_the_check(
 
 
 # Damage to the closed partial file, after the pass has checked every block and before
-# the file is reopened.
+# the file is reopened. An exact copy is compared with its CRC-32 from the pass, and a
+# coordinate, outside the group, with the original. The file is written at 24 bits, so
+# a claim of 32 would hold it to a bound it can't meet: only the group's attributes,
+# compared with those written, show that.
 DAMAGE_AFTER_THE_PASS = [
     "a flipped byte in a stream",
+    "an exact copy one ulp up",
     "a gain one ulp up",
     "an offset that isn't zero",
     "another exact station",
     "a byte more of streams",
     "another trace length",
+    "a finer setting claimed",
     "another waveform_encoding",
     "no waveform_attr_types",
     "a dataset more",
+    "a coordinate's value",
 ]
 
 
@@ -251,13 +273,19 @@ def test_damage_after_the_pass_fails_the_structure_check(
 ) -> None:
     src = write(standard_dataset(4, nt=400, real=(1,)), tmp_path / "in.nc")
     dst = tmp_path / "out.nc"
-    check_structure = files._check_structure
+    # An earlier file, asked to be replaced, but only by a file that passes.
+    dst.write_bytes(b"an earlier file")
+    before = contents(tmp_path)
+    check_reopened = files._check_reopened
 
     def damage_then_check(path: Path, *recorded: Any) -> None:
         with h5py.File(path, "r+") as f:
             g = f[GROUP]
             if damage == "a flipped byte in a stream":
                 g["compressed"][int(g["stream_starts"][1, 2]) + 20] ^= 0xFF
+            elif damage == "an exact copy one ulp up":
+                copy = g["exact_waveform"]
+                copy[2, 0, 150] = np.nextafter(copy[2, 0, 150], np.float32(np.inf))
             elif damage == "a gain one ulp up":
                 g["stream_gains"][0, 3] = np.nextafter(g["stream_gains"][0, 3], np.inf)
             elif damage == "an offset that isn't zero":
@@ -268,18 +296,23 @@ def test_damage_after_the_pass_fails_the_structure_check(
                 g["compressed"].resize((g["compressed"].shape[0] + 1,))
             elif damage == "another trace length":
                 g["stream_starts"].attrs["stream_size"] = 399
+            elif damage == "a finer setting claimed":
+                g.attrs["bits"] = 32
             elif damage == "another waveform_encoding":
                 g.attrs["waveform_encoding"] = '{"_FillValue": -999.0}'
             elif damage == "no waveform_attr_types":
                 del g.attrs["waveform_attr_types"]
-            else:
+            elif damage == "a dataset more":
                 g.create_dataset("notes", data=np.arange(3))
-        check_structure(path, *recorded)
+            else:
+                f["latitude"][0] += 1.0
+        check_reopened(path, *recorded)
 
-    monkeypatch.setattr(files, "_check_structure", damage_then_check)
+    monkeypatch.setattr(files, "_check_reopened", damage_then_check)
     with pytest.raises(CheckFailed):
-        compress_file(src, dst)
-    assert nothing_left(dst)
+        compress_file(src, dst, bits=24, overwrite=True)
+    # The input and the earlier file are as they were, and no partial file is left.
+    assert contents(tmp_path) == before
 
 
 # Each refusal: what it raises, whether check_compressible finds it before any sample is

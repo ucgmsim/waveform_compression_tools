@@ -34,8 +34,9 @@ A file whose stations are all real is not compressed, so it stays exact as it is
 A waveform can run to a hundred gigabytes or more, so it is read, compressed and
 verified a block of stations at a time. A compressed file appears at its path only
 when it is complete: it is written to the path with ``.partial`` added, then renamed.
-`compress_file` checks what it writes as it goes, reading the original only once;
-`verify_file` checks a compressed file against its original on its own, reading both.
+`compress_file` checks the file it writes as `verify_file` would, but reads the
+original's samples only once; `verify_file` checks a compressed file against its
+original on its own, reading both again.
 """
 
 import gc
@@ -103,7 +104,12 @@ class CompressResult:
     bits : int
         The quantisation setting.
     checked : bool
-        Whether the compressed file was checked as it was written.
+        Whether the compressed file was checked as it was written (see
+        `compress_file`): each block decoded from the bytes written and held to
+        `verify_file`'s rules against the samples read, and the closed file shown to
+        hold what was judged and to agree with the original in everything but the
+        waveform's samples. A checked file passes `verify_file`, unless it was changed
+        after it was judged in a way that its CRC-32s miss.
     max_relative_error : float or None
         The largest error the check found in a trace that isn't kept exactly, as a
         fraction of that trace's peak: 0.0 if every such trace came back exactly or is
@@ -621,15 +627,29 @@ def compress_file(
     wrong, the partial file is deleted and the exception raised again, so nothing
     appears at `dst`, and a file already there stays as it was.
 
-    The check proves the compressed file in the same pass, so the original is read
-    only once. As soon as a block is written, its streams are read back and decoded as
-    a reader would decode them, and its exact copies are read back. The block has to
-    pass `verify_file`'s rules against the block still in memory: each trace within one
-    step of its own gain, and within the bound the setting promises, of its peak; a
-    trace of zeros as exact zeros; and each exact copy bit for bit. When the pass is
-    done, the closed partial file is reopened, and its group has to hold what the pass
-    wrote, every stream with the CRC-32 it had when it was decoded. Only then is the
-    file renamed to `dst`.
+    With `check`, the compressed file is checked as it is written, against what was
+    read, so the original's samples are read only once:
+
+    - During the pass, as soon as a block is written, the bytes of its streams are read
+      back from the file, once, and decoded with the starts, sizes and gains recorded
+      for them, and its exact copies are read back. The block has to pass
+      `verify_file`'s rules against the block still in memory: each trace within one
+      step of its own gain, and within the bound the setting promises, of its peak; a
+      trace of zeros as exact zeros; and each exact copy bit for bit. A CRC-32 is taken
+      of each stream, from the bytes decoded, and of each exact copy, from the bytes
+      compared.
+    - When the pass is done, the closed partial file is reopened read-only. Its group
+      has to hold just what the pass wrote: the datasets and attributes written, each
+      with the value written, and every stream and every exact copy with the CRC-32 it
+      had when it was judged, so the file holds what was judged. The file also has to
+      agree with the original in everything but the waveform's samples, as
+      `verify_file` compares them: everything besides the waveform identical, the
+      waveform's attributes and encoding as a reader gets them back, and exact copies
+      of the real stations and of no others.
+
+    Only then is the file renamed to `dst`. A file that passes the check passes
+    `verify_file`, unless it was changed after it was judged in a way that its CRC-32s
+    miss.
 
     Parameters
     ----------
@@ -752,7 +772,8 @@ def compress_file(
                     exact_stations=exact,
                     exact_waveform=exact_waveform,
                 )
-                crcs = np.zeros(traces, np.uint32)
+                stream_crcs = np.zeros(traces, np.uint32)
+                exact_crcs = np.zeros((n_component, exact.size), np.uint32)
                 worst = 0.0
                 stopwatch.lap("write")
                 for s0, s1 in blocks:
@@ -777,8 +798,8 @@ def compress_file(
                     exact_waveform[:, here] = block[:, exact[here] - s0]
                     stopwatch.lap("write")
                     if check:
-                        error, crcs[:, s0:s1] = _check_block(
-                            written, block, s0, s1, partial
+                        error, stream_crcs[:, s0:s1], exact_crcs[:, here] = (
+                            _check_block(written, block, s0, s1, partial)
                         )
                         worst = max(worst, error)
                         stopwatch.lap("check")
@@ -798,7 +819,8 @@ def compress_file(
                 group.attrs.update(attrs)
             stopwatch.lap("write")
             if check:
-                _check_structure(partial, datasets, attrs, nt, crcs, blocks)
+                record = _Record(datasets, attrs, nt, stream_crcs, exact_crcs, blocks)
+                _check_reopened(partial, ds, exact, record)
                 stopwatch.lap("check")
             os.replace(partial, dst)
             stopwatch.lap("write")
@@ -872,8 +894,8 @@ class _Streams:
     exact_stations: np.ndarray
     exact_waveform: h5py.Dataset
 
-    def decode(self, s0: int, s1: int) -> np.ndarray:
-        """Decode a block of stations from their FLAC streams alone.
+    def read(self, s0: int, s1: int) -> tuple[np.ndarray, np.ndarray]:
+        """Read the bytes of a block of stations' streams from the file.
 
         Parameters
         ----------
@@ -884,15 +906,41 @@ class _Streams:
 
         Returns
         -------
-        np.ndarray
-            The block, as a float32 array of shape (component, s1 - s0, nt).
+        data : np.ndarray
+            The bytes the block's streams span, as uint8.
+        starts : np.ndarray
+            Where each of the block's streams starts in `data`, of shape
+            (component, s1 - s0).
         """
         starts, nbytes = self.starts[:, s0:s1], self.nbytes[:, s0:s1]
         first, end = int(starts.min()), int((starts + nbytes).max())
+        return self.compressed[first:end], starts - first
+
+    def decode(
+        self, s0: int, s1: int, read: tuple[np.ndarray, np.ndarray] | None = None
+    ) -> np.ndarray:
+        """Decode a block of stations from their FLAC streams alone.
+
+        Parameters
+        ----------
+        s0 : int
+            The block's first station.
+        s1 : int
+            The station after its last, greater than `s0`.
+        read : tuple[np.ndarray, np.ndarray], optional
+            The block's streams as `read` gave them, if they have been read already.
+            By default they are read from the file.
+
+        Returns
+        -------
+        np.ndarray
+            The block, as a float32 array of shape (component, s1 - s0, nt).
+        """
+        data, starts = self.read(s0, s1) if read is None else read
         return decode_block(
-            self.compressed[first:end],
-            starts - first,
-            nbytes,
+            data,
+            starts,
+            self.nbytes[:, s0:s1],
             self.gains[:, s0:s1],
             self.offsets[:, s0:s1],
             self.nt,
@@ -1010,15 +1058,70 @@ def _open_streams(f: h5py.File, path: Path) -> _Streams:
     )
 
 
-def _compare_block(
-    streams: _Streams, block: np.ndarray, real: np.ndarray, s0: int, s1: int
-) -> tuple[float, bool]:
-    """Decode a block of stations from a compressed file, and judge it by verify's rules.
+def _same_besides_samples(
+    original: xr.Dataset, real: np.ndarray, rest: xr.Dataset, streams: _Streams
+) -> bool:
+    """Say whether a compressed file holds all of its original but the waveform's samples.
 
-    Every trace's FLAC stream is decoded, a real station's too, since a reader that
-    ignores the exact copies decodes it. It has to be within the bound the file's
-    setting promises, and within one step of its own gain (see `verify_file`). Then,
-    with the exact copies put back, every real station has to come back bit for bit.
+    This is `verify_file`'s comparison of everything but the samples, which the check in
+    `compress_file` makes too. Everything besides the waveform, every other variable,
+    coordinate and attribute, has to be identical. The waveform's attributes have to
+    come back as a reader of the file gets them, each in the type it is written with,
+    and so do its ``_FillValue`` and ``missing_value``. The file has to hold exact copies
+    of the real stations and of no others. The waveform's samples aren't read.
+
+    Parameters
+    ----------
+    original : xr.Dataset
+        The original, open, in the standard layout.
+    real : np.ndarray
+        The original's real stations, in increasing order.
+    rest : xr.Dataset
+        The compressed file as xarray opens it: all of it but the waveform.
+    streams : _Streams
+        The compressed file's streams, with the waveform's attributes and encoding as a
+        reader gets them.
+
+    Returns
+    -------
+    bool
+        Whether the file agrees with the original in all of these.
+    """
+    waveform = original["waveform"]
+    # `identical` compares attribute values and not their types, so the types and the
+    # encoding are compared on their own.
+    same_attrs = xr.Dataset(attrs=dict(waveform.attrs)).identical(
+        xr.Dataset(attrs=streams.waveform_attrs)
+    ) and _written_dtypes(waveform.attrs) == _written_dtypes(streams.waveform_attrs)
+    # The encoding as JSON, so a NaN fill value equals a NaN one.
+    same_encoding = json.loads(_encoding_json(waveform.encoding)) == json.loads(
+        _encoding_json(streams.encoding)
+    )
+    return (
+        original.drop_vars("waveform").identical(rest)
+        and same_attrs
+        and same_encoding
+        and np.array_equal(streams.exact_stations, real)
+    )
+
+
+def _compare_block(
+    streams: _Streams,
+    block: np.ndarray,
+    decoded: np.ndarray,
+    real: np.ndarray,
+    s0: int,
+    s1: int,
+) -> tuple[float, bool]:
+    """Judge a decoded block of stations by verify's rules, against the original's.
+
+    Every trace's FLAC stream counts, a real station's too, since a reader that ignores
+    the exact copies decodes it. Each trace's largest error has to be within the bound
+    the file's setting promises, ``1 / full_scale(bits)`` of its peak with a relative
+    slack of 1e-9, whatever its gain says; and every sample has to be within one step of
+    its own gain (see `waveform_compression_tools.codec.within_one_step`), so a trace of
+    zeros has to come back as exact zeros. Then, with the file's exact copies put back,
+    every real station has to come back bit for bit.
 
     Parameters
     ----------
@@ -1027,6 +1130,9 @@ def _compare_block(
     block : np.ndarray
         The original's traces of the block's stations, of shape
         (component, s1 - s0, nt).
+    decoded : np.ndarray
+        The same stations as their streams decode, of the same shape. The exact copies
+        are put back into it.
     real : np.ndarray
         The original's real stations, in increasing order.
     s0 : int
@@ -1041,15 +1147,7 @@ def _compare_block(
         put back, as a fraction of that trace's peak: NaN if the block holds a NaN.
     passed : bool
         Whether the block passes.
-
-    Raises
-    ------
-    ValueError
-        If a stream decodes to the wrong number of samples, or holds no frames.
-    pyflac.DecoderProcessException
-        If a stream is damaged.
     """
-    decoded = streams.decode(s0, s1)
     error = max_relative_error(block, decoded)
     # Each check covers what the others can't. The bound holds every stream to what the
     # file's setting promises, whatever its gains say, so it fails an encoder that wrote
@@ -1071,18 +1169,17 @@ def _compare_block(
     return float(error.max()), passed
 
 
-def _crc32s(
-    compressed: h5py.Dataset, starts: np.ndarray, nbytes: np.ndarray
+def _stream_crcs(
+    data: np.ndarray, starts: np.ndarray, nbytes: np.ndarray
 ) -> np.ndarray:
-    """Compute the CRC-32 of each of a block's streams, as a file holds it.
+    """Compute the CRC-32 of each of a block's streams.
 
     Parameters
     ----------
-    compressed : h5py.Dataset
-        The bytes of every stream. Only the block's are read.
+    data : np.ndarray
+        The bytes the block's streams span, as uint8.
     starts : np.ndarray
-        Where each of the block's streams starts in `compressed`, of shape
-        (component, station).
+        Where each stream starts in `data`, of shape (component, station).
     nbytes : np.ndarray
         The length of each in bytes, of the same shape.
 
@@ -1091,23 +1188,40 @@ def _crc32s(
     np.ndarray
         Each stream's CRC-32, as uint32 of the same shape.
     """
-    first, end = int(starts.min()), int((starts + nbytes).max())
-    data = compressed[first:end]
     crcs = [
-        zlib.crc32(data[start - first : start - first + size])
+        zlib.crc32(data[start : start + size])
         for start, size in zip(starts.flat, nbytes.flat)
     ]
     return np.array(crcs, np.uint32).reshape(starts.shape)
 
 
+def _trace_crcs(traces: np.ndarray) -> np.ndarray:
+    """Compute the CRC-32 of each trace's bytes.
+
+    Parameters
+    ----------
+    traces : np.ndarray
+        Traces of shape (component, station, nt), in C order.
+
+    Returns
+    -------
+    np.ndarray
+        Each trace's CRC-32, as uint32 of shape (component, station).
+    """
+    crcs = [zlib.crc32(traces[c, s]) for c, s in np.ndindex(*traces.shape[:2])]
+    return np.array(crcs, np.uint32).reshape(traces.shape[:2])
+
+
 def _check_block(
     streams: _Streams, block: np.ndarray, s0: int, s1: int, path: Path
-) -> tuple[float, np.ndarray]:
+) -> tuple[float, np.ndarray, np.ndarray]:
     """Check a block of stations as soon as it is written, against the original's.
 
-    The block's streams and exact copies are read back from the file, and the block
-    has to pass verify's rules (see `_compare_block`). An error while decoding counts
-    as a failed check.
+    The bytes of the block's streams are read back from the file once, and decoded with
+    the starts, sizes and gains recorded for them, and the block's exact copies are read
+    back. The block has to pass verify's rules against the original's traces (see
+    `_compare_block`). An error while decoding counts as a failed check. The CRC-32s of
+    what passed are returned, so that the closed file can be shown to hold it.
 
     Parameters
     ----------
@@ -1128,19 +1242,21 @@ def _check_block(
     error : float
         The block's largest error as the file decompresses, as a fraction of a
         trace's peak.
-    crcs : np.ndarray
-        Each stream's CRC-32 as it was read back: uint32 of shape
+    stream_crcs : np.ndarray
+        The CRC-32 of each stream, of the very bytes decoded: uint32 of shape
         (component, s1 - s0).
+    exact_crcs : np.ndarray
+        The CRC-32 of each of the block's exact copies, of the bytes read back and
+        compared: uint32 of shape (component, the block's real stations).
 
     Raises
     ------
     CheckFailed
         If the block fails, or a stream doesn't decode.
     """
-    starts, nbytes = streams.starts[:, s0:s1], streams.nbytes[:, s0:s1]
-    crcs = _crc32s(streams.compressed, starts, nbytes)
+    read = streams.read(s0, s1)
     try:
-        error, passed = _compare_block(streams, block, streams.exact_stations, s0, s1)
+        decoded = streams.decode(s0, s1, read)
     except (
         ValueError,
         pyflac.DecoderInitException,
@@ -1149,63 +1265,100 @@ def _check_block(
         raise CheckFailed(
             f"{path}: stations {s0} to {s1 - 1} don't decode ({e})"
         ) from e
+    real = streams.exact_stations
+    error, passed = _compare_block(streams, block, decoded, real, s0, s1)
     if not passed:
         raise CheckFailed(
             f"{path}: stations {s0} to {s1 - 1} don't come back as they should at "
             f"{streams.bits} bits"
         )
-    return error, crcs
+    data, starts = read
+    copies = real[_in_block(real, s0, s1)] - s0  # Counted from the block's first.
+    stream_crcs = _stream_crcs(data, starts, streams.nbytes[:, s0:s1])
+    return error, stream_crcs, _trace_crcs(decoded[:, copies])
 
 
-def _check_structure(
-    path: Path,
-    datasets: dict[str, np.ndarray],
-    attrs: dict[str, object],
-    nt: int,
-    crcs: np.ndarray,
-    blocks: list[tuple[int, int]],
+@dataclass(frozen=True)
+class _Record:
+    """What a pass of `compress_file` wrote to the group, and the CRC-32s of what it judged.
+
+    Attributes
+    ----------
+    datasets : dict[str, np.ndarray]
+        The datasets written once the pass is done, by name: ``stream_starts``,
+        ``stream_bytes``, ``stream_gains``, ``stream_offsets`` and ``exact_stations``.
+    attrs : dict[str, object]
+        The group's attributes, by name.
+    nt : int
+        The number of samples in every trace, which ``stream_size`` records.
+    stream_crcs : np.ndarray
+        The CRC-32 of each trace's stream, of the bytes decoded during the pass:
+        uint32 of shape (component, station).
+    exact_crcs : np.ndarray
+        The CRC-32 of each exact copy, of the bytes read back and compared during the
+        pass: uint32 of shape (component, real station).
+    blocks : list[tuple[int, int]]
+        The pass's blocks, each its first station and the station after its last.
+    """
+
+    datasets: dict[str, np.ndarray]
+    attrs: dict[str, object]
+    nt: int
+    stream_crcs: np.ndarray
+    exact_crcs: np.ndarray
+    blocks: list[tuple[int, int]]
+
+
+def _check_reopened(
+    path: Path, original: xr.Dataset, real: np.ndarray, record: _Record
 ) -> None:
-    """Check that a closed compressed file holds what `compress_file` wrote and checked.
+    """Reopen a closed compressed file, and check it against its pass and its original.
 
-    The file is reopened for reading. Its group has to hold the datasets and the
-    attributes written, each as it was written; the streams and the exact copies
-    have to have their types and shapes; and every stream has to have the CRC-32 it
-    had when the pass decoded it.
+    The file is reopened read-only, and compared with what the pass recorded:
+
+    - the group holds just the datasets and the attributes written, each attribute with
+      the value written, the setting's ``bits`` included;
+    - ``stream_starts``, ``stream_bytes``, ``stream_gains``, ``stream_offsets`` and
+      ``exact_stations`` hold what was written, in its type, and ``stream_size`` is the
+      number of samples in a trace;
+    - the streams and the exact copies are of their type and shape;
+    - read back a block at a time, every stream and every exact copy has the CRC-32 of
+      the bytes judged during the pass, so the file holds what was judged.
+
+    Then it is compared with the original, still open, in everything but the
+    waveform's samples, as `verify_file` compares them (see `_same_besides_samples`).
+    The original's samples aren't read again.
 
     Parameters
     ----------
     path : Path
-        The file, closed since it was written.
-    datasets : dict[str, np.ndarray]
-        The datasets written when the pass was done, by name.
-    attrs : dict[str, object]
-        The group's attributes, by name.
-    nt : int
-        The number of samples in every trace.
-    crcs : np.ndarray
-        Each trace's stream's CRC-32, as the pass read it back, of shape
-        (component, station).
-    blocks : list[tuple[int, int]]
-        The blocks the pass wrote, each its first station and the station after its
-        last.
+        The compressed file, closed since it was written.
+    original : xr.Dataset
+        The original, open.
+    real : np.ndarray
+        The original's real stations, in increasing order.
+    record : _Record
+        What the pass wrote, and the CRC-32s of what it judged.
 
     Raises
     ------
     CheckFailed
-        If the file differs in any of these.
+        If the file differs from the record or from the original in any of these.
     """
-    starts, nbytes = datasets["stream_starts"], datasets["stream_bytes"]
+    datasets, nt = record.datasets, record.nt
+    n_component = datasets["stream_starts"].shape[0]
     n_exact = datasets["exact_stations"].size
     shapes = {
-        "compressed": (np.dtype(np.uint8), (int(nbytes.sum()),)),
-        "exact_waveform": (np.dtype(np.float32), (starts.shape[0], n_exact, nt)),
+        "compressed": (np.dtype(np.uint8), (int(datasets["stream_bytes"].sum()),)),
+        "exact_waveform": (np.dtype(np.float32), (n_component, n_exact, nt)),
     }
     with h5py.File(path, "r") as f:
         group = f.get(GROUP)
         if not isinstance(group, h5py.Group) or set(group) != {*datasets, *shapes}:
             raise CheckFailed(f"{path} doesn't hold the datasets that were written")
-        if set(group.attrs) != set(attrs) or not all(
-            np.array_equal(group.attrs[name], value) for name, value in attrs.items()
+        if set(group.attrs) != set(record.attrs) or not all(
+            np.array_equal(group.attrs[name], value)
+            for name, value in record.attrs.items()
         ):
             raise CheckFailed(
                 f"{path}: the attributes of {GROUP} differ from those written"
@@ -1223,14 +1376,27 @@ def _check_structure(
                 )
         if dict(group["stream_starts"].attrs) != {"stream_size": nt}:
             raise CheckFailed(f"{path}: stream_size isn't {nt}, the samples in a trace")
-        for s0, s1 in blocks:
-            here = np.s_[:, s0:s1]
-            if not np.array_equal(
-                _crc32s(group["compressed"], starts[here], nbytes[here]), crcs[here]
-            ):
+        # As written, so it opens as a reader opens it.
+        streams = _open_streams(f, path)
+        for s0, s1 in record.blocks:
+            data, starts = streams.read(s0, s1)
+            crcs = _stream_crcs(data, starts, streams.nbytes[:, s0:s1])
+            if not np.array_equal(crcs, record.stream_crcs[:, s0:s1]):
                 raise CheckFailed(
                     f"{path}: a stream of stations {s0} to {s1 - 1} differs from the "
                     "one checked"
+                )
+            here = _in_block(streams.exact_stations, s0, s1)
+            crcs = _trace_crcs(streams.exact_waveform[:, here])
+            if not np.array_equal(crcs, record.exact_crcs[:, here]):
+                raise CheckFailed(
+                    f"{path}: an exact copy of stations {s0} to {s1 - 1} differs from "
+                    "the one checked"
+                )
+        with xr.open_dataset(path, engine="h5netcdf") as rest:
+            if not _same_besides_samples(original, real, rest, streams):
+                raise CheckFailed(
+                    f"{path} differs from the original besides the waveform's samples"
                 )
 
 
@@ -1343,28 +1509,15 @@ def verify_file(
                 f"{compressed} decodes to a waveform of shape {shape}, but the "
                 f"original {original} holds one of shape {waveform.shape}"
             )
-        # `identical` compares attribute values and not their types, so the types
-        # and the encoding are compared on their own.
-        same_attrs = xr.Dataset(attrs=dict(waveform.attrs)).identical(
-            xr.Dataset(attrs=streams.waveform_attrs)
-        ) and _written_dtypes(waveform.attrs) == _written_dtypes(streams.waveform_attrs)
-        # The encoding as JSON, so a NaN fill value equals a NaN one.
-        same_encoding = json.loads(_encoding_json(waveform.encoding)) == json.loads(
-            _encoding_json(streams.encoding)
-        )
-        passed = (
-            ds.drop_vars("waveform").identical(rest)
-            and same_attrs
-            and same_encoding
-            and np.array_equal(streams.exact_stations, real)
-        )
+        passed = _same_besides_samples(ds, real, rest, streams)
         if block_stations is None:
             block_stations = block_stations_for(
                 shape[0], shape[2], _station_chunk(waveform), BLOCK_BYTES
             )
         for s0, s1 in _blocks(waveform.shape[1], block_stations):
             block = waveform[:, s0:s1, :].values
-            error, block_passed = _compare_block(streams, block, real, s0, s1)
+            decoded = streams.decode(s0, s1)
+            error, block_passed = _compare_block(streams, block, decoded, real, s0, s1)
             passed = passed and block_passed
             worst = np.maximum(worst, error)  # A NaN stays.
             gc.collect()
