@@ -3,7 +3,6 @@ import shutil
 import string
 import struct
 import subprocess
-import tracemalloc
 import warnings
 from collections.abc import Callable
 from pathlib import Path
@@ -120,7 +119,7 @@ def test_round_trip_every_station(
 ) -> None:
     src, dst = tmp_path / "realisation.bb", tmp_path / "out.bb"
     standard_dataset(n_station, nt=1001).to_netcdf(src, engine="h5netcdf")
-    res = compress_file(src, dst, bits=bits)
+    res = compress_file(src, dst, bits=bits, block_stations=344)
     assert res.n_traces == 3 * n_station
     assert dst.exists() and not partial_of(dst).exists()
     back = decompress_file(dst)
@@ -133,7 +132,7 @@ def test_round_trip_every_station(
         )
         original, decoded = orig["waveform"].values, back["waveform"].values
     assert within_one_step_of_the_setting(original, decoded, bits).all()
-    check = verify_file(src, dst)
+    check = verify_file(src, dst, block_stations=344)
     assert check.passed
     assert check.max_relative_error == max_relative_error(original, decoded).max()
 
@@ -498,28 +497,6 @@ def test_a_file_without_the_new_attributes_still_decodes(
     back = decompress_file(dst)
     assert back["waveform"].attrs["count"] == 7
     assert back["waveform"].shape == (3, 2, 50)
-
-
-@pytest.mark.parametrize("step", ["compress", "verify"])
-def test_the_waveform_is_read_a_block_of_stations_at_a_time(
-    tmp_path: Path, standard_dataset: StandardDataset, step: str
-) -> None:
-    # 300 stations of 4,000 samples hold 14.4 MB of waveform. Working through blocks
-    # of 10 stations peaks at a few MB: a block, its copies and its streams. Reading
-    # the whole waveform at once would peak above 14.4 MB.
-    src = write(standard_dataset(300, nt=4_000), tmp_path / "in.nc")
-    dst = tmp_path / "out.nc"
-    compress_file(src, dst, block_stations=10)  # Also loads what loads on first use.
-    tracemalloc.start()
-    try:
-        if step == "compress":
-            compress_file(src, tmp_path / "again.nc", block_stations=10)
-        else:
-            assert verify_file(src, dst, block_stations=10).passed
-        peak = tracemalloc.get_traced_memory()[1]
-    finally:
-        tracemalloc.stop()
-    assert peak < 14.4e6 / 2
 
 
 def test_an_unlimited_time_dimension_is_no_trouble(

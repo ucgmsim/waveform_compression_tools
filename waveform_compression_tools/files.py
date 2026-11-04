@@ -36,6 +36,7 @@ verified a block of stations at a time. A compressed file appears at its path on
 when it is complete: it is written to the path with ``.partial`` added, then renamed.
 """
 
+import gc
 import json
 import os
 import time
@@ -61,7 +62,8 @@ from .quantise import full_scale
 from .stations import REAL_STATION_RULE, is_real_station
 
 GROUP = "_flac_compressed_waveform"
-BLOCK_STATIONS = 344
+# The waveform read at once: a block holds about this many bytes of it as float32.
+BLOCK_BYTES = 128 * 2**20
 # What every compressed file records as its encoder: this package and its version.
 ENCODER = f"waveform_compression_tools {__version__}"
 
@@ -175,6 +177,59 @@ class _Stopwatch:
         self.seconds[stage] += now - self._last
         self.cpu_seconds[stage] += now_cpu - self._last_cpu
         self._last, self._last_cpu = now, now_cpu
+
+
+def block_stations_for(
+    n_component: int,
+    nt: int,
+    station_chunk: int | None,
+    block_bytes: int = BLOCK_BYTES,
+) -> int:
+    """Choose how many stations to read at once.
+
+    The budget gives the number of stations whose float32 samples fit in
+    `block_bytes`. For a chunked waveform the block is whole station chunks, so no
+    chunk is read twice, unless that would exceed the budget by more than a quarter.
+
+    Parameters
+    ----------
+    n_component : int
+        The number of components.
+    nt : int
+        The number of samples in a trace.
+    station_chunk : int or None
+        The waveform's chunk along the station axis, or None if it is contiguous.
+    block_bytes : int, default BLOCK_BYTES
+        The memory budget for a block of the waveform.
+
+    Returns
+    -------
+    int
+        The number of stations in a block, at least 1.
+    """
+    stations = max(1, block_bytes // (4 * n_component * nt))
+    if station_chunk is None:
+        return stations
+    block = max(1, round(stations / station_chunk)) * station_chunk
+    return block if block <= stations + stations // 4 else stations
+
+
+def _station_chunk(waveform: xr.DataArray) -> int | None:
+    """Return the waveform's chunk along the station axis.
+
+    Parameters
+    ----------
+    waveform : xr.DataArray
+        The waveform, as opened from a file, with dimensions (component, station,
+        time).
+
+    Returns
+    -------
+    int or None
+        The chunk's length in stations, or None if the waveform is contiguous.
+    """
+    chunks = waveform.encoding.get("chunksizes")
+    return None if chunks is None else int(chunks[1])
 
 
 def _blocks(n_station: int, block_stations: int) -> list[tuple[int, int]]:
@@ -454,7 +509,7 @@ def compress_file(
     dst: Path,
     bits: int = 32,
     level: int = 5,
-    block_stations: int = BLOCK_STATIONS,
+    block_stations: int | None = None,
 ) -> CompressResult:
     """Compress a netCDF file in the standard layout, one FLAC stream per trace.
 
@@ -478,8 +533,10 @@ def compress_file(
         The quantisation setting, from 8 to 32.
     level : int, default 5
         The FLAC compression level, from 0 (fastest) to 8 (smallest).
-    block_stations : int, default 344
-        The most stations read and encoded at once.
+    block_stations : int, optional
+        The most stations read and encoded at once. By default a block holds about
+        `BLOCK_BYTES` of waveform, in whole chunks of stations if the waveform is
+        chunked (see `block_stations_for`).
 
     Returns
     -------
@@ -531,6 +588,10 @@ def compress_file(
         if exact.size == n_station:
             raise AllStationsReal(
                 f"all {n_station} stations of {src} are real, so it isn't compressed"
+            )
+        if block_stations is None:
+            block_stations = block_stations_for(
+                n_component, nt, _station_chunk(waveform), BLOCK_BYTES
             )
         blocks = _blocks(n_station, block_stations)
         waveform_attrs = json.dumps(dict(waveform.attrs), default=_plain)
@@ -592,6 +653,9 @@ def compress_file(
                     here = _in_block(exact, s0, s1)
                     exact_waveform[:, here] = block[:, exact[here] - s0]
                     stopwatch.lap("write")
+                    # pyflac's encoders keep their output in reference cycles, which
+                    # would otherwise wait for the next collection and add up.
+                    gc.collect()
                 group.create_dataset("stream_starts", data=starts)
                 group["stream_starts"].attrs["stream_size"] = nt
                 group.create_dataset("stream_bytes", data=nbytes)
@@ -844,7 +908,8 @@ def decompress_file(path: Path) -> xr.Dataset:
         streams = _open_streams(f, path)
         n_component, n_station = streams.starts.shape
         waveform = np.empty((n_component, n_station, streams.nt), np.float32)
-        for s0, s1 in _blocks(n_station, BLOCK_STATIONS):
+        block_stations = block_stations_for(n_component, streams.nt, None, BLOCK_BYTES)
+        for s0, s1 in _blocks(n_station, block_stations):
             block = streams.decode(s0, s1)
             streams.put_back_exact(block, s0, s1)
             waveform[:, s0:s1] = block
@@ -855,7 +920,7 @@ def decompress_file(path: Path) -> xr.Dataset:
 
 
 def verify_file(
-    original: Path, compressed: Path, block_stations: int = BLOCK_STATIONS
+    original: Path, compressed: Path, block_stations: int | None = None
 ) -> VerifyResult:
     """Check a compressed file against its original, a block of stations at a time.
 
@@ -879,8 +944,10 @@ def verify_file(
         The netCDF file that was compressed, in the standard layout.
     compressed : Path
         The file `compress_file` wrote from it.
-    block_stations : int, default 344
-        The most stations read and decoded at once. It need not be the number the
+    block_stations : int, optional
+        The most stations read and decoded at once. By default a block holds about
+        `BLOCK_BYTES` of waveform, in whole chunks of stations if the original is
+        chunked (see `block_stations_for`). It need not be the number the
         file was compressed with.
 
     Returns
@@ -937,6 +1004,10 @@ def verify_file(
             and same_encoding
             and np.array_equal(streams.exact_stations, real)
         )
+        if block_stations is None:
+            block_stations = block_stations_for(
+                shape[0], shape[2], _station_chunk(waveform), BLOCK_BYTES
+            )
         for s0, s1 in _blocks(waveform.shape[1], block_stations):
             block = waveform[:, s0:s1, :].values
             decoded = streams.decode(s0, s1)
@@ -962,6 +1033,7 @@ def verify_file(
                 block[:, here].view(np.uint32), decoded[:, here].view(np.uint32)
             )
             worst = np.maximum(worst, error.max())
+            gc.collect()
     return VerifyResult(
         max_relative_error=float(worst),
         passed=passed,

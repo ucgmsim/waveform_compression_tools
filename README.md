@@ -85,8 +85,8 @@ waveform-compression-tools verify ORIGINAL COMPRESSED                 # exits 1 
 waveform-compression-tools convert-bbbin SRC DST                      # legacy BB.bin -> netCDF file
 ```
 
-- `compress` reads, encodes and writes a block of 344 stations at a time, so its memory is a few times one block, however big the file is.
-- `decompress` holds the whole waveform in memory, so it suits files that fit there: it needs 4 bytes a sample, plus a block of up to 344 stations and some working space. Python's `decompress_file` does the same.
+- `compress` reads, encodes and writes a block of about 128 MiB of waveform at a time (whole chunks of stations if the file is chunked), so its memory is a few times one block, however big the file is.
+- `decompress` holds the whole waveform in memory, so it suits files that fit there: it needs 4 bytes a sample, plus a block of 128 MiB and some working space. Python's `decompress_file` does the same.
 - `verify` decodes the compressed file a block at a time and exits with status 0 only if every trace decodes within the bound its setting promises and within one step of the original, the real stations come back bit for bit, the file holds an exact copy of every real station and of no other, and everything else in the file, the waveform's attributes included, is identical to the original's.
 - A command that can't do its work prints a message and exits with status 1, leaving nothing at its destination: a file appears there only when it is complete (it is written to the destination with `.partial` added, then renamed). Arguments that Typer refuses, such as a file that doesn't exist or a `--level` outside 0 to 8, exit with status 2.
 

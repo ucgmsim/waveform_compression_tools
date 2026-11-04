@@ -298,8 +298,8 @@ def decompress(
     every other sample is within one quantisation step of the original.
 
     The whole waveform is decoded into memory, so this command suits files whose
-    waveform fits there: it needs 4 bytes for each sample, plus a block of up to 344
-    stations and some working space. The file appears at DST only when it is complete.
+    waveform fits there: it needs 4 bytes for each sample, plus a block of 128 MiB
+    and some working space. The file appears at DST only when it is complete.
     \f
     Parameters
     ----------
