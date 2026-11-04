@@ -17,14 +17,12 @@ from waveform_compression_tools import files
 from waveform_compression_tools.codec import (
     STANDARD_DIMS,
     EncodedBlock,
-    NotStandardLayout,
     encode_block,
     max_relative_error,
     within_one_step,
 )
 from waveform_compression_tools.files import (
     GROUP,
-    AllStationsReal,
     compress_file,
     decompress_file,
     is_compressed,
@@ -208,21 +206,6 @@ def test_a_file_decodes_by_the_readme_alone(
     assert bit_identical(waveform, decompress_file(dst)["waveform"].values)
 
 
-def test_refuses_non_standard_and_leaves_nothing(
-    tmp_path: Path, standard_dataset: StandardDataset
-) -> None:
-    ds = standard_dataset(2, nt=50)
-    standard = write(ds, tmp_path / "standard.nc")
-    ds["waveform"] = ds["waveform"].astype(np.float64)
-    src, dst = write(ds, tmp_path / "in.nc"), tmp_path / "out.nc"
-    with pytest.raises(NotStandardLayout):
-        compress_file(src, dst)
-    assert not dst.exists() and not partial_of(dst).exists()
-    compress_file(standard, dst)
-    with pytest.raises(NotStandardLayout):
-        verify_file(src, dst)
-
-
 @pytest.mark.parametrize(
     "error",
     [
@@ -298,34 +281,6 @@ def test_verify_holds_a_file_to_the_bound_its_setting_promises(
     check = verify_file(src, dst)
     assert not check.passed
     assert 1 / full_scale(32) < check.max_relative_error <= 1 / full_scale(24)
-
-
-def test_verify_fails_a_file_whose_gains_are_all_1(
-    tmp_path: Path, standard_dataset: StandardDataset, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # As an encoder that wrote gains of 1 would: every trace rounded to whole units,
-    # so every sample is within one step, 1, of the original, and far outside the
-    # bound of the setting the file declares.
-    def encode_with_gains_of_1(
-        waveform: np.ndarray, bits: int, level: int
-    ) -> EncodedBlock:
-        gains = np.ones(waveform.shape[:2])
-        streams = [
-            encode_stream(quantise(waveform[c, s], 1.0), level)
-            for c, s in np.ndindex(*gains.shape)
-        ]
-        nbytes = np.array([len(stream) for stream in streams], np.int64)
-        return EncodedBlock(streams, nbytes.reshape(gains.shape), gains)
-
-    src = write(standard_dataset(3, nt=400), tmp_path / "in.nc")
-    dst = tmp_path / "out.nc"
-    monkeypatch.setattr(files, "encode_block", encode_with_gains_of_1)
-    compress_file(src, dst)
-    with xr.open_dataset(src, engine="h5netcdf") as orig:
-        original = orig["waveform"].values
-    decoded = decompress_file(dst)["waveform"].values
-    assert within_one_step(original, decoded, np.ones((3, 3)))
-    assert not verify_file(src, dst).passed
 
 
 def test_verify_fails_a_station_that_never_moved_but_decodes_to_something(
@@ -514,12 +469,12 @@ def test_an_unlimited_time_dimension_is_no_trouble(
     assert verify_file(src, dst).passed
 
 
-def test_is_compressed(tmp_path: Path, standard_dataset: StandardDataset) -> None:
+def test_a_file_that_is_not_compressed_is_not_said_to_be(
+    tmp_path: Path, standard_dataset: StandardDataset
+) -> None:
+    # A compressed file is test_check.py's "already compressed" refusal.
     src = write(standard_dataset(2, nt=50), tmp_path / "in.nc")
-    dst = tmp_path / "out.nc"
-    compress_file(src, dst)
     (tmp_path / "notes.txt").write_text("not HDF5")
-    assert is_compressed(dst)
     assert not is_compressed(src)
     assert not is_compressed(tmp_path / "notes.txt")
     assert not is_compressed(tmp_path / "missing.nc")
@@ -584,22 +539,18 @@ def test_real_stations_come_back_exactly(
 
 # A netCDF file holds station names as text, which can be any Unicode, padded with
 # whitespace (HDF5 can't store a NUL in text), or as bytes of a fixed length, padded with
-# NULs, which are read as ASCII.
+# NULs, which are read as ASCII. Bytes that aren't ASCII are refused, rather than read
+# some other way: that is test_check.py's refusal of them.
 @pytest.mark.parametrize(
-    ("names", "refused"),
+    "names",
     [
         pytest.param(
             ["Ōtaki", " KIKS ", "S000002 ", "\tOPZ", "6c5SYSL", "22008d3\n"],
-            False,
             id="text",
         ),
         pytest.param(
             [b"OPZ", b" KIKS ", b"6c5SYSL ", b"\0S000003", b"ABCDEFGH", b"22008d3"],
-            False,
             id="fixed-length ASCII bytes",
-        ),
-        pytest.param(
-            ["Ōtaki".encode(), b"S000001"], True, id="bytes that aren't ASCII"
         ),
     ],
 )
@@ -607,16 +558,9 @@ def test_station_names_come_back_exactly(
     tmp_path: Path,
     standard_dataset: StandardDataset,
     names: list[str] | list[bytes],
-    refused: bool,
 ) -> None:
     ds = standard_dataset(len(names), nt=50).assign_coords(station=np.array(names))
     src, dst = write(ds, tmp_path / "in.nc"), tmp_path / "out.nc"
-    if refused:
-        # Refused, rather than read some other way.
-        with pytest.raises(ValueError):
-            compress_file(src, dst)
-        assert not dst.exists() and not partial_of(dst).exists()
-        return
     compress_file(src, dst)
     back = decompress_file(dst)["station"]
     with xr.open_dataset(src, engine="h5netcdf") as orig:
@@ -631,36 +575,6 @@ def test_station_names_come_back_exactly(
         exact_stations = f[GROUP]["exact_stations"][...].tolist()
     assert exact_stations == [i for i, name in enumerate(unpadded) if len(name) != 7]
     assert verify_file(src, dst).passed
-
-
-def test_a_file_whose_stations_are_all_real_is_not_compressed(
-    tmp_path: Path, standard_dataset: StandardDataset
-) -> None:
-    src = write(standard_dataset(3, nt=100, real=(0, 1, 2)), tmp_path / "in.nc")
-    dst = tmp_path / "out.nc"
-    with pytest.raises(AllStationsReal, match="real"):
-        compress_file(src, dst)
-    assert not dst.exists() and not partial_of(dst).exists()
-    assert issubclass(AllStationsReal, ValueError)
-
-
-@pytest.mark.parametrize("names", ["none", "along another dimension"])
-def test_real_stations_are_found_by_a_station_coordinate(
-    tmp_path: Path, standard_dataset: StandardDataset, names: str
-) -> None:
-    ds = standard_dataset(3, nt=100)
-    standard, dst = write(ds, tmp_path / "standard.nc"), tmp_path / "out.nc"
-    unnamed = ds.drop_vars("station")
-    if names == "along another dimension":
-        # Names that would make station 1 real, but they aren't the stations' names.
-        unnamed = unnamed.assign_coords(station=("site", ["6c5SYSL", "OPZ", "22008d3"]))
-    src = write(unnamed, tmp_path / "in.nc")
-    with pytest.raises(NotStandardLayout, match="station"):
-        compress_file(src, dst)
-    assert not dst.exists() and not partial_of(dst).exists()
-    compress_file(standard, dst)
-    with pytest.raises(NotStandardLayout, match="station"):
-        verify_file(src, dst)
 
 
 @pytest.mark.parametrize("change", ["one ulp up", "a zero's sign"])
@@ -760,39 +674,6 @@ def test_exact_copies_that_cannot_be_put_back_are_refused(
         verify_file(src, dst)
 
 
-def test_a_source_with_another_group_is_refused(
-    tmp_path: Path, standard_dataset: StandardDataset
-) -> None:
-    # xarray reads only the root group, so the compressed file would go without it.
-    src = write(standard_dataset(2, nt=50), tmp_path / "in.nc")
-    with h5py.File(src, "a") as f:
-        f.create_group("provenance").create_dataset("notes", data=np.arange(3))
-    dst = tmp_path / "out.nc"
-    with pytest.raises(ValueError, match="provenance"):
-        compress_file(src, dst)
-    assert not dst.exists() and not partial_of(dst).exists()
-
-
-@pytest.mark.parametrize(
-    ("src_name", "dst_name"),
-    [
-        pytest.param("in.nc", "in.nc", id="the same path"),
-        pytest.param("in.nc", "link.nc", id="a link to it"),
-        # The partial file is written first, and deleted if anything fails.
-        pytest.param("in.nc.partial", "in.nc", id="its partial"),
-    ],
-)
-def test_a_file_is_never_compressed_over_itself(
-    tmp_path: Path, standard_dataset: StandardDataset, src_name: str, dst_name: str
-) -> None:
-    src = write(standard_dataset(2, nt=50), tmp_path / src_name)
-    (tmp_path / "link.nc").symlink_to(src)
-    before = src.read_bytes()
-    with pytest.raises(ValueError, match="overwrite"):
-        compress_file(src, tmp_path / dst_name)
-    assert src.read_bytes() == before
-
-
 # The waveform's attributes, which the file holds as JSON, changed from the original's
 # {"units": "g"}.
 WAVEFORM_ATTRS = {
@@ -831,20 +712,6 @@ def test_verify_fails_a_file_whose_other_content_changed(
         else:
             f[GROUP].attrs["waveform_attrs"] = json.dumps(WAVEFORM_ATTRS[change])
     assert not verify_file(src, dst).passed
-
-
-def test_a_file_with_no_stations_is_refused_and_nothing_is_written(
-    tmp_path: Path, standard_dataset: StandardDataset
-) -> None:
-    # It would compress to empty arrays, and no real file has no stations. A file
-    # already at the destination stays as it was.
-    src = write(standard_dataset(0, nt=50), tmp_path / "in.nc")
-    dst = tmp_path / "out.nc"
-    dst.write_bytes(b"an earlier file")
-    with pytest.raises(NotStandardLayout, match="no stations"):
-        compress_file(src, dst)
-    assert dst.read_bytes() == b"an earlier file"
-    assert not partial_of(dst).exists()
 
 
 @pytest.mark.parametrize(
@@ -934,32 +801,6 @@ def test_verify_of_an_older_file_expects_jsons_types(
         del f[GROUP].attrs["waveform_encoding"]
         del f[GROUP].attrs["waveform_attr_types"]
     assert verify_file(src, dst).passed is passes
-
-
-def test_an_attribute_whose_type_cannot_be_kept_is_refused(
-    tmp_path: Path, standard_dataset: StandardDataset
-) -> None:
-    src, dst = write(standard_dataset(2, nt=50), tmp_path / "in.nc"), tmp_path / "o.nc"
-    with h5py.File(src, "r+") as f:
-        f["waveform"].attrs.create(
-            "pair", np.zeros((), np.dtype([("a", "<i4"), ("b", "<f4")]))
-        )
-    with pytest.raises(TypeError, match="pair"):
-        compress_file(src, dst)
-    assert not dst.exists()
-    assert not partial_of(dst).exists()
-
-
-def test_a_finite_fill_value_inside_the_data_is_refused(
-    tmp_path: Path, standard_dataset: StandardDataset
-) -> None:
-    ds = standard_dataset(2, nt=50)
-    ds["waveform"].encoding["_FillValue"] = np.float32(0.0)
-    src, dst = write(ds, tmp_path / "in.nc"), tmp_path / "out.nc"
-    with pytest.raises(NotStandardLayout, match="fill value"):
-        compress_file(src, dst, bits=8)
-    assert not dst.exists()
-    assert not partial_of(dst).exists()
 
 
 def test_a_finite_fill_value_far_from_the_data_round_trips(

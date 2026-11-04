@@ -2,15 +2,11 @@ from collections.abc import Callable
 
 import numpy as np
 import pytest
-import xarray as xr
 from hypothesis import given
 from hypothesis import strategies as st
 from hypothesis.extra.numpy import arrays
 
 from waveform_compression_tools.codec import (
-    STANDARD_DIMS,
-    NotStandardLayout,
-    check_standard,
     decode_block,
     encode_block,
     max_relative_error,
@@ -117,34 +113,6 @@ def test_kit_round_trip_within_one_step(
     back = round_trip(w, bits)
     assert within_one_step(w, back, encode_block(w, bits).gains)
     assert max_relative_error(w, back).max() <= RELATIVE_ERROR_LIMIT[bits]
-
-
-@pytest.mark.parametrize(
-    "ds",
-    [
-        xr.Dataset(
-            {
-                "waveform": (
-                    ("station", "component", "time"),
-                    np.zeros((2, 3, 4), np.float32),
-                )
-            }
-        ),
-        xr.Dataset({"waveform": (STANDARD_DIMS, np.zeros((3, 2, 4), np.float64))}),
-        xr.Dataset({"other": (STANDARD_DIMS, np.zeros((3, 2, 4), np.float32))}),
-    ],
-)
-def test_check_standard_refuses(ds: xr.Dataset) -> None:
-    with pytest.raises(NotStandardLayout):
-        check_standard(ds)
-
-
-@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
-def test_block_with_a_non_finite_sample_is_refused(bad: float) -> None:
-    w = random_walks((3, 2, 100))
-    w[2, 1, 50] = bad
-    with pytest.raises(ValueError, match="non-finite"):
-        encode_block(w)
 
 
 @pytest.mark.parametrize("bits", [32, 24, 17])

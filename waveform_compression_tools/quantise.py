@@ -9,6 +9,8 @@ gives every sample back within one quantisation step, ``1 / gain``.
 
 import numpy as np
 
+from .errors import NonFiniteSamples
+
 
 def full_scale(bits: int) -> int:
     """Return the largest value of a signed integer with the given bits.
@@ -80,12 +82,12 @@ def quantise(trace: np.ndarray, gain: float) -> np.ndarray:
 
     Raises
     ------
-    ValueError
+    NonFiniteSamples
         If the trace holds a NaN or an infinity.
     """
     finite = np.isfinite(trace)
     if not finite.all():
-        raise ValueError(
+        raise NonFiniteSamples(
             f"trace has {int((~finite).sum())} non-finite samples (NaN or infinity)"
         )
     return np.rint(trace.astype(np.float64) * gain).astype(np.int32)

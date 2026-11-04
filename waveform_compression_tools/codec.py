@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import numpy as np
 import xarray as xr
 
+from .errors import NotStandardLayout
 from .quantise import dequantise, gain_for, quantise
 from .stream import decode_stream, encode_stream
 
@@ -31,10 +32,6 @@ STANDARD_COMPONENTS = ("000", "090", "ver")
 # How far past one quantisation step, relative to the step, a decoded sample may be
 # without failing the check. It allows for rounding in float64.
 STEP_SLACK = 1e-9
-
-
-class NotStandardLayout(ValueError):  # noqa: N818
-    """A dataset does not hold its waveform in the layout this package handles."""
 
 
 def check_standard(ds: xr.Dataset) -> None:
@@ -111,10 +108,11 @@ def encode_block(waveform: np.ndarray, bits: int = 32, level: int = 5) -> Encode
 
     Raises
     ------
+    NonFiniteSamples
+        If a trace holds a NaN or an infinity.
     ValueError
         If `waveform` is not a float32 array of three dimensions with at least one
-        sample per trace, if a trace holds a NaN or an infinity, or if `bits` is
-        outside 8 to 32.
+        sample per trace, or if `bits` is outside 8 to 32.
     pyflac.EncoderInitException
         If libFLAC can't start a trace's stream.
     pyflac.EncoderProcessException
