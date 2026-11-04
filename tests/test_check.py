@@ -336,13 +336,21 @@ REFUSALS = {
     "no stations": (NotStandardLayout, True, "no stations"),
     "an attribute JSON can't hold": (NotStandardLayout, True, "JSON"),
     "an attribute whose type can't be kept": (NotStandardLayout, True, "pair"),
+    "conflicting fill values": (NotStandardLayout, True, "differ"),
+    "a vector missing_value": (NotStandardLayout, True, "missing_value"),
     "every station real": (AllStationsReal, True, "real"),
     "a NaN": (NonFiniteSamples, False, "non-finite"),
     "an infinity": (NonFiniteSamples, False, "non-finite"),
     "a negative infinity": (NonFiniteSamples, False, "non-finite"),
     "a fill value inside the data": (NotStandardLayout, False, "fill value"),
+    "a missing_value inside the data": (NotStandardLayout, False, "fill value"),
 }
 NON_FINITE = {"a NaN": np.nan, "an infinity": np.inf, "a negative infinity": -np.inf}
+# xarray warns as it opens a waveform with several fill values, which it reads as
+# missing, before the refusal.
+SEVERAL_FILL_VALUES = pytest.mark.filterwarnings(
+    "ignore:variable 'waveform' has multiple fill values:xarray.SerializationWarning"
+)
 
 
 def refused_input(
@@ -382,10 +390,21 @@ def refused_input(
         ds["waveform"][2, 2, 50] = NON_FINITE[case]
     elif case == "a fill value inside the data":
         ds["waveform"].encoding["_FillValue"] = np.float32(0.0)
+    elif case == "a missing_value inside the data":
+        # Without a _FillValue, so that only the missing_value is inside the data.
+        ds["waveform"].encoding.update(_FillValue=None, missing_value=np.float32(0.0))
     write(ds, src)
     if case == "an HDF5 group":
         with h5py.File(src, "a") as f:
             f.create_group("provenance").create_dataset("notes", data=np.arange(3))
+    elif case == "conflicting fill values":
+        # Beside xarray's NaN _FillValue, as another writer might give it. xarray
+        # couldn't write a decompressed file with both.
+        with h5py.File(src, "r+") as f:
+            f["waveform"].attrs["missing_value"] = np.float32(-1e6)
+    elif case == "a vector missing_value":
+        with h5py.File(src, "r+") as f:
+            f["waveform"].attrs["missing_value"] = np.array([-1e6, -2e6], np.float32)
     elif case == "an attribute JSON can't hold":
         with h5py.File(src, "r+") as f:
             f["waveform"].attrs["gain"] = np.complex128(1 + 2j)
@@ -414,7 +433,15 @@ def refused_input(
     return src, dst, case not in ("the output exists", "a broken link at the output")
 
 
-@pytest.mark.parametrize("case", REFUSALS)
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(case, marks=SEVERAL_FILL_VALUES)
+        if case == "a vector missing_value"
+        else case
+        for case in REFUSALS
+    ],
+)
 def test_refusals_raise_refused_and_write_nothing(
     tmp_path: Path, standard_dataset: StandardDataset, case: str
 ) -> None:

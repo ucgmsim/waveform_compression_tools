@@ -440,7 +440,7 @@ def _encoding_json(encoding: dict) -> str:
         elif isinstance(value, np.generic):
             value = value.item()
         out[name] = value
-    return json.dumps(out)
+    return json.dumps(out, allow_nan=False)
 
 
 def _encoding_back(text: str) -> dict:
@@ -460,6 +460,47 @@ def _encoding_back(text: str) -> dict:
         name: None if value is None else np.float32(value)
         for name, value in json.loads(text).items()
     }
+
+
+def _refuse_unkeepable_fill_values(encoding: dict, src: Path) -> None:
+    """Refuse a waveform whose ``_FillValue`` and ``missing_value`` couldn't be kept.
+
+    Each has to be one value. If both are there, they have to be the same, a NaN the
+    same as a NaN, as the check compares them: xarray can't write a dataset whose two
+    differ, so the file would compress and verify, but the dataset it decompresses to
+    couldn't be written to a file.
+
+    Parameters
+    ----------
+    encoding : dict
+        The waveform's netCDF encoding, as xarray read it.
+    src : Path
+        The file, for the message.
+
+    Raises
+    ------
+    NotStandardLayout
+        If either holds more values than one, or none, or both are there and differ.
+    """
+    given = {
+        name: encoding[name]
+        for name in ("_FillValue", "missing_value")
+        if encoding.get(name) is not None
+    }
+    for name, value in given.items():
+        if np.ndim(value) != 0:
+            raise NotStandardLayout(
+                f"{src} has a {name} of {np.size(value)} values, not one, which a "
+                "compressed file can't keep"
+            )
+    if len(given) == 2:
+        fills = json.loads(_encoding_json(encoding))
+        if fills["_FillValue"] != fills["missing_value"]:
+            raise NotStandardLayout(
+                f"{src} has a _FillValue of {fills['_FillValue']} and a missing_value "
+                f"of {fills['missing_value']}, which differ, so the file it "
+                "decompresses to couldn't be written"
+            )
 
 
 def _real_stations(ds: xr.Dataset) -> np.ndarray:
@@ -603,9 +644,10 @@ def check_compressible(src: Path, dst: Path, overwrite: bool = False) -> None:
         If `src` is a file that isn't HDF5, is not in the standard layout (see
         `waveform_compression_tools.codec.check_standard`), has no ``station``
         coordinate along the station dimension, has a station whose name is bytes that
-        aren't ASCII, has no stations, or has a waveform attribute that can't be
-        written as JSON or whose type can't be kept, as a complex or a compound one
-        can't.
+        aren't ASCII, has no stations, has a waveform attribute that can't be written
+        as JSON or whose type can't be kept, as a complex or a compound one can't, or
+        has a ``_FillValue`` or ``missing_value`` that isn't one value, or both, and
+        they differ.
     AllStationsReal
         If every station of `src` is real, so it stays exact as it is.
     """
@@ -626,6 +668,7 @@ def check_compressible(src: Path, dst: Path, overwrite: bool = False) -> None:
         # Each refuses an attribute that the compressed file can't keep.
         json.dumps(dict(waveform.attrs), default=_plain)
         _attr_types(waveform.attrs)
+        _refuse_unkeepable_fill_values(waveform.encoding, src)
         if exact.size == n_station:
             raise AllStationsReal(
                 f"all {n_station} stations of {src} are real, so it isn't compressed"

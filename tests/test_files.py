@@ -824,3 +824,23 @@ def test_a_finite_fill_value_far_from_the_data_round_trips(
     compress_file(src, dst, bits=8)
     assert verify_file(src, dst).passed
     assert decompress_file(dst)["waveform"].encoding["_FillValue"] == np.float32(-1e6)
+
+
+@pytest.mark.parametrize("fill", [-1e6, np.nan])
+def test_an_equal_fill_value_and_missing_value_round_trip(
+    tmp_path: Path, standard_dataset: StandardDataset, fill: float
+) -> None:
+    # xarray writes a _FillValue alone; another writer may give a missing_value too,
+    # equal to it: far from the data, or NaN beside a NaN, which counts as equal.
+    ds = standard_dataset(2, nt=50)
+    ds["waveform"].encoding["_FillValue"] = np.float32(fill)
+    src, dst = write(ds, tmp_path / "in.nc"), tmp_path / "out.nc"
+    with h5py.File(src, "r+") as f:
+        f["waveform"].attrs["missing_value"] = np.float32(fill)
+    compress_file(src, dst, bits=8)
+    decompress_file(dst).to_netcdf(tmp_path / "back.nc", engine="h5netcdf")
+    with h5py.File(tmp_path / "back.nc", "r") as f:
+        for name in ("_FillValue", "missing_value"):
+            np.testing.assert_array_equal(f["waveform"].attrs[name], np.float32(fill))
+            assert f["waveform"].attrs[name].dtype == np.float32
+    assert verify_file(src, dst).passed
