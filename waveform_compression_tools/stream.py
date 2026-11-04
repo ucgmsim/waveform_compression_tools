@@ -215,21 +215,24 @@ def decode_stream(blob: bytes) -> np.ndarray:
     Returns
     -------
     np.ndarray
-        The samples, as a 1-D int32 array.
+        The samples, as a 1-D int32 array: empty if the blob holds no frames at all,
+        as when it is empty.
 
     Raises
     ------
     pyflac.DecoderProcessException
         If libFLAC reports an error, as it does for a blob that is not a FLAC
         stream, a damaged one, and most that are cut short.
-    ValueError
-        If the blob holds no frames at all, as when it is empty.
 
     Notes
     -----
     A stream carries no sample count, and a cut stream does not always raise: one
     that is cut between frames, or at some places inside a frame, decodes without
-    an error to the whole frames before the cut. A caller that knows how many
-    samples to expect must compare it with the length of the result.
+    an error to the whole frames before the cut, and one cut to nothing decodes to
+    no samples. A caller that knows how many samples to expect must compare it with
+    the length of the result.
     """
-    return np.concatenate(_WholeStreamDecoder(blob).frames).ravel()
+    frames = _WholeStreamDecoder(blob).frames
+    if not frames:
+        return np.empty(0, np.int32)
+    return np.concatenate(frames).ravel()

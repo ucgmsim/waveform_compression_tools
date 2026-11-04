@@ -1,29 +1,68 @@
 """The command line: compress, decompress and verify waveform files, and convert BB.bin.
 
-``waveform-compression-tools`` has four commands, each a thin layer over a function of this package:
+``waveform-compression-tools`` has four commands, each a thin layer over this package:
 
-- ``compress SRC DST``: `waveform_compression_tools.files.compress_file`;
-- ``decompress SRC DST``: `waveform_compression_tools.files.decompress_file`, written to a netCDF
-  file;
+- ``compress SRC DST``: `waveform_compression_tools.files.compress_file`, which checks
+  the file it writes, with a JSON record of the run if asked (see
+  `waveform_compression_tools.record`);
+- ``decompress SRC DST``: `waveform_compression_tools.files.decompress_file`, written
+  to a netCDF file;
 - ``verify ORIGINAL COMPRESSED``: `waveform_compression_tools.files.verify_file`;
 - ``convert-bbbin SRC DST``: `waveform_compression_tools.bbbin.convert_bbbin`.
 
-A command that succeeds prints a summary to standard output and exits with status 0.
-One that cannot do its work, or whose check fails, prints a message to standard error
-and exits with status 1, with nothing written at its destination. Arguments that
-Typer refuses, as a file that does not exist or a ``--level`` out of range, exit with
-status 2.
+Every command exits with one of four statuses, which are published: `EXIT_OK` when it
+succeeds; `EXIT_FAILED` when the run goes wrong, as when a file can't be read or
+written, a check fails, or something unexpected happens; `EXIT_USAGE` for arguments
+that Typer refuses; and `EXIT_REFUSED` for an input that can't be used as it is (see
+`waveform_compression_tools.errors.Refused`). A command that succeeds prints a summary
+to standard output. One that fails or refuses prints exactly one line to standard
+error, ``waveform-compression-tools: <path>: <reason>``, where the path names the file
+the problem is about, and leaves nothing at its destination; only a compressed file
+whose record can't be written stays. A file already at a destination is replaced only
+with ``--overwrite``.
 """
 
-import os
+import logging
+import time
+from collections.abc import Generator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, NoReturn
 
 import pyflac
 import typer
-import xarray as xr
 
-from . import bbbin, files
+from . import bbbin, destinations, files
+from .content_hash import content_hash
+from .errors import (
+    CheckFailed,
+    NotBBBin,
+    NotStandardLayout,
+    OutputExists,
+    Refused,
+    SameFile,
+)
+from .record import make_record, write_record
+
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_USAGE = 2
+EXIT_REFUSED = 3
+
+# How every error line starts.
+_PROGRAM = "waveform-compression-tools"
+# The errors that are about a command's output, whichever of its steps raises them.
+_ABOUT_THE_OUTPUT = (SameFile, OutputExists, CheckFailed)
+# What the functions behind the commands document raising when an input can't be used
+# or a run goes wrong. Anything else is unexpected, and its line gives its type.
+_EXPECTED = (OSError, ValueError, CheckFailed)
+# libFLAC's errors as it encodes a trace.
+_ENCODING = (pyflac.EncoderInitException, pyflac.EncoderProcessException)
+
+# pyflac logs each error libFLAC reports while decoding, and the exception that follows
+# says it again. A command says what went wrong in its one line, so the log goes nowhere.
+logging.getLogger("pyflac").addHandler(logging.NullHandler())
+logging.getLogger("pyflac").propagate = False
 
 # Plain help and error text: the paragraphs of a command's help are reflowed, and the
 # output is the same whether or not Rich is installed.
@@ -32,46 +71,288 @@ app = typer.Typer(
     rich_markup_mode=None,
 )
 
-# What the functions behind the commands document raising for a file they can't use.
-_BAD_FILE = (OSError, ValueError, TypeError, pyflac.DecoderProcessException)
 
-
-def _fail(message: str) -> NoReturn:
-    """Print an error message to standard error, and exit with status 1.
-
-    Parameters
-    ----------
-    message : str
-        What went wrong.
-
-    Raises
-    ------
-    typer.Exit
-        Always, with status 1.
-    """
-    typer.echo(f"Error: {message}", err=True)
-    raise typer.Exit(1)
-
-
-def _explain(error: Exception, path: Path) -> str:
-    """Say what went wrong with a file, in words that name the file where they must.
+def _reason(error: Exception) -> str:
+    """Say what went wrong, in words for the error line and the record.
 
     Parameters
     ----------
     error : Exception
-        What the function behind a command raised for a file it can't use.
-    path : Path
-        The file the command read, which is the one a stream that doesn't decode is in.
+        What a command's step raised.
 
     Returns
     -------
     str
-        The error's message. For a stream that doesn't decode, whose own message names
-        nothing, it says that a stream in `path` is damaged.
+        The error's message, which is never empty. libFLAC's errors as it decodes say
+        that a stream is damaged, and those as it encodes that a trace couldn't be
+        encoded. An unexpected error, or one without a message, is named by its type.
     """
+    message = str(error)
     if isinstance(error, pyflac.DecoderProcessException):
-        return f"a stream in {path} is damaged ({error})"
-    return str(error)
+        return f"a FLAC stream is damaged ({message})"
+    if isinstance(error, _ENCODING):
+        return f"a trace couldn't be encoded ({message})"
+    if isinstance(error, _EXPECTED) and message:
+        return message
+    return f"{type(error).__name__}: {message}" if message else type(error).__name__
+
+
+def _say(path: Path, reason: str) -> None:
+    """Print a command's one error line to standard error.
+
+    Parameters
+    ----------
+    path : Path
+        The file the problem is about.
+    reason : str
+        What went wrong.
+    """
+    line = f"{_PROGRAM}: {path}: {reason}"
+    # A message of several lines, as some of xarray's are, is joined into one.
+    typer.echo(" ".join(line.splitlines()), err=True)
+
+
+class _Stop(Exception):  # noqa: N818
+    """Why a command stopped short of its work.
+
+    Parameters
+    ----------
+    path : Path
+        The file the problem is about: the input, the output or the record.
+    error : Exception
+        What went wrong.
+
+    Attributes
+    ----------
+    path : Path
+        The file the problem is about.
+    reason : str
+        What went wrong, in words (see `_reason`).
+    status : str
+        ``"refused"`` for a refusal of the input, and ``"failed"`` otherwise.
+    code : int
+        The status to exit with: `EXIT_REFUSED` or `EXIT_FAILED`.
+    """
+
+    def __init__(self, path: Path, error: Exception) -> None:  # numpydoc ignore=GL08
+        super().__init__(path, error)
+        refused = isinstance(error, Refused)
+        self.path = path
+        self.reason = _reason(error)
+        self.status = "refused" if refused else "failed"
+        self.code = EXIT_REFUSED if refused else EXIT_FAILED
+
+    def exit(self) -> NoReturn:
+        """Print the error line, and exit.
+
+        Raises
+        ------
+        typer.Exit
+            Always, with `code`.
+        """
+        _say(self.path, self.reason)
+        raise typer.Exit(self.code)
+
+
+@contextmanager
+def _about(
+    path: Path,
+    others: Mapping[type[Exception] | tuple[type[Exception], ...], Path] | None = None,
+) -> Generator[None]:
+    """Turn any error in a block into a `_Stop` that names the file it is about.
+
+    Parameters
+    ----------
+    path : Path
+        The file an error in the block is about.
+    others : Mapping, optional
+        Errors that are about another file instead: each kind of error, or a tuple of
+        kinds, and the file.
+
+    Yields
+    ------
+    None
+        Nothing; the block runs.
+
+    Raises
+    ------
+    _Stop
+        For any exception the block raises. `KeyboardInterrupt` and the like are left
+        alone.
+    """
+    try:
+        yield
+    # Every error becomes one line, never a traceback.
+    except Exception as error:
+        for kinds, other in (others or {}).items():
+            if isinstance(error, kinds):
+                path = other
+                break
+        raise _Stop(path, error) from error
+
+
+def _require_folder(path: Path) -> None:
+    """Fail unless the folder that a file is to be written in exists.
+
+    Parameters
+    ----------
+    path : Path
+        The file.
+
+    Raises
+    ------
+    FileNotFoundError
+        If there is no folder at ``path.parent``.
+    """
+    if not path.parent.is_dir():
+        raise FileNotFoundError(
+            f"there is no folder {path.parent} to write {path.name} in"
+        )
+
+
+def _refuse_a_record_over(record: Path, src: Path, dst: Path) -> None:
+    """Refuse a record that would be written over the input or the output.
+
+    Parameters
+    ----------
+    record : Path
+        Where the record is to go.
+    src : Path
+        The input.
+    dst : Path
+        The output.
+
+    Raises
+    ------
+    typer.BadParameter
+        A usage error, if `record`, or `record` with ``.partial`` added, is `src` or
+        `dst` (see `waveform_compression_tools.destinations.refuse_overwriting`).
+    """
+    for path in (src, dst):
+        try:
+            destinations.refuse_overwriting(path, record, overwrite=True)
+        except SameFile as error:
+            raise typer.BadParameter(str(error), param_hint="'--record'") from error
+
+
+def _hash(path: Path, seconds: dict[str, float]) -> str:
+    """Hash a file's content, and count the time it takes.
+
+    Parameters
+    ----------
+    path : Path
+        The file.
+    seconds : dict[str, float]
+        The run's timings: the time is added to ``"hash"``.
+
+    Returns
+    -------
+    str
+        The file's content hash (see `waveform_compression_tools.content_hash`).
+    """
+    start = time.perf_counter()
+    try:
+        return content_hash(path)
+    finally:
+        seconds["hash"] += time.perf_counter() - start
+
+
+def _hash_output(dst: Path, seconds: dict[str, float]) -> str:
+    """Hash the compressed file, or delete it if hashing fails or is interrupted.
+
+    A run whose output isn't hashed doesn't succeed, and a run that doesn't succeed
+    leaves nothing at its destination.
+
+    Parameters
+    ----------
+    dst : Path
+        The compressed file.
+    seconds : dict[str, float]
+        The run's timings: the time is added to ``"hash"``.
+
+    Returns
+    -------
+    str
+        The file's content hash.
+    """
+    try:
+        return _hash(dst, seconds)
+    except BaseException:
+        dst.unlink(missing_ok=True)
+        raise
+
+
+def _write_compress_record(
+    path: Path,
+    *,
+    src: Path,
+    bits: int,
+    start: float,
+    seconds: dict[str, float],
+    input_hash: str | None,
+    result: files.CompressResult | None,
+    output: tuple[Path, int, str] | None,
+    stop: _Stop | None,
+) -> None:
+    """Write the record of a compress run, or exit if it can't be written.
+
+    Parameters
+    ----------
+    path : Path
+        Where the record goes.
+    src : Path
+        The input.
+    bits : int
+        The setting asked for.
+    start : float
+        When the command started, by `time.perf_counter`.
+    seconds : dict[str, float]
+        The run's timings so far: the time spent hashing, as ``"hash"``, and 0.0 for
+        ``"compress"`` and ``"check"``, which come from `result`.
+    input_hash : str or None
+        The input's content hash, if the run got as far as hashing it.
+    result : CompressResult or None
+        What compressing made, if the run got that far.
+    output : tuple[Path, int, str] or None
+        The compressed file's path, size and content hash, if the run succeeded.
+    stop : _Stop or None
+        Why the run stopped short, if it did.
+
+    Raises
+    ------
+    typer.Exit
+        With `EXIT_FAILED`, after the error line, if the record can't be written. A
+        compressed file stays where it is.
+    """
+    seconds = {**seconds, "total": time.perf_counter() - start}
+    if result is not None:
+        seconds["compress"] = result.read_s + result.encode_s + result.write_s
+        seconds["check"] = result.check_s
+    worst = None if result is None else result.max_relative_error
+    output_path, output_bytes, output_hash = output or (None, None, None)
+    try:
+        # make_record takes plain Python values only.
+        record = make_record(
+            status="ok" if stop is None else stop.status,
+            reason="" if stop is None else stop.reason,
+            input_path=src,
+            input_bytes=int(src.stat().st_size),
+            input_hash=input_hash,
+            output_path=output_path,
+            output_bytes=None if output_bytes is None else int(output_bytes),
+            output_hash=output_hash,
+            bits=int(bits),
+            checked=result is not None and bool(result.checked),
+            max_relative_error=None if worst is None else float(worst),
+            n_traces=None if result is None else int(result.n_traces),
+            n_exact_stations=None if result is None else int(result.n_exact),
+            seconds={name: float(value) for name, value in seconds.items()},
+        )
+        write_record(record, path)
+    # Every error becomes one line, never a traceback.
+    except Exception as error:
+        _say(path, f"the record can't be written: {_reason(error)}")
+        raise typer.Exit(EXIT_FAILED) from error
 
 
 def _count(n: int, noun: str) -> str:
@@ -136,54 +417,6 @@ def _factor(before: int, after: int) -> str:
     return f"{after / before:.1f}x larger"
 
 
-def _refuse_overwriting(src: Path, dst: Path) -> None:
-    """Exit unless writing a file to `dst` leaves `src` alone.
-
-    A file is written to `dst` with ``.partial`` added, which is deleted if the write
-    fails, and then renamed to `dst`. Either would destroy `src` if it is `dst`, or
-    `dst` with ``.partial`` added.
-
-    Parameters
-    ----------
-    src : Path
-        The file the command reads.
-    dst : Path
-        The file it writes.
-
-    Raises
-    ------
-    typer.Exit
-        With status 1, if `src` is `dst` or `dst` with ``.partial`` added, by their
-        resolved paths.
-    """
-    if src.resolve() in (dst.resolve(), Path(f"{dst}.partial").resolve()):
-        _fail(f"writing {dst} would overwrite {src}")
-
-
-def _write_netcdf(ds: xr.Dataset, dst: Path) -> None:
-    """Write a dataset to a netCDF file that appears at `dst` only when it is complete.
-
-    It is written by xarray with the h5netcdf engine to `dst` with ``.partial`` added,
-    and renamed to `dst` when it is complete. If anything goes wrong, the partial file
-    is deleted and the exception raised again; a file already at `dst` is then as it
-    was.
-
-    Parameters
-    ----------
-    ds : xr.Dataset
-        The dataset to write.
-    dst : Path
-        Where to write the file. A file already there is replaced.
-    """
-    partial = Path(f"{dst}.partial")
-    try:
-        ds.to_netcdf(partial, engine="h5netcdf")
-        os.replace(partial, dst)
-    except BaseException:
-        partial.unlink(missing_ok=True)
-        raise
-
-
 @app.command()
 def compress(
     src: Annotated[
@@ -200,12 +433,14 @@ def compress(
         typer.Argument(
             metavar="DST",
             dir_okay=False,
-            help="Where to write the compressed file. A file already there is replaced.",
+            help="Where to write the compressed file.",
         ),
     ],
     bits: Annotated[
         int,
-        typer.Option(help="Bits of quantisation, from 8 to 32. 24 is FLAC-24."),
+        typer.Option(
+            min=8, max=32, help="Bits of quantisation, from 8 to 32. 24 is FLAC-24."
+        ),
     ] = 32,
     level: Annotated[
         int,
@@ -215,8 +450,29 @@ def compress(
             help="FLAC compression level, from 0 (fastest) to 8 (smallest).",
         ),
     ] = 5,
+    no_check: Annotated[
+        bool,
+        typer.Option(
+            "--no-check",
+            help="Don't check the compressed file against the original as it is "
+            "written.",
+        ),
+    ] = False,
+    record: Annotated[
+        Path | None,
+        typer.Option(
+            metavar="PATH",
+            dir_okay=False,
+            help="Write a JSON record of the run to PATH, whatever its outcome. A "
+            "record already there is replaced.",
+        ),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite", help="Replace a file already at DST."),
+    ] = False,
 ) -> None:
-    """Compress a netCDF file of waveforms to FLAC.
+    """Compress a netCDF file of waveforms to FLAC, and check it.
 
     Each trace is scaled so that its largest sample is full scale for BITS, rounded to
     an integer and written as one FLAC stream. Every decoded sample is then within one
@@ -227,36 +483,92 @@ def compress(
 
     A station whose name is not exactly 7 characters long is real, and its traces are
     also kept exactly as they were. A file whose stations are all real is not
-    compressed: the command says so, exits with status 1 and writes nothing, so the
-    file stays as it is.
+    compressed: it is refused, and stays as it is.
 
-    The compressed file appears at DST only when it is complete.
+    The compressed file is checked as it is written, against the samples read, unless
+    --no-check is given. It appears at DST only when it is complete, and has passed
+    the check if one is made. A file already at DST is replaced only with --overwrite.
+
+    With --record, a JSON record of the run is written to PATH whether the file is
+    compressed, refused or fails: the input's and the output's paths, sizes and content
+    hashes, the setting, the check's largest error, and the time spent. If the record
+    can't be written, the run fails, though a compressed file stays at DST.
+
+    The command exits with status 0 when the file is compressed, 1 when the run fails,
+    2 for a usage error, and 3 when the file is refused. A refusal or a failure is one
+    line on standard error.
     \f
     Parameters
     ----------
     src : Path
         The netCDF file to compress, in the standard layout.
     dst : Path
-        Where to write the compressed file. A file already there is replaced.
+        Where to write the compressed file.
     bits : int, default 32
         Bits of quantisation, from 8 to 32.
     level : int, default 5
         FLAC compression level, from 0 (fastest) to 8 (smallest).
+    no_check : bool, default False
+        Whether to leave out the check.
+    record : Path, optional
+        Where to write the record of the run.
+    overwrite : bool, default False
+        Whether to replace a file already at `dst`.
 
     Raises
     ------
     typer.Exit
-        With status 1, if the file can't be compressed.
+        With `EXIT_REFUSED` if the file is refused, and `EXIT_FAILED` if the run fails
+        or the record can't be written.
     """
+    start = time.perf_counter()
+    if record is not None:
+        _refuse_a_record_over(record, src, dst)
+    seconds = {"hash": 0.0, "compress": 0.0, "check": 0.0}
+    input_hash: str | None = None
+    result: files.CompressResult | None = None
     try:
-        result = files.compress_file(src, dst, bits, level)
-    except files.AllStationsReal:
-        _fail(
-            f"every station of {src} is real, so it isn't compressed: it stays as it "
-            f"is, and nothing is written to {dst}"
+        with _about(src, {_ABOUT_THE_OUTPUT: dst}):
+            files.check_compressible(src, dst, overwrite)
+        # Before the input is hashed, so that a mistyped folder costs no hash.
+        for path in (dst,) if record is None else (dst, record):
+            with _about(path):
+                _require_folder(path)
+        with _about(src):
+            input_hash = _hash(src, seconds)
+        with _about(src, {_ABOUT_THE_OUTPUT: dst}):
+            result = files.compress_file(
+                src, dst, bits, level, check=not no_check, overwrite=overwrite
+            )
+        with _about(dst):
+            output_hash = _hash_output(dst, seconds)
+    except _Stop as stop:
+        # Unless it is the record's own folder that is missing.
+        if record is not None and stop.path != record:
+            _write_compress_record(
+                record,
+                src=src,
+                bits=bits,
+                start=start,
+                seconds=seconds,
+                input_hash=input_hash,
+                result=result,
+                output=None,
+                stop=stop,
+            )
+        stop.exit()
+    if record is not None:
+        _write_compress_record(
+            record,
+            src=src,
+            bits=bits,
+            start=start,
+            seconds=seconds,
+            input_hash=input_hash,
+            result=result,
+            output=(dst, result.bytes_out, output_hash),
+            stop=None,
         )
-    except _BAD_FILE as e:
-        _fail(_explain(e, src))
     typer.echo(
         f"compressed {src} to {dst} at {result.bits} bits: "
         f"{_count(result.n_traces, 'trace')}, "
@@ -266,7 +578,7 @@ def compress(
         f"{_size(result.bytes_in)} -> {_size(result.bytes_out)}, "
         f"{_factor(result.bytes_in, result.bytes_out)} "
         f"(read {result.read_s:.1f} s, encode {result.encode_s:.1f} s, "
-        f"write {result.write_s:.1f} s)"
+        f"write {result.write_s:.1f} s, check {result.check_s:.1f} s)"
     )
 
 
@@ -284,11 +596,13 @@ def decompress(
     dst: Annotated[
         Path,
         typer.Argument(
-            metavar="DST",
-            dir_okay=False,
-            help="Where to write the netCDF file. A file already there is replaced.",
+            metavar="DST", dir_okay=False, help="Where to write the netCDF file."
         ),
     ],
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite", help="Replace a file already at DST."),
+    ] = False,
 ) -> None:
     """Decompress a file written by compress.
 
@@ -299,27 +613,39 @@ def decompress(
 
     The whole waveform is decoded into memory, so this command suits files whose
     waveform fits there: it needs 4 bytes for each sample, plus a block of 128 MiB
-    and some working space. The file appears at DST only when it is complete.
+    and some working space. The file appears at DST only when it is complete. A file
+    already at DST is replaced only with --overwrite.
+
+    The command exits with status 0 when the file is decompressed, 1 when the run
+    fails, as for a damaged file, 2 for a usage error, and 3 when SRC is refused, as a
+    file that isn't compressed is. A refusal or a failure is one line on standard
+    error.
     \f
     Parameters
     ----------
     src : Path
         The compressed file, written by compress.
     dst : Path
-        Where to write the netCDF file. A file already there is replaced.
+        Where to write the netCDF file.
+    overwrite : bool, default False
+        Whether to replace a file already at `dst`.
 
     Raises
     ------
     typer.Exit
-        With status 1, if SRC is not a compressed file, is damaged, or can't be
-        decoded or written, or if writing DST would overwrite SRC.
+        With `EXIT_REFUSED` if SRC isn't a compressed file that can be read, or if DST
+        is SRC or is there already, and with `EXIT_FAILED` if the run fails.
     """
-    _refuse_overwriting(src, dst)
     try:
-        ds = files.decompress_file(src)
-        _write_netcdf(ds, dst)
-    except _BAD_FILE as e:
-        _fail(_explain(e, src))
+        with _about(dst):
+            destinations.refuse_overwriting(src, dst, overwrite)
+            _require_folder(dst)
+        with _about(src):
+            ds = files.decompress_file(src)
+        with _about(dst):
+            destinations.write_netcdf(ds, dst)
+    except _Stop as stop:
+        stop.exit()
     n_component, n_station, nt = ds["waveform"].shape
     typer.echo(
         f"decompressed {src} to {dst}: "
@@ -357,7 +683,10 @@ def verify(
     for bit, and everything else in the file, the waveform's attributes included, is
     identical to the original's.
 
-    Exits with status 0 if the file passes and 1 if it fails or can't be checked.
+    The command exits with status 0 if the file passes, 1 if it fails or can't be
+    checked, 2 for a usage error, and 3 if either file is refused, as an original that
+    isn't in the standard layout is, or a compressed file that isn't one. A refusal or
+    a failure is one line on standard error.
     \f
     Parameters
     ----------
@@ -369,18 +698,19 @@ def verify(
     Raises
     ------
     typer.Exit
-        With status 1, if the file fails the check or can't be checked.
+        With `EXIT_REFUSED` if either file is refused, and `EXIT_FAILED` if the file
+        fails the check or can't be checked.
     """
     try:
-        result = files.verify_file(original, compressed)
-    except _BAD_FILE as e:
-        _fail(_explain(e, compressed))
+        # verify_file checks only the original's layout.
+        with _about(compressed, {NotStandardLayout: original}):
+            result = files.verify_file(original, compressed)
+    except _Stop as stop:
+        stop.exit()
     error = f"largest error {result.max_relative_error:.2g} of a trace's peak"
     if not result.passed:
-        typer.echo(
-            f"FAILED: {compressed} does not agree with {original} ({error})", err=True
-        )
-        raise typer.Exit(1)
+        _say(compressed, f"doesn't agree with {original} ({error})")
+        raise typer.Exit(EXIT_FAILED)
     typer.echo(
         f"verified: {compressed} agrees with {original} ({error}; "
         f"{_count(result.n_exact, 'real station')} exact; "
@@ -399,37 +729,48 @@ def convert_bbbin(
     dst: Annotated[
         Path,
         typer.Argument(
-            metavar="DST",
-            dir_okay=False,
-            help="Where to write the netCDF file. A file already there is replaced.",
+            metavar="DST", dir_okay=False, help="Where to write the netCDF file."
         ),
     ],
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite", help="Replace a file already at DST."),
+    ] = False,
 ) -> None:
     """Convert a BB.bin file to a netCDF file.
 
     BB.bin is the legacy layout of a simulation's broadband waveforms. DST is in the
     standard layout, which the compress command takes. The whole BB.bin file is read
     into memory, which takes about twice its size at the peak. The file appears at DST
-    only when it is complete.
+    only when it is complete. A file already at DST is replaced only with --overwrite.
+
+    The command exits with status 0 when the file is converted, 1 when the run fails,
+    2 for a usage error, and 3 when SRC is refused, as a file that can't be a BB.bin
+    is. A refusal or a failure is one line on standard error.
     \f
     Parameters
     ----------
     src : Path
         The BB.bin file.
     dst : Path
-        Where to write the netCDF file. A file already there is replaced.
+        Where to write the netCDF file.
+    overwrite : bool, default False
+        Whether to replace a file already at `dst`.
 
     Raises
     ------
     typer.Exit
-        With status 1, if SRC is not a BB.bin file or can't be converted, or if writing
-        DST would overwrite SRC.
+        With `EXIT_REFUSED` if SRC is not a BB.bin file, or if DST is SRC or is there
+        already, and with `EXIT_FAILED` if the run fails.
     """
-    _refuse_overwriting(src, dst)
     try:
-        bbbin.convert_bbbin(src, dst)
-    except _BAD_FILE as e:
-        _fail(_explain(e, src))
+        with _about(dst):
+            _require_folder(dst)
+        # Only a file that can't be a BB.bin is about SRC: the rest is the writing's.
+        with _about(dst, {NotBBBin: src}):
+            bbbin.convert_bbbin(src, dst, overwrite)
+    except _Stop as stop:
+        stop.exit()
     typer.echo(
         f"converted {src} to {dst}: "
         f"{_size(src.stat().st_size)} -> {_size(dst.stat().st_size)}"

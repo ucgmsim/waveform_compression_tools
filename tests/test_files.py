@@ -237,20 +237,6 @@ def test_failure_mid_write_leaves_nothing(
     assert not dst.exists() and not partial_of(dst).exists()
 
 
-def test_results_report_sizes_and_times(
-    tmp_path: Path, standard_dataset: StandardDataset
-) -> None:
-    src = write(standard_dataset(4, nt=500), tmp_path / "in.nc")
-    dst = tmp_path / "out.nc"
-    res = compress_file(src, dst, bits=17)
-    assert (res.bytes_in, res.bytes_out) == (src.stat().st_size, dst.stat().st_size)
-    assert (res.n_traces, res.bits) == (12, 17)
-    assert res.read_s > 0 and res.encode_s > 0 and res.write_s > 0
-    check = verify_file(src, dst)
-    assert check.passed and 0 < check.max_relative_error <= 1 / full_scale(17)
-    assert check.verify_s > 0
-
-
 def test_verify_fails_a_trace_that_decodes_a_few_steps_off(
     tmp_path: Path, standard_dataset: StandardDataset
 ) -> None:

@@ -12,6 +12,7 @@ from waveform_compression_tools.codec import (
     check_standard,
     max_relative_error,
 )
+from waveform_compression_tools.errors import NotBBBin
 from waveform_compression_tools.files import (
     compress_file,
     decompress_file,
@@ -116,9 +117,9 @@ def test_text_that_is_not_ascii_is_refused(
         content, text = bytearray(path.read_bytes()), "Ōtaki".encode()
         content[20 : 20 + len(text)] = text  # At the start of lf_dir.
         path.write_bytes(content)
-    with pytest.raises(UnicodeDecodeError):
+    with pytest.raises(NotBBBin, match="ASCII"):
         read_bbbin(path)
-    with pytest.raises(UnicodeDecodeError):
+    with pytest.raises(NotBBBin, match="ASCII"):
         convert_bbbin(path, tmp_path / "BB.nc")
     assert [p.name for p in tmp_path.iterdir()] == ["BB.bin"]
 
@@ -242,7 +243,7 @@ def test_failure_mid_write_leaves_nothing(
 
     monkeypatch.setattr(xr.Dataset, "to_netcdf", write_some_then_fail)
     with pytest.raises(error, match="writing failed"):
-        convert_bbbin(src, dst)
+        convert_bbbin(src, dst, overwrite=True)
     # The partial file is gone, the file that was at dst is as it was, and so is src.
     assert sorted(p.name for p in tmp_path.iterdir()) == ["BB.bin", "BB.nc"]
     assert dst.read_bytes() == b"an earlier conversion"

@@ -170,9 +170,8 @@ def decode_block(
     ValueError
         If `starts`, `nbytes`, `gains` and `offsets` do not all have the same shape.
         If a stream decodes to some other number of samples than `nt`, as one that
-        was cut short does. The message names the stream's component and station,
-        counting from 0 within this block. Also, with numpy's own message, if a
-        stream holds no frames at all.
+        was cut short does, or cut to nothing. The message names the stream's
+        component and station, counting from 0 within this block.
     pyflac.DecoderProcessException
         If a stream is damaged.
     """

@@ -62,14 +62,15 @@ from .codec import (
     max_relative_error,
     within_one_step,
 )
+from .destinations import refuse_overwriting
 from .errors import (
     AllStationsReal,
     AlreadyCompressed,
     CheckFailed,
     HasGroups,
+    NotCompressed,
     NotStandardLayout,
-    OutputExists,
-    SameFile,
+    UnknownFormat,
 )
 from .quantise import full_scale
 from .stations import REAL_STATION_RULE, is_real_station
@@ -562,7 +563,7 @@ def check_compressible(src: Path, dst: Path, overwrite: bool = False) -> None:
     ------
     SameFile
         If `dst`, or `dst` with ``.partial`` added, resolves to `src`, whatever
-        `overwrite` says.
+        `overwrite` says (see `waveform_compression_tools.destinations`).
     OutputExists
         If something is at `dst` already and `overwrite` is false.
     AlreadyCompressed
@@ -579,13 +580,7 @@ def check_compressible(src: Path, dst: Path, overwrite: bool = False) -> None:
     AllStationsReal
         If every station of `src` is real, so it stays exact as it is.
     """
-    partial = Path(f"{dst}.partial")
-    # The partial file is overwritten, and deleted if anything fails, and the rename
-    # replaces whatever is at dst: either would destroy the source.
-    if src.resolve() in (dst.resolve(), partial.resolve()):
-        raise SameFile(f"compressing {src} to {dst} would overwrite it")
-    if not overwrite and os.path.lexists(dst):
-        raise OutputExists(f"{dst} exists already, and is replaced only if asked")
+    refuse_overwriting(src, dst, overwrite)
     if is_compressed(src):
         raise AlreadyCompressed(f"{src} is compressed already")
     _refuse_subgroups(src)
@@ -986,25 +981,32 @@ def _open_streams(f: h5py.File, path: Path) -> _Streams:
 
     Raises
     ------
+    NotCompressed
+        If the file has no group ``_flac_compressed_waveform``.
+    UnknownFormat
+        If the group is in a format version other than 1, or its ``bits`` is outside 8
+        to 32, which no file can have.
     ValueError
-        If the file has no group ``_flac_compressed_waveform``, the group is in a
-        format version other than 1, its ``bits`` is outside 8 to 32, its
-        ``stream_bytes``, ``stream_gains`` or ``stream_offsets`` differs in shape
-        from its ``stream_starts``, its ``exact_stations`` are not stations of the
-        file in increasing order, or its ``exact_waveform`` is not float32 with each
-        of their traces.
+        If the group's ``stream_bytes``, ``stream_gains`` or ``stream_offsets`` differs
+        in shape from its ``stream_starts``, its ``exact_stations`` are not stations of
+        the file in increasing order, its ``exact_waveform`` is not float32 with each of
+        their traces, or its ``waveform_attr_types`` names an attribute that its
+        ``waveform_attrs`` lacks.
     """
     if GROUP not in f:
-        raise ValueError(f"{path} has no group {GROUP}, so it is not compressed")
+        raise NotCompressed(f"{path} has no group {GROUP}, so it is not compressed")
     group = f[GROUP]
     version = int(group.attrs["format_version"])
     if version != _FORMAT_VERSION:
-        raise ValueError(
+        raise UnknownFormat(
             f"{path} is in format version {version}, "
             f"and only version {_FORMAT_VERSION} can be read"
         )
     bits = int(group.attrs["bits"])
-    full_scale(bits)  # Refuses a setting outside 8 to 32, which no file can have.
+    try:
+        full_scale(bits)
+    except ValueError as e:
+        raise UnknownFormat(f"{path} has a setting that can't be read: {e}") from e
     starts = group["stream_starts"][...]
     # A block reads only its own stations, so it would never see a value too many.
     for name in ("stream_bytes", "stream_gains", "stream_offsets"):
@@ -1036,6 +1038,11 @@ def _open_streams(f: h5py.File, path: Path) -> _Streams:
         )
     waveform_attrs = json.loads(group.attrs["waveform_attrs"])
     for name, dtype in json.loads(group.attrs.get("waveform_attr_types", "{}")).items():
+        if name not in waveform_attrs:
+            raise ValueError(
+                f"{path}: waveform_attr_types names the attribute {name!r}, which "
+                "waveform_attrs lacks"
+            )
         value = waveform_attrs[name]
         waveform_attrs[name] = (
             np.asarray(value, dtype)
@@ -1420,10 +1427,14 @@ def decompress_file(path: Path) -> xr.Dataset:
 
     Raises
     ------
+    NotCompressed
+        If `path` holds no compressed waveform.
+    UnknownFormat
+        If it is in a format version other than 1, or has a setting outside 8 to 32.
     ValueError
-        If `path` is not a compressed file in format version 1 with a setting from 8
-        to 32 and arrays that agree with each other, or a stream decodes to the
-        wrong number of samples.
+        If its arrays don't agree with each other, its ``waveform_attr_types`` names an
+        attribute that its ``waveform_attrs`` lacks, or a stream decodes to the wrong
+        number of samples.
     pyflac.DecoderProcessException
         If a stream is damaged.
     """
@@ -1484,11 +1495,16 @@ def verify_file(
     NotStandardLayout
         If `original` is not in the standard layout, has no ``station`` coordinate,
         or has a station whose name is bytes that are not ASCII.
+    NotCompressed
+        If `compressed` holds no compressed waveform.
+    UnknownFormat
+        If `compressed` is in a format version other than 1, or has a setting outside
+        8 to 32.
     ValueError
-        If `compressed` is not a compressed file in format version 1 with a setting
-        from 8 to 32 and arrays that agree with each other, if it decodes to a
-        waveform of another shape than the original's, if a stream decodes to the
-        wrong number of samples, or if `block_stations` is less than 1.
+        If the arrays of `compressed` don't agree with each other, if its
+        ``waveform_attr_types`` names an attribute that its ``waveform_attrs`` lacks,
+        if it decodes to a waveform of another shape than the original's, if a stream
+        decodes to the wrong number of samples, or if `block_stations` is less than 1.
     pyflac.DecoderProcessException
         If a stream is damaged.
     """

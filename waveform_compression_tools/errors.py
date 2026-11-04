@@ -1,15 +1,15 @@
-"""Why a file isn't compressed, and how a compressed file fails its check.
+"""Why an input is refused, and how a compressed file fails its check.
 
-A refusal, `Refused` or one of its subclasses, says that the input can't be compressed
-as it is. Nothing is written: no file appears at the destination, and a file already
-there stays as it was. A failed check, `CheckFailed`, says that the compressed output
-didn't come back as it should. It is deleted, so nothing appears at the destination
-either.
+A refusal, `Refused` or one of its subclasses, says that an input can't be used as it
+is: it can't be compressed, decompressed, verified or converted. Nothing is written: no
+file appears at the destination, and a file already there stays as it was. A failed
+check, `CheckFailed`, says that the compressed output didn't come back as it should. It
+is deleted, so nothing appears at the destination either.
 """
 
 
 class Refused(ValueError):  # noqa: N818
-    """The input isn't compressible as it is. Nothing is written."""
+    """An input can't be used as it is. Nothing is written."""
 
 
 class NotStandardLayout(Refused):
@@ -41,6 +41,18 @@ class OutputExists(Refused):
 
 class SameFile(Refused):
     """The destination, or the destination with ``.partial`` added, is the input."""
+
+
+class NotCompressed(Refused):
+    """A file holds no compressed waveform, so there is nothing to decompress or verify."""
+
+
+class UnknownFormat(Refused):
+    """A compressed file is in a format version, or has a setting, that can't be read."""
+
+
+class NotBBBin(Refused):
+    """A file can't be a BB.bin: its size doesn't fit its header, or its text isn't ASCII."""
 
 
 class CheckFailed(RuntimeError):  # noqa: N818
