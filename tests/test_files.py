@@ -186,6 +186,8 @@ def test_a_file_decodes_by_the_readme_alone(
         assert g.attrs["dtype"] == "float32"
         assert g.attrs["bits"] == 24
         assert json.loads(g.attrs["waveform_attrs"]) == {"units": "g"}
+        assert json.loads(g.attrs["waveform_encoding"]) == {"_FillValue": "NaN"}
+        assert json.loads(g.attrs["waveform_attr_types"]) == {}
         compressed = g["compressed"][...]
         starts, nbytes = g["stream_starts"][...], g["stream_bytes"][...]
         gains, offsets = g["stream_gains"][...], g["stream_offsets"][...]
@@ -384,14 +386,36 @@ def test_verify_refuses_a_file_compressed_from_another_shape(
         verify_file(other, dst)
 
 
-def test_waveform_attributes_with_numpy_values_come_back(
+@pytest.mark.parametrize("fill", [-999.0, None])
+def test_the_fill_value_survives_compression(
+    tmp_path: Path, standard_dataset: StandardDataset, fill: float | None
+) -> None:
+    ds = standard_dataset(2, nt=50)
+    ds["waveform"].encoding["_FillValue"] = fill
+    src, dst = write(ds, tmp_path / "in.nc"), tmp_path / "out.nc"
+    compress_file(src, dst)
+    back = decompress_file(dst)
+    back.to_netcdf(tmp_path / "back.nc", engine="h5netcdf")
+    with h5py.File(tmp_path / "back.nc", "r") as f:
+        if fill is None:
+            assert "_FillValue" not in f["waveform"].attrs
+        else:
+            assert f["waveform"].attrs["_FillValue"] == np.float32(fill)
+            assert f["waveform"].attrs["_FillValue"].dtype == np.float32
+    assert verify_file(src, dst).passed
+
+
+def test_waveform_attributes_come_back_with_their_types(
     tmp_path: Path, standard_dataset: StandardDataset
 ) -> None:
     ds = standard_dataset(2, nt=50)
     ds["waveform"].attrs.update(
         scale=np.float32(0.1),
         count=np.int32(7),
+        wide=np.float64(2.5),
+        long=np.int64(9),
         flags=np.array([1, 2, 3], np.int32),
+        weights=np.array([0.5, 1.5], np.float32),
         names=["a", "bb"],
         unset=np.nan,
     )
@@ -399,12 +423,81 @@ def test_waveform_attributes_with_numpy_values_come_back(
     compress_file(src, dst)
     back = decompress_file(dst)["waveform"].attrs
     with xr.open_dataset(src, engine="h5netcdf") as orig:
-        expected = orig["waveform"].attrs
+        expected = dict(orig["waveform"].attrs)
     assert back.keys() == expected.keys()
     for name, value in expected.items():
         np.testing.assert_array_equal(back[name], value)
-    # Their types came back from JSON as Python's, which isn't a difference.
+        assert type(back[name]) is type(value), name
+        if isinstance(value, np.ndarray | np.generic):
+            assert back[name].dtype == value.dtype, name
+    assert back["scale"].dtype == np.float32
+    assert back["count"].dtype == np.int32
     assert verify_file(src, dst).passed
+
+
+@pytest.mark.parametrize("attribute", ["waveform_encoding", "waveform_attr_types"])
+def test_verify_fails_when_the_fill_value_or_a_type_differs(
+    tmp_path: Path, standard_dataset: StandardDataset, attribute: str
+) -> None:
+    ds = standard_dataset(2, nt=50)
+    ds["waveform"].encoding["_FillValue"] = -999.0
+    ds["waveform"].attrs["scale"] = np.float32(0.1)
+    src, dst = write(ds, tmp_path / "in.nc"), tmp_path / "out.nc"
+    compress_file(src, dst)
+    assert verify_file(src, dst).passed
+    with h5py.File(dst, "r+") as f:
+        g = f[GROUP]
+        assert json.loads(g.attrs["waveform_encoding"]) == {"_FillValue": -999.0}
+        assert json.loads(g.attrs["waveform_attr_types"]) == {"scale": "float32"}
+        g.attrs[attribute] = (
+            '{"_FillValue": "NaN"}'
+            if attribute == "waveform_encoding"
+            else '{"scale": "float64"}'
+        )
+    assert not verify_file(src, dst).passed
+
+
+def test_a_nan_fill_value_is_written_as_strict_json(
+    tmp_path: Path, standard_dataset: StandardDataset
+) -> None:
+    ds = standard_dataset(2, nt=50)
+    ds["waveform"].encoding["_FillValue"] = np.float32(np.nan)
+    src, dst = write(ds, tmp_path / "in.nc"), tmp_path / "out.nc"
+    compress_file(src, dst)
+    with h5py.File(dst, "r") as f:
+        text = f[GROUP].attrs["waveform_encoding"]
+    assert json.loads(text, parse_constant=pytest.fail) == {"_FillValue": "NaN"}
+    assert verify_file(src, dst).passed
+    assert np.isnan(decompress_file(dst)["waveform"].encoding["_FillValue"])
+
+
+def test_every_kind_of_encoding_value_is_strict_json() -> None:
+    text = files._encoding_json(
+        {"_FillValue": np.float32(np.inf), "missing_value": np.float32(-np.inf)}
+    )
+    assert json.loads(text, parse_constant=pytest.fail) == {
+        "_FillValue": "Infinity",
+        "missing_value": "-Infinity",
+    }
+    back = files._encoding_back(text)
+    assert back == {"_FillValue": np.inf, "missing_value": -np.inf}
+    assert all(type(v) is np.float32 for v in back.values())
+    assert files._encoding_json({"_FillValue": None}) == '{"_FillValue": null}'
+
+
+def test_a_file_without_the_new_attributes_still_decodes(
+    tmp_path: Path, standard_dataset: StandardDataset
+) -> None:
+    ds = standard_dataset(2, nt=50)
+    ds["waveform"].attrs["count"] = np.int32(7)
+    src, dst = write(ds, tmp_path / "in.nc"), tmp_path / "out.nc"
+    compress_file(src, dst)
+    with h5py.File(dst, "r+") as f:
+        del f[GROUP].attrs["waveform_encoding"]
+        del f[GROUP].attrs["waveform_attr_types"]
+    back = decompress_file(dst)
+    assert back["waveform"].attrs["count"] == 7
+    assert back["waveform"].shape == (3, 2, 50)
 
 
 @pytest.mark.parametrize("step", ["compress", "verify"])

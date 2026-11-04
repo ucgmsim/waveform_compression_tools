@@ -24,6 +24,8 @@ The waveform is float32 with the dimensions (component, station, time), its comp
 | `dims` | `["component", "station", "time"]` |
 | `dtype` | `"float32"` |
 | `waveform_attrs` | the original waveform's attributes, as a JSON string |
+| `waveform_encoding` | optional. A JSON string of the waveform's `_FillValue` and `missing_value`, as the original had them; a value that isn't finite is the string `"NaN"`, `"Infinity"` or `"-Infinity"`. An original with no `_FillValue` has `{"_FillValue": null}`: write the waveform without one. A reader without it gets xarray's default, a NaN `_FillValue`. |
+| `waveform_attr_types` | optional. A JSON string mapping each numpy-typed attribute of `waveform_attrs` to its dtype, such as `"float32"` or `"int32"`. A reader without it gets the JSON's own types: float64 and int64. |
 | `bits` | the setting, an integer from 8 to 32 (see below) |
 | `encoder` | `"waveform_compression_tools"` and the version that wrote the file |
 | `exact_rule` | which stations are real, in words (see below) |

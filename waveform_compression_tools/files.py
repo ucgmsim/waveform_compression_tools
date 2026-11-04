@@ -23,7 +23,9 @@ xarray with the h5netcdf engine. In the waveform's place, the HDF5 group
 
 The group's attributes are ``format_version`` (1), ``dims``
 (``["component", "station", "time"]``), ``dtype`` (``"float32"``),
-``waveform_attrs`` (the waveform's attributes, as JSON), ``bits`` (the quantisation
+``waveform_attrs`` (the waveform's attributes, as JSON), the optional
+``waveform_encoding`` (its ``_FillValue`` and ``missing_value``, as JSON) and
+``waveform_attr_types`` (the dtype of each numpy-typed attribute), ``bits`` (the quantisation
 setting), ``encoder`` (``"waveform_compression_tools"`` and the package's version) and
 ``exact_rule`` (which stations have exact copies, in words).
 
@@ -227,6 +229,73 @@ def _plain(value: object) -> object:
     raise TypeError(f"an attribute of type {type(value).__name__} can't go in JSON")
 
 
+def _attr_types(attrs: dict) -> dict[str, str]:
+    """Name the numpy dtype of each attribute that is a numpy scalar or array.
+
+    Parameters
+    ----------
+    attrs : dict
+        The waveform's attributes.
+
+    Returns
+    -------
+    dict[str, str]
+        Each such attribute's name and dtype string, such as ``"float32"``.
+    """
+    return {
+        name: str(value.dtype)
+        for name, value in attrs.items()
+        if isinstance(value, np.ndarray | np.generic)
+    }
+
+
+def _encoding_json(encoding: dict) -> str:
+    """Write the waveform's ``_FillValue`` and ``missing_value`` as strict JSON.
+
+    Parameters
+    ----------
+    encoding : dict
+        The waveform's netCDF encoding, as xarray read it.
+
+    Returns
+    -------
+    str
+        A JSON object. A float that isn't finite is the string ``"NaN"``,
+        ``"Infinity"`` or ``"-Infinity"``. A waveform with no ``_FillValue`` has
+        ``{"_FillValue": null}``, so it is written back without one.
+    """
+    out: dict[str, object] = {"_FillValue": None}
+    for name in ("_FillValue", "missing_value"):
+        if name not in encoding:
+            continue
+        value = encoding[name]
+        if value is not None and not np.isfinite(value):
+            value = str(float(value)).replace("inf", "Infinity").replace("nan", "NaN")
+        elif isinstance(value, np.generic):
+            value = value.item()
+        out[name] = value
+    return json.dumps(out)
+
+
+def _encoding_back(text: str) -> dict:
+    """Read what `_encoding_json` wrote, as values for the waveform's encoding.
+
+    Parameters
+    ----------
+    text : str
+        The JSON object.
+
+    Returns
+    -------
+    dict
+        Each value as a float32, the waveform's dtype, or ``None``.
+    """
+    return {
+        name: None if value is None else np.float32(value)
+        for name, value in json.loads(text).items()
+    }
+
+
 def _real_stations(ds: xr.Dataset) -> np.ndarray:
     """Find the real stations of a dataset, by their names.
 
@@ -386,6 +455,8 @@ def compress_file(
             )
         blocks = _blocks(n_station, block_stations)
         waveform_attrs = json.dumps(dict(waveform.attrs), default=_plain)
+        waveform_encoding = _encoding_json(waveform.encoding)
+        waveform_attr_types = json.dumps(_attr_types(waveform.attrs))
         stopwatch.lap("read")
         try:
             rest = ds.drop_vars("waveform")
@@ -445,6 +516,8 @@ def compress_file(
                 group.attrs["dims"] = list(STANDARD_DIMS)
                 group.attrs["dtype"] = "float32"
                 group.attrs["waveform_attrs"] = waveform_attrs
+                group.attrs["waveform_encoding"] = waveform_encoding
+                group.attrs["waveform_attr_types"] = waveform_attr_types
                 group.attrs["bits"] = bits
                 group.attrs["encoder"] = ENCODER
                 group.attrs["exact_rule"] = REAL_STATION_RULE
@@ -492,7 +565,10 @@ class _Streams:
     bits : int
         The quantisation setting the file declares, from 8 to 32.
     waveform_attrs : dict
-        The original waveform's attributes.
+        The original waveform's attributes, each numpy value in its own type.
+    encoding : dict or None
+        The waveform's ``_FillValue`` and ``missing_value`` to put back, or None
+        for a file without ``waveform_encoding``.
     exact_stations : np.ndarray
         The real stations, in increasing order.
     exact_waveform : h5py.Dataset
@@ -508,6 +584,7 @@ class _Streams:
     nt: int
     bits: int
     waveform_attrs: dict
+    encoding: dict | None
     exact_stations: np.ndarray
     exact_waveform: h5py.Dataset
 
@@ -625,6 +702,15 @@ def _open_streams(f: h5py.File, path: Path) -> _Streams:
             f"{path}: exact_waveform is {exact_waveform.dtype} of shape "
             f"{exact_waveform.shape}, not float32 of shape {shape}"
         )
+    waveform_attrs = json.loads(group.attrs["waveform_attrs"])
+    for name, dtype in json.loads(group.attrs.get("waveform_attr_types", "{}")).items():
+        value = waveform_attrs[name]
+        waveform_attrs[name] = (
+            np.asarray(value, dtype)
+            if isinstance(value, list)
+            else np.dtype(dtype).type(value)
+        )
+    encoding = group.attrs.get("waveform_encoding")
     return _Streams(
         compressed=group["compressed"],
         starts=starts,
@@ -633,7 +719,8 @@ def _open_streams(f: h5py.File, path: Path) -> _Streams:
         offsets=group["stream_offsets"][...],
         nt=nt,
         bits=bits,
-        waveform_attrs=json.loads(group.attrs["waveform_attrs"]),
+        waveform_attrs=waveform_attrs,
+        encoding=None if encoding is None else _encoding_back(encoding),
         exact_stations=exact_stations,
         exact_waveform=exact_waveform,
     )
@@ -676,6 +763,8 @@ def decompress_file(path: Path) -> xr.Dataset:
             waveform[:, s0:s1] = block
     ds = xr.load_dataset(path, engine="h5netcdf")
     ds["waveform"] = (STANDARD_DIMS, waveform, streams.waveform_attrs)
+    if streams.encoding is not None:
+        ds["waveform"].encoding.update(streams.encoding)
     return ds
 
 
@@ -747,14 +836,19 @@ def verify_file(
                 f"original {original} holds one of shape {waveform.shape}"
             )
         bound = (1 + STEP_SLACK) / full_scale(streams.bits)
-        # The waveform's attributes came back from JSON, so a numpy value comes back
-        # as a Python one; compared as `identical` compares attributes, it's the same.
+        # `identical` compares attribute values and not their types, so the types
+        # and the encoding are compared on their own.
         same_attrs = xr.Dataset(attrs=dict(waveform.attrs)).identical(
             xr.Dataset(attrs=streams.waveform_attrs)
-        )
+        ) and _attr_types(waveform.attrs) == _attr_types(streams.waveform_attrs)
+        # The encoding as JSON, so a NaN fill value equals a NaN one.
+        same_encoding = streams.encoding is not None and json.loads(
+            _encoding_json(waveform.encoding)
+        ) == json.loads(_encoding_json(streams.encoding))
         passed = (
             ds.drop_vars("waveform").identical(rest)
             and same_attrs
+            and same_encoding
             and np.array_equal(streams.exact_stations, real)
         )
         for s0, s1 in _blocks(waveform.shape[1], block_stations):
