@@ -930,3 +930,67 @@ def test_verify_asks_whether_an_older_file_decompresses_to_the_original(
         del f[GROUP].attrs["waveform_encoding"]
         del f[GROUP].attrs["waveform_attr_types"]
     assert verify_file(src, dst).passed is bool(np.isnan(fill))
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "passes"),
+    [
+        ("wide", np.float64(2.5), True),
+        ("long", np.int64(9), True),
+        ("array", np.array([0.5, 1.5]), True),
+        ("scale", np.float32(0.1), False),
+        ("count", np.int32(7), False),
+    ],
+)
+def test_verify_of_an_older_file_expects_jsons_types(
+    tmp_path: Path,
+    standard_dataset: StandardDataset,
+    name: str,
+    value: np.generic,
+    passes: bool,
+) -> None:
+    ds = standard_dataset(2, nt=50)
+    ds["waveform"].attrs[name] = value
+    src, dst = write(ds, tmp_path / "in.nc"), tmp_path / "out.nc"
+    compress_file(src, dst)
+    with h5py.File(dst, "r+") as f:
+        del f[GROUP].attrs["waveform_encoding"]
+        del f[GROUP].attrs["waveform_attr_types"]
+    assert verify_file(src, dst).passed is passes
+
+
+def test_an_attribute_whose_type_cannot_be_kept_is_refused(
+    tmp_path: Path, standard_dataset: StandardDataset
+) -> None:
+    src, dst = write(standard_dataset(2, nt=50), tmp_path / "in.nc"), tmp_path / "o.nc"
+    with h5py.File(src, "r+") as f:
+        f["waveform"].attrs.create(
+            "pair", np.zeros((), np.dtype([("a", "<i4"), ("b", "<f4")]))
+        )
+    with pytest.raises(TypeError, match="pair"):
+        compress_file(src, dst)
+    assert not dst.exists()
+    assert not partial_of(dst).exists()
+
+
+def test_a_finite_fill_value_inside_the_data_is_refused(
+    tmp_path: Path, standard_dataset: StandardDataset
+) -> None:
+    ds = standard_dataset(2, nt=50)
+    ds["waveform"].encoding["_FillValue"] = np.float32(0.0)
+    src, dst = write(ds, tmp_path / "in.nc"), tmp_path / "out.nc"
+    with pytest.raises(NotStandardLayout, match="fill value"):
+        compress_file(src, dst, bits=8)
+    assert not dst.exists()
+    assert not partial_of(dst).exists()
+
+
+def test_a_finite_fill_value_far_from_the_data_round_trips(
+    tmp_path: Path, standard_dataset: StandardDataset
+) -> None:
+    ds = standard_dataset(2, nt=50)
+    ds["waveform"].encoding["_FillValue"] = np.float32(-1e6)
+    src, dst = write(ds, tmp_path / "in.nc"), tmp_path / "out.nc"
+    compress_file(src, dst, bits=8)
+    assert verify_file(src, dst).passed
+    assert decompress_file(dst)["waveform"].encoding["_FillValue"] == np.float32(-1e6)

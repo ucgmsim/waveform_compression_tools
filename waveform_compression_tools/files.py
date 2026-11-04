@@ -241,12 +241,89 @@ def _attr_types(attrs: dict) -> dict[str, str]:
     -------
     dict[str, str]
         Each such attribute's name and dtype string, such as ``"float32"``.
+
+    Raises
+    ------
+    TypeError
+        If an attribute's dtype can't be named by its string and read back, as a
+        compound (structured) one can't.
     """
-    return {
-        name: str(value.dtype)
-        for name, value in attrs.items()
-        if isinstance(value, np.ndarray | np.generic)
-    }
+    types = {}
+    for name, value in attrs.items():
+        if isinstance(value, np.ndarray | np.generic):
+            dtype = value.dtype
+            try:
+                restorable = np.dtype(str(dtype)) == dtype
+            except TypeError:
+                restorable = False
+            if not restorable:
+                raise TypeError(f"attribute {name!r} of type {dtype} can't be kept")
+            types[name] = str(dtype)
+    return types
+
+
+def _written_dtypes(attrs: dict) -> dict[str, str]:
+    """Name the dtype each attribute is written with when the dataset is saved.
+
+    Parameters
+    ----------
+    attrs : dict
+        The waveform's attributes, as xarray holds them or as JSON gives them.
+
+    Returns
+    -------
+    dict[str, str]
+        The dtype string of each numeric, boolean or array attribute: a numpy value's
+        own, float64 for a Python float, int64 for a Python int and what numpy makes
+        of a list. Strings are left out.
+    """
+    out = {}
+    for name, value in attrs.items():
+        if isinstance(value, np.ndarray | np.generic):
+            out[name] = str(value.dtype)
+        elif isinstance(value, bool | int | float | list | tuple):
+            try:
+                out[name] = str(np.asarray(value).dtype)
+            except ValueError:  # A ragged list is no array.
+                continue
+    return out
+
+
+def _refuse_fill_in_range(
+    block: np.ndarray, fills: list[float], bits: int, encoding_name: str
+) -> None:
+    """Refuse a block with a trace that reaches a finite fill value.
+
+    A lossy sample within one step of a fill value could decode to exactly it, and
+    then read back as missing.
+
+    Parameters
+    ----------
+    block : np.ndarray
+        Traces of shape (component, station, time).
+    fills : list[float]
+        The finite ``_FillValue`` and ``missing_value`` of the waveform.
+    bits : int
+        The quantisation setting.
+    encoding_name : str
+        Names the waveform in the message.
+
+    Raises
+    ------
+    NotStandardLayout
+        If a fill value lies within one quantisation step of a trace's range.
+    """
+    if not fills:
+        return
+    low = block.min(axis=2).astype(np.float64)
+    high = block.max(axis=2).astype(np.float64)
+    step = np.abs(block).max(axis=2) / full_scale(bits)
+    for fill in fills:
+        if np.any((low - step <= fill) & (fill <= high + step)):
+            raise NotStandardLayout(
+                f"{encoding_name} has the finite fill value {fill} inside the data's "
+                "range, which can't survive lossy compression"
+            )
 
 
 def _encoding_json(encoding: dict) -> str:
@@ -415,15 +492,17 @@ def compress_file(
     AllStationsReal
         If every station of `src` is real, so it stays as it is. Nothing is written.
     NotStandardLayout
-        If `src` is not in the standard layout, has no ``station`` coordinate, or has
-        no stations. Nothing is written.
+        If `src` is not in the standard layout, has no ``station`` coordinate, has
+        no stations, or has a finite ``_FillValue`` or ``missing_value`` within one
+        quantisation step of a trace's range. Nothing is written.
     ValueError
         If `bits` is outside 8 to 32, which is checked first; if `dst`, or `dst` with
         ``.partial`` added, resolves to `src`; if `src` holds an HDF5 group besides
         its root; if a trace holds a NaN or an infinity; or if `block_stations` is
         less than 1.
     TypeError
-        If an attribute of the waveform can't be written as JSON.
+        If an attribute of the waveform can't be written as JSON, or its type can't
+        be kept, as a compound one's can't.
     UnicodeDecodeError
         If a station's name is bytes that are not ASCII.
     pyflac.EncoderInitException
@@ -457,6 +536,12 @@ def compress_file(
         waveform_attrs = json.dumps(dict(waveform.attrs), default=_plain)
         waveform_encoding = _encoding_json(waveform.encoding)
         waveform_attr_types = json.dumps(_attr_types(waveform.attrs))
+        fills = [
+            float(v)
+            for name in ("_FillValue", "missing_value")
+            for v in np.atleast_1d(waveform.encoding.get(name, np.nan))
+            if v is not None and np.isfinite(v)
+        ]
         stopwatch.lap("read")
         try:
             rest = ds.drop_vars("waveform")
@@ -489,6 +574,7 @@ def compress_file(
                 for s0, s1 in blocks:
                     block = waveform[:, s0:s1, :].values
                     stopwatch.lap("read")
+                    _refuse_fill_in_range(block, fills, bits, str(src))
                     encoded = encode_block(block, bits, level)
                     stopwatch.lap("encode")
                     # The block's streams go after those already written, in the
@@ -840,7 +926,7 @@ def verify_file(
         # and the encoding are compared on their own.
         same_attrs = xr.Dataset(attrs=dict(waveform.attrs)).identical(
             xr.Dataset(attrs=streams.waveform_attrs)
-        ) and _attr_types(waveform.attrs) == _attr_types(streams.waveform_attrs)
+        ) and _written_dtypes(waveform.attrs) == _written_dtypes(streams.waveform_attrs)
         # The encoding as JSON, so a NaN fill value equals a NaN one.
         same_encoding = json.loads(_encoding_json(waveform.encoding)) == json.loads(
             _encoding_json(streams.encoding)
