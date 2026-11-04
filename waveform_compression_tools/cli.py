@@ -115,7 +115,8 @@ def _say(path: Path, reason: str) -> None:
     """Print a command's one error line to standard error.
 
     The line names the file once: a reason that starts with ``"<path>: "`` or
-    ``"<path> "``, as many of this package's messages do, loses that start.
+    ``"<path> "``, as many of this package's messages do, loses that start, and so
+    does one that starts so with the file's partial name, as a failed check's does.
 
     Parameters
     ----------
@@ -124,7 +125,7 @@ def _say(path: Path, reason: str) -> None:
     reason : str
         What went wrong.
     """
-    for start in (f"{path}: ", f"{path} "):
+    for start in (f"{path}: ", f"{path} ", f"{path}.partial: ", f"{path}.partial "):
         if reason.startswith(start) and len(reason) > len(start):
             reason = reason[len(start) :]
             break

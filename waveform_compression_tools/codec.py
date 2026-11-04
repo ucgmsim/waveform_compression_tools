@@ -142,6 +142,7 @@ def decode_block(
     gains: np.ndarray,
     offsets: np.ndarray,
     nt: int,
+    first_station: int = 0,
 ) -> np.ndarray:
     """Decode a block of stations.
 
@@ -159,6 +160,9 @@ def decode_block(
         The value added to each trace after dividing by its gain, of shape (3, n).
     nt : int
         The number of samples in every trace.
+    first_station : int, default 0
+        The block's first station in its file, from which an error's message counts
+        the stations.
 
     Returns
     -------
@@ -171,7 +175,7 @@ def decode_block(
         If `starts`, `nbytes`, `gains` and `offsets` do not all have the same shape.
         If a stream decodes to some other number of samples than `nt`, as one that
         was cut short does, or cut to nothing. The message names the stream's
-        component and station, counting from 0 within this block.
+        component and station, counting the stations from `first_station`.
     pyflac.DecoderProcessException
         If a stream is damaged.
     """
@@ -188,8 +192,8 @@ def decode_block(
         q = decode_stream(compressed[start : start + size].tobytes())
         if q.size != nt:
             raise ValueError(
-                f"component {c}, station {s}: the stream decodes to {q.size} "
-                f"samples, expected {nt}"
+                f"component {c}, station {s + first_station}: the stream decodes to "
+                f"{q.size} samples, expected {nt}"
             )
         block[c, s] = dequantise(q, gains[c, s], offsets[c, s])
     return block

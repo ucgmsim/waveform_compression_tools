@@ -415,12 +415,17 @@ def test_a_failed_check_exits_1_and_leaves_nothing(
         monkeypatch.setattr(cli, "content_hash", hash_all_but_the_output)
     before = contents(tmp_path)
     result = run("compress", src, dst, "--record", rec)
-    reason = assert_stopped(result, EXIT_FAILED, {"src": src, "dst": dst}[named])
+    path = {"src": src, "dst": dst}[named]
+    reason = assert_stopped(result, EXIT_FAILED, path)
     assert word in reason
+    # The line names the file once, though the check's own message names the partial
+    # file it was checking.
+    assert result.stderr.count(str(path)) == 1
     # No output and no partial file: nothing but the record.
     assert contents(tmp_path) == {**before, "rec.json": rec.read_bytes()}
+    # The record keeps the library's whole message.
     record = read_record(rec)
-    assert (record["status"], record["reason"]) == ("failed", reason)
+    assert record["status"] == "failed" and record["reason"].endswith(reason)
     # The input was hashed before it was compressed, and there is no output.
     assert record["input"]["content_hash"] == content_hash(src)
     assert record["output"] is None

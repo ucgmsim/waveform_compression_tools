@@ -121,6 +121,8 @@ So `"checked": true` in the record means that DST passed the same tests as `veri
 
 To run a file again when its record is missing (because the run was killed, say) or doesn't say `"ok"`, give the same command with `--overwrite`. That replaces the record, and any output that a killed run left. Without `--overwrite`, a file already at PATH is refused before the input is read, and stays as it was.
 
+A `"refused"` record isn't always about the input: one whose reason names DST, such as `DST exists already`, is about the destination. A run killed after DST was renamed into place, but before its record was written, leaves DST with no record, and running it again without `--overwrite` is refused that way. So read the reason before taking a `"refused"` record to mean that the input can't be compressed.
+
 No record is written for a usage error, for a refused record, when the record's own folder doesn't exist, or for an interruption. If the record can't be written, the run fails, with a line naming the record, and a compressed file stays at DST.
 
 The record's keys, in order:
@@ -200,11 +202,11 @@ The refusals, by command:
 
 A refusal writes nothing but `compress`'s record, and leaves a file already at the destination as it was. A file that isn't HDF5 at all is refused, while an HDF5 file that is damaged or cut short is a failure: it may be the right kind of file, and the run went wrong.
 
-An interruption (Ctrl-C) is left to Typer, which exits with status 130 and prints nothing; `compress` writes no record then.
+An interruption (Ctrl-C) is left to Typer, which ends the run with its own status; `compress` writes no record then.
 
 ### The error line
 
-A command that fails or refuses prints exactly one line to standard error, and nothing to standard output:
+A command that fails or refuses prints one line of its own to standard error (a library it uses may add warnings, as xarray does for some files), and nothing to standard output:
 
 ```text
 waveform-compression-tools: <path>: <reason>
@@ -336,7 +338,7 @@ trace = (q.astype(np.float64) / gain + offset).astype(np.float32)
 
 - A file that holds an HDF5 group besides its root is refused: xarray reads only the root group, so its compressed file would go without the group.
 - `decompress` and `decompress_file` load the whole waveform into memory: 4 bytes a sample, plus a block of 128 MiB and some working space. A file whose waveform doesn't fit in memory can be compressed and verified, but not yet decompressed. A later release is to decompress a block at a time.
-- The streams are stored in chunks of 4 MiB, so a compressed file takes at least 4 MiB, and a file that is smaller than that comes out larger.
+- The streams are stored in chunks of 4 MiB, or of the waveform's own size if that is smaller, and a compressed file holds whole chunks. So a file whose waveform is smaller than 4 MiB isn't made any smaller, and can come out larger; a bigger file holds up to 4 MiB more than its streams need.
 
 ## Developing
 

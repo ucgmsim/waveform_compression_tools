@@ -74,7 +74,10 @@ def refuse_overwriting(
     if same:
         raise SameFile(f"writing {dst} would overwrite {src}")
     if not overwrite and os.path.lexists(dst):
-        raise OutputExists(f"{dst} exists already, and is replaced only if asked")
+        raise OutputExists(
+            f"{dst} exists already, and is replaced only if asked (--overwrite, or "
+            "overwrite=True)"
+        )
 
 
 def write_netcdf(ds: xr.Dataset, dst: str | os.PathLike[str]) -> None:

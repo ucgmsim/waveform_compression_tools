@@ -269,6 +269,34 @@ def test_failure_mid_write_leaves_nothing(
     assert not dst.exists() and not partial_of(dst).exists()
 
 
+def test_a_stream_that_decodes_short_is_named_by_its_station_in_the_file(
+    tmp_path: Path, standard_dataset: StandardDataset
+) -> None:
+    # In blocks of 2 stations, station 3 is the second of the second block: the message
+    # counts it from the file's first station, not its block's.
+    src = write(standard_dataset(5, nt=100), tmp_path / "in.nc")
+    dst = tmp_path / "out.nc"
+    compress_file(src, dst)
+    with h5py.File(dst, "r+") as f:
+        f[GROUP]["stream_bytes"][1, 3] = 0  # Station 3's second stream, cut to nothing.
+    message = "component 1, station 3: the stream decodes to 0 samples"
+    with pytest.raises(ValueError, match=message):
+        verify_file(src, dst, block_stations=2)
+
+
+def test_a_small_file_has_chunks_no_larger_than_its_waveform(
+    tmp_path: Path, standard_dataset: StandardDataset
+) -> None:
+    # Chunks of 4 MiB would make every compressed file take at least that much.
+    src = write(standard_dataset(3, nt=100), tmp_path / "in.nc")
+    dst = tmp_path / "out.nc"
+    compress_file(src, dst)
+    with h5py.File(dst, "r") as f:
+        (chunk,) = f[GROUP]["compressed"].chunks
+    assert chunk <= 3 * 3 * 100 * 4  # The waveform's bytes, as float32.
+    assert verify_file(src, dst).passed
+
+
 def test_verify_fails_a_trace_that_decodes_a_few_steps_off(
     tmp_path: Path, standard_dataset: StandardDataset
 ) -> None:

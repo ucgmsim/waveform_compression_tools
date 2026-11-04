@@ -85,7 +85,8 @@ ENCODER = f"waveform_compression_tools {__version__}"
 # The version of the layout described above. A reader refuses any other.
 _FORMAT_VERSION = 1
 # The compressed bytes are stored in chunks of this size, so that their dataset can
-# grow a block at a time.
+# grow a block at a time, or of the waveform's own size if that is smaller, so that a
+# small file doesn't take 4 MiB.
 _CHUNK_BYTES = 4 * 2**20
 
 
@@ -889,12 +890,13 @@ def compress_file(
             )
             with h5py.File(partial, "a") as f:
                 group = f.create_group(GROUP)
+                chunk = min(_CHUNK_BYTES, max(1, 4 * n_component * n_station * nt))
                 compressed = group.create_dataset(
                     "compressed",
                     shape=(0,),
                     maxshape=(None,),
                     dtype=np.uint8,
-                    chunks=(_CHUNK_BYTES,),
+                    chunks=(chunk,),
                 )
                 exact_waveform = group.create_dataset(
                     "exact_waveform",
@@ -1090,6 +1092,7 @@ class _Streams:
             self.gains[:, s0:s1],
             self.offsets[:, s0:s1],
             self.nt,
+            first_station=s0,
         )
 
     def put_back_exact(self, block: np.ndarray, s0: int, s1: int) -> np.ndarray:
@@ -1571,10 +1574,13 @@ def decompress_file(path: str | os.PathLike[str]) -> xr.Dataset:
     xr.Dataset
         The original dataset, loaded into memory: every variable, coordinate and
         attribute of the original, and its ``waveform`` as float32 with the
-        dimensions (component, station, time) and its original attributes. The real
-        stations' traces are the exact copies the file holds; every other sample is
-        within one quantisation step of the original. The whole waveform is decoded,
-        so it has to fit in memory.
+        dimensions (component, station, time) and its original attributes. Each
+        attribute is in its own type again, and the waveform's encoding has its
+        ``_FillValue`` and ``missing_value`` as the original had them, so the dataset
+        is written to a file as the original was. The real stations' traces are the
+        exact copies the file holds; every other sample is within one quantisation
+        step of the original. The whole waveform is decoded, so it has to fit in
+        memory.
 
     Raises
     ------
@@ -1625,7 +1631,8 @@ def verify_file(
     `waveform_compression_tools.stations`) has to come back bit for bit, and the file has to hold
     exact copies of the real stations and of no others. The waveform's attributes,
     and everything besides the waveform (every other variable, coordinate and
-    attribute), have to be identical to the original's.
+    attribute), have to be identical to the original's. So do the types the waveform's
+    attributes come back in, and its ``_FillValue`` and ``missing_value``.
 
     Parameters
     ----------
@@ -1697,6 +1704,8 @@ def verify_file(
             error, block_passed = _compare_block(streams, block, decoded, real, s0, s1)
             passed = passed and block_passed
             worst = np.maximum(worst, error)  # A NaN stays.
+            # Each stream's decoder is kept in a reference cycle, as pyflac's encoders
+            # are, which would otherwise wait for the next collection and add up.
             gc.collect()
     return VerifyResult(
         max_relative_error=float(worst),
