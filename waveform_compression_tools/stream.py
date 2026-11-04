@@ -71,7 +71,11 @@ def encode_stream(q: np.ndarray, level: int = 5, blocksize: int = 4096) -> bytes
         raise pyflac.EncoderProcessException(
             f"libFLAC could not finish the stream ({encoder.state})"
         )
-    return b"".join(chunks)
+    stream = b"".join(chunks)
+    # The encoder is in a reference cycle, so it lives until the next collection, and
+    # its write callback with it. The chunks needn't wait with them.
+    chunks.clear()
+    return stream
 
 
 # The decoder below depends on pyflac 3.0.0's internals, not on its public API: the
@@ -153,7 +157,9 @@ class _WholeStreamDecoder(pyflac_decoder._Decoder):
     def __init__(self, blob: bytes) -> None:  # numpydoc ignore=GL08
         super().__init__()
         self._done = False
-        self._buffer: deque[bytes] = deque([blob])
+        # A view, since pyflac's read callback slices off what it reads each time: a
+        # slice of bytes would copy the rest of the stream.
+        self._buffer: deque[memoryview] = deque([memoryview(blob)])
         self._lock = threading.Lock()
         self._event = _EndWhenEmpty(self)
         self.frames: list[np.ndarray] = []
@@ -235,4 +241,8 @@ def decode_stream(blob: bytes) -> np.ndarray:
     frames = _WholeStreamDecoder(blob).frames
     if not frames:
         return np.empty(0, np.int32)
-    return np.concatenate(frames).ravel()
+    samples = np.concatenate(frames).ravel()
+    # The decoder is in reference cycles, so it lives until the next collection. Its
+    # frames needn't wait with it.
+    frames.clear()
+    return samples

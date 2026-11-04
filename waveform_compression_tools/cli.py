@@ -115,8 +115,7 @@ def _say(path: Path, reason: str) -> None:
     """Print a command's one error line to standard error.
 
     The line names the file once: a reason that starts with ``"<path>: "`` or
-    ``"<path> "``, as many of this package's messages do, loses that start, and so
-    does one that starts so with the file's partial name, as a failed check's does.
+    ``"<path> "``, as many of this package's messages do, loses that start.
 
     Parameters
     ----------
@@ -125,7 +124,7 @@ def _say(path: Path, reason: str) -> None:
     reason : str
         What went wrong.
     """
-    for start in (f"{path}: ", f"{path} ", f"{path}.partial: ", f"{path}.partial "):
+    for start in (f"{path}: ", f"{path} "):
         if reason.startswith(start) and len(reason) > len(start):
             reason = reason[len(start) :]
             break
@@ -356,25 +355,23 @@ def _write_compress_record(
     if result is not None:
         seconds["compress"] = result.read_s + result.encode_s + result.write_s
         seconds["check"] = result.check_s
-    worst = None if result is None else result.max_relative_error
     output_path, output_bytes, output_hash = output or (None, None, None)
     try:
-        # make_record takes plain Python values only.
         record = make_record(
             status="ok" if stop is None else stop.status,
             reason="" if stop is None else stop.reason,
             input_path=src,
-            input_bytes=int(src.stat().st_size),
+            input_bytes=src.stat().st_size,
             input_hash=input_hash,
             output_path=output_path,
-            output_bytes=None if output_bytes is None else int(output_bytes),
+            output_bytes=output_bytes,
             output_hash=output_hash,
-            bits=int(bits),
-            checked=result is not None and bool(result.checked),
-            max_relative_error=None if worst is None else float(worst),
-            n_traces=None if result is None else int(result.n_traces),
-            n_exact_stations=None if result is None else int(result.n_exact),
-            seconds={name: float(value) for name, value in seconds.items()},
+            bits=bits,
+            checked=result is not None and result.checked,
+            max_relative_error=None if result is None else result.max_relative_error,
+            n_traces=None if result is None else result.n_traces,
+            n_exact_stations=None if result is None else result.n_exact,
+            seconds=seconds,
         )
         write_record(record, path)
     # Every error becomes one line, never a traceback.

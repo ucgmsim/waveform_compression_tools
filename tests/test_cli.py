@@ -7,7 +7,6 @@ import struct
 import subprocess
 import sys
 import time
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -46,7 +45,7 @@ from waveform_compression_tools.files import (
 from waveform_compression_tools.quantise import full_scale, quantise
 from waveform_compression_tools.stream import encode_stream
 
-StandardDataset = Callable[..., xr.Dataset]
+from helpers import StandardDataset, partial_of, write
 
 runner = CliRunner()
 
@@ -98,15 +97,6 @@ def assert_stopped(result: Result, status: int, path: Path) -> str:
     assert reason.strip() != ""
     assert not reason.startswith((f"{path}: ", f"{path} ")), result.stderr
     return reason
-
-
-def write(ds: xr.Dataset, path: Path) -> Path:
-    ds.to_netcdf(path, engine="h5netcdf")
-    return path
-
-
-def partial_of(path: Path) -> Path:
-    return Path(f"{path}.partial")
 
 
 def contents(folder: Path) -> dict[str, bytes]:
@@ -418,9 +408,10 @@ def test_a_failed_check_exits_1_and_leaves_nothing(
     path = {"src": src, "dst": dst}[named]
     reason = assert_stopped(result, EXIT_FAILED, path)
     assert word in reason
-    # The line names the file once, though the check's own message names the partial
-    # file it was checking.
+    # The line names the file once, though the check's own message starts with it. It
+    # names the file the run was making, not the partial file it was checking.
     assert result.stderr.count(str(path)) == 1
+    assert ".partial" not in result.stderr
     # No output and no partial file: nothing but the record.
     assert contents(tmp_path) == {**before, "rec.json": rec.read_bytes()}
     # The record keeps the library's whole message.
@@ -569,9 +560,11 @@ def test_bits_out_of_range_is_a_usage_error(
 # failures are the damage table's and the failed write's.
 SAME_CODES = [
     ("decompress", "a file that isn't compressed", 0, "not compressed"),
+    ("decompress", "a dataset with the group's name", 0, "not compressed"),
     ("decompress", "a text file", 0, "isn't an HDF5 file, so it is not compressed"),
     ("decompress", "an unknown format version", 0, "format version 2"),
     ("verify", "a file that isn't compressed", 1, "not compressed"),
+    ("verify", "a dataset with the group's name", 1, "not compressed"),
     ("verify", "a text file", 1, "isn't an HDF5 file, so it is not compressed"),
     ("verify", "an unknown setting", 1, "bits must be from 8 to 32"),
     ("verify", "an original that isn't in the standard layout", 0, "float32"),
@@ -602,6 +595,10 @@ def test_decompress_verify_and_convert_use_the_same_codes(
     text.write_text("station,pga\nS000000,0.12\n")
     if case == "a file that isn't compressed":
         packed = original
+    elif case == "a dataset with the group's name":
+        packed = write(standard_dataset(3, nt=100), tmp_path / "dataset.nc")
+        with h5py.File(packed, "r+") as f:
+            f.create_dataset(GROUP, data=np.arange(3))
     elif case == "a text file":
         packed = text
     elif case == "an original that is a text file":
@@ -805,13 +802,33 @@ def test_a_failed_write_leaves_no_partial_file_and_keeps_the_old_one(
         assert result.exit_code not in statuses
         assert PROGRAM not in result.stderr and not rec.exists()
     else:
-        # A failure, an unexpected one with its type. Compress names its input for
-        # anything that goes wrong while it compresses, but for a refusal to write or a
-        # failed check; decompress names the file it was writing.
-        named = src if command == "compress" else dst
+        # A failure, an unexpected one with its type. An OSError as the output is
+        # written names the output, whichever command writes it. Compress names its
+        # input for anything else that goes wrong while it compresses, but for a refusal
+        # to write or a failed check; decompress names the file it was writing.
+        named = src if command == "compress" and not isinstance(error, OSError) else dst
         assert shown in assert_stopped(result, EXIT_FAILED, named)
         assert command != "compress" or read_record(rec)["status"] == "failed"
     assert dst.read_bytes() == b"an earlier file" and not partial_of(dst).exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can write in any folder")
+@pytest.mark.parametrize("command", ["compress", "decompress", "convert-bbbin"])
+def test_a_folder_that_cant_be_written_in_fails_naming_the_output(
+    tmp_path: Path, standard_dataset: StandardDataset, command: str
+) -> None:
+    # h5py's error names no file, yet the line names the output, not the input.
+    src = an_input(command, tmp_path, standard_dataset)
+    folder = tmp_path / "read-only"
+    folder.mkdir()
+    dst = folder / "out.nc"
+    folder.chmod(0o500)
+    try:
+        result = run(command, src, dst)
+    finally:
+        folder.chmod(0o700)
+    assert "Permission denied" in assert_stopped(result, EXIT_FAILED, dst)
+    assert list(folder.iterdir()) == []
 
 
 def test_an_os_error_names_the_file_it_is_about(
