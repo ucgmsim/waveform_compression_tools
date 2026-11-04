@@ -1,3 +1,8 @@
+import json
+import shutil
+import string
+import struct
+import subprocess
 import tracemalloc
 import warnings
 from collections.abc import Callable
@@ -5,14 +10,17 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+import pyflac
 import pytest
 import xarray as xr
 
 from waveform_compression_tools import files
 from waveform_compression_tools.codec import (
+    STANDARD_DIMS,
     EncodedBlock,
     NotStandardLayout,
     encode_block,
+    max_relative_error,
     within_one_step,
 )
 from waveform_compression_tools.files import (
@@ -49,20 +57,85 @@ def rewrite(group: h5py.Group, name: str, data: np.ndarray) -> None:
     group.create_dataset(name, data=data)
 
 
-def assert_streams_tile_the_bytes(path: Path) -> None:
-    # Laid end to end in order of their starts, the streams cover the compressed bytes
-    # exactly: no stream is written twice, and nothing lies between them.
-    with h5py.File(path, "r") as f:
-        g = f[GROUP]
-        starts, nbytes = g["stream_starts"][...].ravel(), g["stream_bytes"][...].ravel()
-        size = g["compressed"].shape[0]
-    order = np.argsort(starts)
-    ends = np.cumsum(nbytes[order])
-    assert np.array_equal(starts[order], ends - nbytes[order]) and ends[-1] == size
+def within_one_step_of_the_setting(
+    original: np.ndarray, decoded: np.ndarray, bits: int
+) -> np.ndarray:
+    # For each trace, whether every sample is within the setting's one step: the
+    # trace's peak over 2 ** (bits - 1) - 1, with a relative slack of 1e-9, as the README
+    # promises. A trace of zeros has a step of 0, so it has to come back as exact zeros.
+    original = original.astype(np.float64)
+    step = np.abs(original).max(axis=2, keepdims=True) / (2 ** (bits - 1) - 1)
+    return np.all(np.abs(decoded - original) <= step * (1 + 1e-9), axis=2)
+
+
+def streaminfo(stream: bytes) -> dict[str, int]:
+    # A FLAC stream is the marker "fLaC" and then the STREAMINFO block: a 4-byte block
+    # header and 34 bytes of data. Counting from the start of the stream, bytes 8 to
+    # 12 of it are the minimum and maximum block sizes, and bytes 18 to 26 pack the
+    # sample rate, channel count and bits per sample (20, 3 and 5 bits) ahead of the
+    # total sample count.
+    assert stream[:4] == b"fLaC"
+    min_blocksize, max_blocksize = struct.unpack(">HH", stream[8:12])
+    packed = int.from_bytes(stream[18:26], "big")
+    return {
+        "min_blocksize": min_blocksize,
+        "max_blocksize": max_blocksize,
+        "sample_rate": packed >> 44,
+        "channels": ((packed >> 41) & 0b111) + 1,
+        "bits_per_sample": ((packed >> 36) & 0b11111) + 1,
+    }
+
+
+def decode_with_pyflac(stream: bytes, folder: Path) -> np.ndarray:
+    # pyflac's public StreamDecoder, which this package's decoder doesn't use.
+    frames: list[np.ndarray] = []
+    decoder = pyflac.StreamDecoder(
+        write_callback=lambda samples, rate, channels, n: frames.append(samples.copy())
+    )
+    decoder.process(stream)
+    decoder.finish()
+    return np.concatenate(frames).ravel()
+
+
+def decode_with_ffmpeg(stream: bytes, folder: Path) -> np.ndarray:
+    # As the README says: ffmpeg -i trace.flac -f s32le trace.raw.
+    flac, raw = folder / "trace.flac", folder / "trace.raw"
+    flac.write_bytes(stream)
+    command = ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", str(flac)]
+    subprocess.run([*command, "-f", "s32le", str(raw)], check=True)
+    return np.fromfile(raw, "<i4")
+
+
+# FLAC decoders independent of this package's own. Each takes a stream's bytes, and a
+# folder for any files it needs, and gives back its samples.
+DECODERS = {"pyflac's StreamDecoder": decode_with_pyflac, "ffmpeg": decode_with_ffmpeg}
 
 
 # Station counts on both sides of a multiple of 344, the stations in a block, and an
 # odd number of samples: every station has to be compressed exactly once.
+@pytest.mark.parametrize("bits", [8, 17, 24, 32])
+@pytest.mark.parametrize("n_station", [1, 343, 344, 345, 700])
+def test_round_trip_every_station(
+    tmp_path: Path, standard_dataset: StandardDataset, n_station: int, bits: int
+) -> None:
+    src, dst = tmp_path / "realisation.bb", tmp_path / "out.bb"
+    standard_dataset(n_station, nt=1001).to_netcdf(src, engine="h5netcdf")
+    res = compress_file(src, dst, bits=bits)
+    assert res.n_traces == 3 * n_station
+    assert dst.exists() and not partial_of(dst).exists()
+    back = decompress_file(dst)
+    with xr.open_dataset(src, engine="h5netcdf") as orig:
+        assert back["waveform"].dims == STANDARD_DIMS
+        assert back["waveform"].dtype == np.float32
+        assert back["waveform"].attrs == {"units": "g"}
+        xr.testing.assert_identical(
+            back.drop_vars("waveform"), orig.drop_vars("waveform")
+        )
+        original, decoded = orig["waveform"].values, back["waveform"].values
+    assert within_one_step_of_the_setting(original, decoded, bits).all()
+    check = verify_file(src, dst)
+    assert check.passed
+    assert check.max_relative_error == max_relative_error(original, decoded).max()
 
 
 def test_a_file_whose_components_are_x_y_z_comes_back_with_its_labels(
@@ -80,6 +153,57 @@ def test_a_file_whose_components_are_x_y_z_comes_back_with_its_labels(
             back.drop_vars("waveform"), orig.drop_vars("waveform")
         )
     assert verify_file(src, dst).passed
+
+
+@pytest.mark.parametrize("decoder", DECODERS)
+def test_a_file_decodes_by_the_readme_alone(
+    tmp_path: Path, standard_dataset: StandardDataset, decoder: str
+) -> None:
+    # The README describes the file well enough to decode it with h5py and any FLAC
+    # decoder, without this package. Traces of 5,000 samples take two frames each.
+    if decoder == "ffmpeg" and shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg is not on the PATH")
+    src = write(standard_dataset(4, nt=5_000, real=(1,)), tmp_path / "in.nc")
+    dst = tmp_path / "out.nc"
+    compress_file(src, dst, bits=24)
+    with h5py.File(dst, "r") as f:
+        assert "waveform" not in f
+        g = f[GROUP]
+        # The README's tables: the group's datasets, and its attributes.
+        assert {name: (g[name].dtype, g[name].shape) for name in g} == {
+            "compressed": (np.uint8, (g["compressed"].size,)),
+            "stream_starts": (np.int64, (3, 4)),
+            "stream_bytes": (np.int64, (3, 4)),
+            "stream_gains": (np.float64, (3, 4)),
+            "stream_offsets": (np.float64, (3, 4)),
+            "exact_stations": (np.int64, (1,)),
+            "exact_waveform": (np.float32, (3, 1, 5_000)),
+        }
+        assert g["stream_starts"].attrs["stream_size"] == 5_000
+        assert g.attrs["format_version"] == 1
+        assert list(g.attrs["dims"]) == ["component", "station", "time"]
+        assert g.attrs["dtype"] == "float32"
+        assert g.attrs["bits"] == 24
+        assert json.loads(g.attrs["waveform_attrs"]) == {"units": "g"}
+        compressed = g["compressed"][...]
+        starts, nbytes = g["stream_starts"][...], g["stream_bytes"][...]
+        gains, offsets = g["stream_gains"][...], g["stream_offsets"][...]
+        exact_stations = g["exact_stations"][...]
+        exact_waveform = g["exact_waveform"][...]
+    # The README's recipe, step by step.
+    waveform = np.empty((3, 4, 5_000), np.float32)
+    for c, s in np.ndindex(3, 4):
+        stream = compressed[starts[c, s] : starts[c, s] + nbytes[c, s]].tobytes()
+        info = streaminfo(stream)
+        assert (info["channels"], info["bits_per_sample"]) == (1, 32)
+        assert (info["min_blocksize"], info["max_blocksize"]) == (4_096, 4_096)
+        assert info["sample_rate"] == 44_100
+        q = DECODERS[decoder](stream, tmp_path)
+        trace = q.astype(np.float64) / gains[c, s] + offsets[c, s]
+        waveform[c, s] = trace.astype(np.float32)
+    for k, s in enumerate(exact_stations):
+        waveform[:, s] = exact_waveform[:, k]
+    assert bit_identical(waveform, decompress_file(dst)["waveform"].values)
 
 
 def test_refuses_non_standard_and_leaves_nothing(
@@ -387,6 +511,57 @@ def test_real_stations_come_back_exactly(
     assert verify_file(src, dst).passed  # All 10 stations in one block.
 
 
+# A netCDF file holds station names as text, which can be any Unicode, padded with
+# whitespace (HDF5 can't store a NUL in text), or as bytes of a fixed length, padded with
+# NULs, which are read as ASCII.
+@pytest.mark.parametrize(
+    ("names", "refused"),
+    [
+        pytest.param(
+            ["Ōtaki", " KIKS ", "S000002 ", "\tOPZ", "6c5SYSL", "22008d3\n"],
+            False,
+            id="text",
+        ),
+        pytest.param(
+            [b"OPZ", b" KIKS ", b"6c5SYSL ", b"\0S000003", b"ABCDEFGH", b"22008d3"],
+            False,
+            id="fixed-length ASCII bytes",
+        ),
+        pytest.param(
+            ["Ōtaki".encode(), b"S000001"], True, id="bytes that aren't ASCII"
+        ),
+    ],
+)
+def test_station_names_come_back_exactly(
+    tmp_path: Path,
+    standard_dataset: StandardDataset,
+    names: list[str] | list[bytes],
+    refused: bool,
+) -> None:
+    ds = standard_dataset(len(names), nt=50).assign_coords(station=np.array(names))
+    src, dst = write(ds, tmp_path / "in.nc"), tmp_path / "out.nc"
+    if refused:
+        # Refused, rather than read some other way.
+        with pytest.raises(ValueError):
+            compress_file(src, dst)
+        assert not dst.exists() and not partial_of(dst).exists()
+        return
+    compress_file(src, dst)
+    back = decompress_file(dst)["station"]
+    with xr.open_dataset(src, engine="h5netcdf") as orig:
+        assert back.dtype == orig["station"].dtype
+    assert back.values.tolist() == names  # Each name, and whether it is text or bytes.
+    # A name is a grid's if it is 7 characters long without its padding.
+    texts = [
+        name.decode("ascii") if isinstance(name, bytes) else name for name in names
+    ]
+    unpadded = [text.strip(string.whitespace + "\0") for text in texts]
+    with h5py.File(dst, "r") as f:
+        exact_stations = f[GROUP]["exact_stations"][...].tolist()
+    assert exact_stations == [i for i, name in enumerate(unpadded) if len(name) != 7]
+    assert verify_file(src, dst).passed
+
+
 def test_a_file_whose_stations_are_all_real_is_not_compressed(
     tmp_path: Path, standard_dataset: StandardDataset
 ) -> None:
@@ -547,6 +722,15 @@ def test_a_file_is_never_compressed_over_itself(
     assert src.read_bytes() == before
 
 
+# The waveform's attributes, which the file holds as JSON, changed from the original's
+# {"units": "g"}.
+WAVEFORM_ATTRS = {
+    "a waveform attribute changed": {"units": "m/s"},
+    "a waveform attribute added": {"units": "g", "scale": 2.0},
+    "a waveform attribute gone": {},
+}
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -554,6 +738,7 @@ def test_a_file_is_never_compressed_over_itself(
         "an attribute of a variable",
         "a variable's value",
         "a coordinate's value",
+        *WAVEFORM_ATTRS,
     ],
 )
 def test_verify_fails_a_file_whose_other_content_changed(
@@ -570,8 +755,10 @@ def test_verify_fails_a_file_whose_other_content_changed(
             f["vs30"].attrs["units"] = "m/s"
         elif change == "a variable's value":
             f["vs30"][1] += 1.0
-        else:
+        elif change == "a coordinate's value":
             f["latitude"][0] += 1.0
+        else:
+            f[GROUP].attrs["waveform_attrs"] = json.dumps(WAVEFORM_ATTRS[change])
     assert not verify_file(src, dst).passed
 
 

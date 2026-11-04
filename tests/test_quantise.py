@@ -8,10 +8,11 @@ from waveform_compression_tools.quantise import (
 
 
 def test_full_scale() -> None:
-    assert (full_scale(32), full_scale(24), full_scale(17)) == (
+    assert (full_scale(32), full_scale(24), full_scale(17), full_scale(8)) == (
         2_147_483_647,
         8_388_607,
         65_535,
+        127,
     )
 
 
@@ -25,6 +26,3 @@ def test_bits_out_of_range(bits: int) -> None:
 def test_non_finite_refused(bad: float) -> None:
     with pytest.raises(ValueError, match="non-finite"):
         quantise(np.array([0.0, 1.0, bad], dtype=np.float32), 1.0)
-
-
-# The tests below pin behaviour that the tests above leave open.

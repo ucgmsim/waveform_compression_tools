@@ -27,7 +27,7 @@ dev = ["ruff", "deptry", "ty"]
 waveform-compression-tools = "waveform_compression_tools.cli:app"
 
 [tool.deptry]
-pep621_dev_dependency_groups = ["test", "dev"]
+optional_dependencies_dev_groups = ["test", "dev"]
 
 # h5netcdf is used only through xarray's `engine` argument.
 [tool.deptry.per_rule_ignores]

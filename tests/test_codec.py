@@ -3,6 +3,9 @@ from collections.abc import Callable
 import numpy as np
 import pytest
 import xarray as xr
+from hypothesis import given
+from hypothesis import strategies as st
+from hypothesis.extra.numpy import arrays
 
 from waveform_compression_tools.codec import (
     STANDARD_DIMS,
@@ -55,6 +58,46 @@ def random_walks(shape: tuple[int, int, int], seed: int = 0) -> np.ndarray:
     return (walks * scales[..., None]).astype(np.float32)
 
 
+def within_one_step_of_the_setting(
+    original: np.ndarray, decoded: np.ndarray, bits: int
+) -> np.ndarray:
+    """Say, for each trace, whether every sample is within the setting's one step.
+
+    The step is the trace's peak over 2 ** (bits - 1) - 1, with a relative slack of
+    1e-9 for rounding, as the README promises. A trace of zeros has a step of 0, so
+    it has to come back as exact zeros.
+    """
+    original = original.astype(np.float64)
+    step = np.abs(original).max(axis=2, keepdims=True) / (2 ** (bits - 1) - 1)
+    return np.all(np.abs(decoded - original) <= step * (1 + 1e-9), axis=2)
+
+
+def hard_traces(nt: int) -> dict[str, np.ndarray]:
+    """Return the traces most likely to come back wrong, each of nt float32 samples."""
+    rng = np.random.default_rng(0)
+    walk = np.cumsum(rng.normal(size=nt))
+    walk /= np.abs(walk).max()  # A peak of 1.
+    spike = np.zeros(nt)
+    spike[nt // 2] = -7.0
+    # Peaks that no other sample of their trace matches, of either sign.
+    peak_first, peak_last = walk.copy(), walk.copy()
+    peak_first[0] = -2.0
+    peak_last[-1] = 2.0
+    traces = {
+        "all zeros": np.zeros(nt),
+        "a positive constant": np.full(nt, 2.5),
+        "a negative constant": np.full(nt, -3.5),
+        "a single spike": spike,
+        "a peak at the first sample": peak_first,
+        "a peak at the last sample": peak_last,
+        "a peak of 3.4e38": 3.4e38 * walk,
+        "about 1e-39, below float32's normal numbers": 1e-39 * walk,
+        "subnormal multiples of 1.4e-45": rng.integers(-5, 6, nt) * 1.4e-45,
+        "1e30 beside 1e-30": np.where(np.arange(nt) % 2 == 0, 1e30, 1e-30),
+    }
+    return {name: trace.astype(np.float32) for name, trace in traces.items()}
+
+
 @pytest.mark.parametrize("name", KIT_FLAC_BYTES)
 @pytest.mark.parametrize("bits", [32, 24, 17])
 def test_kit_sizes_match_the_reference(
@@ -96,9 +139,6 @@ def test_check_standard_refuses(ds: xr.Dataset) -> None:
         check_standard(ds)
 
 
-# The tests below pin behaviour that the tests above leave open.
-
-
 @pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
 def test_block_with_a_non_finite_sample_is_refused(bad: float) -> None:
     w = random_walks((3, 2, 100))
@@ -119,10 +159,28 @@ def test_round_trip_at_any_length_within_one_step(bits: int, nt: int) -> None:
     assert max_relative_error(w, back).max() <= RELATIVE_ERROR_LIMIT[bits]
 
 
-def flip_a_byte(stream: bytes) -> bytes:
-    damaged = bytearray(stream)
-    damaged[len(damaged) // 2] ^= 0xFF
-    return bytes(damaged)
+@pytest.mark.parametrize("bits", range(8, 33))
+def test_hard_traces_come_back_within_one_step(bits: int) -> None:
+    # Each station holds one of the hard traces, in all three of its components.
+    traces = hard_traces(nt=100)
+    block = np.stack([np.stack(list(traces.values()))] * 3)
+    ok = within_one_step_of_the_setting(block, round_trip(block, bits), bits)
+    assert ok.all(), [name for name, good in zip(traces, ok.all(axis=0)) if not good]
+
+
+@given(
+    block=arrays(
+        np.float32,
+        st.tuples(st.just(3), st.integers(1, 3), st.integers(1, 300)),
+        elements=st.floats(width=32, allow_nan=False, allow_infinity=False),
+    ),
+    bits=st.integers(8, 32),
+)
+def test_any_finite_block_comes_back_within_one_step(
+    block: np.ndarray, bits: int
+) -> None:
+    # Any finite float32, subnormals included, at any setting.
+    assert within_one_step_of_the_setting(block, round_trip(block, bits), bits).all()
 
 
 @pytest.mark.parametrize("off", [1.0, -0.5, 1e-30])

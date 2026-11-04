@@ -15,7 +15,8 @@ from waveform_compression_tools.codec import (
     max_relative_error,
 )
 from waveform_compression_tools.files import GROUP, is_compressed
-from waveform_compression_tools.quantise import full_scale
+from waveform_compression_tools.quantise import full_scale, quantise
+from waveform_compression_tools.stream import encode_stream
 
 StandardDataset = Callable[..., xr.Dataset]
 
@@ -73,8 +74,34 @@ def compressed_file(ds: xr.Dataset, tmp_path: Path) -> tuple[Path, Path]:
     return src, dst
 
 
-# A small file grows, as the compressed bytes are stored in chunks of 4 MiB; a larger
-# one shrinks. The size is reported as a factor of the bigger over the smaller.
+def test_compress_then_verify(tmp_path: Path) -> None:
+    # Each command in turn, on what the one before it wrote. Each exits with status 0
+    # and says nothing on stderr; its output is at its destination; and the files it
+    # read are as they were.
+    bb, nc, packed, back = (
+        tmp_path / name for name in ("BB.bin", "BB.nc", "BB.flac.nc", "back.nc")
+    )
+    write_bbbin(bb, ["S000000", "S000001", "KIKS"], nt=200)
+    steps = [
+        (("convert-bbbin", bb, nc), [bb], nc),
+        (("compress", nc, packed), [nc], packed),
+        (("verify", nc, packed), [nc, packed], None),
+        (("decompress", packed, back), [packed], back),
+    ]
+    for args, inputs, output in steps:
+        before = [path.read_bytes() for path in inputs]
+        result = run(*args)
+        assert_exit(result, 0)
+        assert result.stderr == "", args
+        assert output is None or output.is_file(), args
+        assert [path.read_bytes() for path in inputs] == before, args
+    # Nothing else, no partial file included, was left behind.
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "BB.bin",
+        "BB.flac.nc",
+        "BB.nc",
+        "back.nc",
+    ]
 
 
 @pytest.mark.parametrize("bits", ["7", "33"])
@@ -182,15 +209,77 @@ def test_decompress_gives_back_the_standard_layout(
     assert np.array_equal(original[:, 1].view(np.uint32), decoded[:, 1].view(np.uint32))
 
 
+# Damage to one trace's stream, which decompressing and verifying both meet.
+STREAM_DAMAGE = [
+    "a zeroed fLaC marker",
+    "a flipped byte",
+    "the last 10 bytes cut off",
+    "a cut between frames",
+    "a cut to nothing",
+]
+# Damage that only a check against the original can find.
+CHECK_DAMAGE = ["a doubled gain", "an original of another shape"]
+
+
+@pytest.mark.parametrize(
+    ("command", "damage"),
+    [("decompress", damage) for damage in STREAM_DAMAGE]
+    + [("verify", damage) for damage in STREAM_DAMAGE + CHECK_DAMAGE],
+)
+def test_a_damaged_file_fails_the_check(
+    tmp_path: Path, standard_dataset: StandardDataset, command: str, damage: str
+) -> None:
+    # 10,000 samples are two whole frames of 4,096 and a short third.
+    ds = standard_dataset(3, nt=10_000)
+    src, packed = compressed_file(ds, tmp_path)
+    c, s = 1, 2
+    with h5py.File(packed, "r+") as f:
+        g = f[GROUP]
+        start, size = int(g["stream_starts"][c, s]), int(g["stream_bytes"][c, s])
+        if damage == "a zeroed fLaC marker":
+            g["compressed"][start : start + 4] = 0
+        elif damage == "a flipped byte":
+            g["compressed"][start + size // 2] ^= 0xFF
+        elif damage == "the last 10 bytes cut off":
+            g["stream_bytes"][c, s] = size - 10
+        elif damage == "a cut between frames":
+            # The stream's first two frames are the first 8,192 samples encoded alone.
+            # libFLAC decodes them without an error: only a count of the samples finds
+            # the cut.
+            gain = g["stream_gains"][c, s]
+            frames = encode_stream(quantise(ds["waveform"].values[c, s, :8192], gain))
+            assert g["compressed"][start : start + size].tobytes().startswith(frames)
+            g["stream_bytes"][c, s] = len(frames)
+        elif damage == "a cut to nothing":
+            g["stream_bytes"][c, s] = 0
+        elif damage == "a doubled gain":
+            g["stream_gains"][c, s] *= 2
+    original = src
+    if damage == "an original of another shape":
+        original = write(ds.isel(station=slice(0, 2)), tmp_path / "other.nc")
+    back = tmp_path / "back.nc"
+    before = sorted(tmp_path.iterdir())
+    # Decompress takes the compressed file and where to write; verify takes the
+    # original and the compressed file.
+    args = {"decompress": (packed, back), "verify": (original, packed)}[command]
+    result = run(command, *args)
+    assert_exit(result, 1)
+    assert result.stderr != "" and result.stdout == ""
+    assert sorted(tmp_path.iterdir()) == before  # Nothing at DST, nor anywhere else.
+
+
+@pytest.mark.parametrize("command", ["decompress", "verify"])
 def test_decompress_refuses_a_file_that_is_not_compressed(
-    tmp_path: Path, standard_dataset: StandardDataset
+    tmp_path: Path, standard_dataset: StandardDataset, command: str
 ) -> None:
     src = write(standard_dataset(2, nt=50), tmp_path / "in.nc")
-    dst = tmp_path / "out.nc"
-    result = run("decompress", src, dst)
+    # Decompress takes the file and where to write; verify takes the original and the
+    # file it checks, here the original again.
+    args = {"decompress": (src, tmp_path / "out.nc"), "verify": (src, src)}[command]
+    result = run(command, *args)
     assert_exit(result, 1)
     assert "not compressed" in result.stderr and result.stdout == ""
-    assert not dst.exists() and not partial_of(dst).exists()
+    assert [p.name for p in tmp_path.iterdir()] == ["in.nc"]  # Nothing is written.
 
 
 # What the command shows when the write fails, or None where the failure is not one it
@@ -241,7 +330,7 @@ def test_convert_bbbin_refuses_a_file_that_is_not_a_bbbin(tmp_path: Path) -> Non
     assert not dst.exists() and not partial_of(dst).exists()
 
 
-@pytest.mark.parametrize("command", ["decompress", "convert-bbbin"])
+@pytest.mark.parametrize("command", ["compress", "decompress", "convert-bbbin"])
 @pytest.mark.parametrize("src_name", ["data.nc", "data.nc.partial"])
 def test_a_command_will_not_write_over_its_source(
     tmp_path: Path,
@@ -257,7 +346,9 @@ def test_a_command_will_not_write_over_its_source(
     # whatever the spelling it is the same file.
     monkeypatch.chdir(tmp_path)
     src, dst = Path(src_name), tmp_path / "data.nc"
-    if command == "decompress":
+    if command == "compress":
+        write(standard_dataset(2, nt=50), src)
+    elif command == "decompress":
         original = write(standard_dataset(2, nt=50), tmp_path / "original.nc")
         assert_exit(run("compress", original, src), 0)
     else:
@@ -281,14 +372,20 @@ SOURCES = [
 DESTINATIONS = [("compress", 1), ("decompress", 1), ("convert-bbbin", 1)]
 
 
-@pytest.mark.parametrize(("command", "position"), SOURCES)
+# A source that doesn't exist, and a folder where any file is named.
+@pytest.mark.parametrize(
+    ("command", "position", "path"),
+    [(command, position, "missing.nc") for command, position in SOURCES]
+    + [(command, position, ".") for command, position in SOURCES + DESTINATIONS],
+)
 def test_a_missing_source_is_a_usage_error(
-    tmp_path: Path, command: str, position: int
+    tmp_path: Path, command: str, position: int, path: str
 ) -> None:
     exists = tmp_path / "exists.nc"
     exists.write_bytes(b"")
     args = [exists, exists]
-    args[position] = tmp_path / "missing.nc"
+    args[position] = tmp_path / path  # "." names the folder itself.
     result = run(command, *args)
     assert_exit(result, 2)
-    assert "does not exist" in result.stderr
+    message = "is a directory" if path == "." else "does not exist"
+    assert message in result.stderr

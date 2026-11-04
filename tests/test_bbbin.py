@@ -2,12 +2,14 @@ import struct
 from collections.abc import Callable
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pytest
 import xarray as xr
 
 from waveform_compression_tools.bbbin import convert_bbbin, read_bbbin
 from waveform_compression_tools.codec import (
+    check_standard,
     max_relative_error,
 )
 from waveform_compression_tools.files import (
@@ -37,6 +39,8 @@ def test_every_sample_lands_in_its_place(
     expected = np.moveaxis(data[:, :, [1, 0, 2]], 2, 0)
     assert ds["waveform"].shape == (3, nstat, nt)
     np.testing.assert_array_equal(ds["waveform"].values, expected)
+    assert list(ds["component"].values) == ["000", "090", "ver"]
+    assert ds["waveform"].attrs["units"] == "g"
     assert ds["time"].shape == (nt,)
     assert ds["station"].shape == (nstat,)
 
@@ -172,6 +176,29 @@ def test_the_size_has_to_fit_the_header(
     path.write_bytes(change(path.read_bytes()))
     with pytest.raises(ValueError, match="not a BB.bin file"):
         read_bbbin(path)
+
+
+@pytest.mark.parametrize("endian", ["<", ">"])
+def test_convert_bbbin_writes_a_netcdf_file(
+    tmp_path: Path, endian: str, make_bbbin: MakeBbbin
+) -> None:
+    # A big-endian file's numbers have to be turned into the machine's, in every
+    # variable: a file written from them would keep their byte order, and a waveform
+    # read back from it in that order isn't the standard layout's float32.
+    make_bbbin(tmp_path / "BB.bin", nstat=3, nt=7, endian=endian)
+    ds = read_bbbin(tmp_path / "BB.bin")
+    nc = convert_bbbin(tmp_path / "BB.bin", tmp_path / "BB.nc")
+    assert nc == tmp_path / "BB.nc"
+    # The BB.bin and the converted file, and no partial file.
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["BB.bin", "BB.nc"]
+    assert h5py.is_hdf5(nc)
+    with xr.open_dataset(nc, engine="h5netcdf") as written:
+        for dataset in (ds, written):
+            check_standard(dataset)
+            assert all(
+                variable.dtype.isnative for variable in dataset.variables.values()
+            )
+        xr.testing.assert_identical(written, ds)
 
 
 def test_converted_file_compresses(tmp_path: Path, make_bbbin: MakeBbbin) -> None:
