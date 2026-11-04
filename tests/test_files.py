@@ -168,7 +168,8 @@ def test_a_file_decodes_by_the_readme_alone(
     compress_file(src, dst, bits=24)
     with h5py.File(dst, "r") as f:
         assert "waveform" not in f
-        g = f[GROUP]
+        # By the name the README gives it, as every file written so far holds it.
+        g = f["_flac_compressed_waveform"]
         # The README's tables: the group's datasets, and its attributes.
         assert {name: (g[name].dtype, g[name].shape) for name in g} == {
             "compressed": (np.uint8, (g["compressed"].size,)),
