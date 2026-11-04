@@ -1,9 +1,7 @@
 import tracemalloc
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-import xarray as xr
 
 from waveform_compression_tools import files
 from waveform_compression_tools.files import (
@@ -12,7 +10,7 @@ from waveform_compression_tools.files import (
     verify_file,
 )
 
-StandardDataset = Callable[..., xr.Dataset]
+from helpers import StandardDataset
 
 
 def test_block_sizes() -> None:

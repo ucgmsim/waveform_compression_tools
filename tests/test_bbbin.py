@@ -19,12 +19,10 @@ from waveform_compression_tools.files import (
     verify_file,
 )
 
+from helpers import partial_of
+
 # make_bbbin, the fixture that writes a BB.bin file, is in conftest.py.
 MakeBbbin = Callable[..., np.ndarray]
-
-
-def partial_of(path: Path) -> Path:
-    return Path(f"{path}.partial")
 
 
 # Shapes with one station, one sample, or both, where a dimension could be lost.

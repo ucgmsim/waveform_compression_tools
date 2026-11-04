@@ -13,6 +13,8 @@ from waveform_compression_tools.codec import (
     within_one_step,
 )
 
+from helpers import within_one_step_of_the_setting
+
 # Total FLAC bytes for each kit file and setting, as measured with an independent
 # implementation of this encoder (level 5, float64 gains).
 KIT_FLAC_BYTES = {
@@ -52,20 +54,6 @@ def random_walks(shape: tuple[int, int, int], seed: int = 0) -> np.ndarray:
     walks = np.cumsum(rng.normal(size=shape), axis=2)
     scales = 10.0 ** rng.uniform(-3, 2, shape[:2])
     return (walks * scales[..., None]).astype(np.float32)
-
-
-def within_one_step_of_the_setting(
-    original: np.ndarray, decoded: np.ndarray, bits: int
-) -> np.ndarray:
-    """Say, for each trace, whether every sample is within the setting's one step.
-
-    The step is the trace's peak over 2 ** (bits - 1) - 1, with a relative slack of
-    1e-9 for rounding, as the README promises. A trace of zeros has a step of 0, so
-    it has to come back as exact zeros.
-    """
-    original = original.astype(np.float64)
-    step = np.abs(original).max(axis=2, keepdims=True) / (2 ** (bits - 1) - 1)
-    return np.all(np.abs(decoded - original) <= step * (1 + 1e-9), axis=2)
 
 
 def hard_traces(nt: int) -> dict[str, np.ndarray]:

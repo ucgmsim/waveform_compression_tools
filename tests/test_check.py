@@ -1,4 +1,3 @@
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -36,16 +35,7 @@ from waveform_compression_tools.files import (
 from waveform_compression_tools.quantise import full_scale, quantise
 from waveform_compression_tools.stream import encode_stream
 
-StandardDataset = Callable[..., xr.Dataset]
-
-
-def write(ds: xr.Dataset, path: Path) -> Path:
-    ds.to_netcdf(path, engine="h5netcdf")
-    return path
-
-
-def partial_of(path: Path) -> Path:
-    return Path(f"{path}.partial")
+from helpers import StandardDataset, partial_of, write
 
 
 def nothing_left(dst: Path) -> bool:

@@ -37,16 +37,7 @@ from waveform_compression_tools.quantise import full_scale, gain_for, quantise
 from waveform_compression_tools.record import write_record
 from waveform_compression_tools.stream import encode_stream
 
-StandardDataset = Callable[..., xr.Dataset]
-
-
-def write(ds: xr.Dataset, path: Path) -> Path:
-    ds.to_netcdf(path, engine="h5netcdf")
-    return path
-
-
-def partial_of(path: Path) -> Path:
-    return Path(f"{path}.partial")
+from helpers import StandardDataset, partial_of, within_one_step_of_the_setting, write
 
 
 def bit_identical(a: np.ndarray, b: np.ndarray) -> bool:
@@ -58,17 +49,6 @@ def rewrite(group: h5py.Group, name: str, data: np.ndarray) -> None:
     # Replaces a dataset in a group, whatever its shape or type.
     del group[name]
     group.create_dataset(name, data=data)
-
-
-def within_one_step_of_the_setting(
-    original: np.ndarray, decoded: np.ndarray, bits: int
-) -> np.ndarray:
-    # For each trace, whether every sample is within the setting's one step: the
-    # trace's peak over 2 ** (bits - 1) - 1, with a relative slack of 1e-9, as the README
-    # promises. A trace of zeros has a step of 0, so it has to come back as exact zeros.
-    original = original.astype(np.float64)
-    step = np.abs(original).max(axis=2, keepdims=True) / (2 ** (bits - 1) - 1)
-    return np.all(np.abs(decoded - original) <= step * (1 + 1e-9), axis=2)
 
 
 def streaminfo(stream: bytes) -> dict[str, int]:

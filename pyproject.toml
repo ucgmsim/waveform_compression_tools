@@ -68,6 +68,8 @@ convention = "numpy"
 
 [tool.ruff.lint.isort]
 known-first-party = ["waveform_compression_tools"]
+# The tests' shared functions, in tests/helpers.py.
+known-local-folder = ["helpers"]
 
 [tool.ruff.lint.per-file-ignores]
 # Ignore no docstring in __init__.py
