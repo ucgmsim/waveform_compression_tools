@@ -351,6 +351,79 @@ def _attr_types(attrs: dict) -> dict[str, str]:
     return types
 
 
+def _named_non_finite(value: object, name: str, typed: bool) -> object:
+    """Write each float of an attribute that isn't finite as its name, for strict JSON.
+
+    Parameters
+    ----------
+    value : object
+        The attribute's value as plain Python: a scalar, or lists for an array.
+    name : str
+        The attribute's name, for the message.
+    typed : bool
+        Whether the attribute has a numpy type, which brings a number back from its
+        name when the file is read.
+
+    Returns
+    -------
+    object
+        The value, with ``"NaN"``, ``"Infinity"`` or ``"-Infinity"`` in place of each
+        float that isn't finite, in its lists too.
+
+    Raises
+    ------
+    NotStandardLayout
+        If a float isn't finite and the attribute has no numpy type, so its name would
+        come back as a string.
+    """
+    if isinstance(value, list | tuple):
+        return [_named_non_finite(v, name, typed) for v in value]
+    if isinstance(value, float) and not np.isfinite(value):
+        if not typed:
+            raise NotStandardLayout(
+                f"attribute {name!r} holds {value}, which strict JSON can't hold and "
+                "which has no numpy type to come back as"
+            )
+        return str(value).replace("inf", "Infinity").replace("nan", "NaN")
+    return value
+
+
+def _attrs_json(attrs: dict) -> str:
+    """Write the waveform's attributes as strict JSON.
+
+    A float that isn't finite, on its own or in a list, is the string ``"NaN"``,
+    ``"Infinity"`` or ``"-Infinity"``, as in ``waveform_encoding``. Its type, which
+    ``waveform_attr_types`` records (see `_attr_types`), makes a number of it again
+    when the file is read.
+
+    Parameters
+    ----------
+    attrs : dict
+        The waveform's attributes.
+
+    Returns
+    -------
+    str
+        A JSON object of the attributes.
+
+    Raises
+    ------
+    NotStandardLayout
+        If an attribute's type can't be kept (see `_attr_types`), it can't go in JSON
+        (see `_plain`), or it holds a float that isn't finite and has no numpy type.
+    """
+    types = _attr_types(attrs)
+    out = {
+        name: _named_non_finite(
+            value.tolist() if isinstance(value, np.ndarray | np.generic) else value,
+            name,
+            name in types,
+        )
+        for name, value in attrs.items()
+    }
+    return json.dumps(out, default=_plain, allow_nan=False)
+
+
 def _written_dtypes(attrs: dict) -> dict[str, str]:
     """Name the dtype each attribute is written with when the dataset is saved.
 
@@ -669,8 +742,7 @@ def check_compressible(
                 f"{src} has no stations, so there is nothing to compress"
             )
         # Each refuses an attribute that the compressed file can't keep.
-        json.dumps(dict(waveform.attrs), default=_plain)
-        _attr_types(waveform.attrs)
+        _attrs_json(waveform.attrs)
         _refuse_unkeepable_fill_values(waveform.encoding, src)
         if exact.size == n_station:
             raise AllStationsReal(
@@ -791,7 +863,7 @@ def compress_file(
             "format_version": _FORMAT_VERSION,
             "dims": list(STANDARD_DIMS),
             "dtype": "float32",
-            "waveform_attrs": json.dumps(dict(waveform.attrs), default=_plain),
+            "waveform_attrs": _attrs_json(waveform.attrs),
             "waveform_encoding": waveform_encoding,
             "waveform_attr_types": json.dumps(_attr_types(waveform.attrs)),
             "bits": bits,

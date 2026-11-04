@@ -24,6 +24,7 @@ from waveform_compression_tools.codec import (
 )
 from waveform_compression_tools.content_hash import content_hash
 from waveform_compression_tools.destinations import refuse_overwriting, write_netcdf
+from waveform_compression_tools.errors import NotStandardLayout
 from waveform_compression_tools.files import (
     GROUP,
     check_compressible,
@@ -440,6 +441,59 @@ def test_a_nan_fill_value_is_written_as_strict_json(
     assert json.loads(text, parse_constant=pytest.fail) == {"_FillValue": "NaN"}
     assert verify_file(src, dst).passed
     assert np.isnan(decompress_file(dst)["waveform"].encoding["_FillValue"])
+
+
+def test_a_non_finite_attribute_is_written_as_strict_json(
+    tmp_path: Path, standard_dataset: StandardDataset
+) -> None:
+    ds = standard_dataset(2, nt=50)
+    ds["waveform"].attrs.update(
+        unset=np.nan,
+        high=np.float32(np.inf),
+        low=-np.inf,
+        weights=np.array([0.5, np.nan], np.float32),
+    )
+    src, dst = write(ds, tmp_path / "in.nc"), tmp_path / "out.nc"
+    compress_file(src, dst)
+    with h5py.File(dst, "r") as f:
+        text = f[GROUP].attrs["waveform_attrs"]
+    assert json.loads(text, parse_constant=pytest.fail) == {
+        "units": "g",
+        "unset": "NaN",
+        "high": "Infinity",
+        "low": "-Infinity",
+        "weights": [0.5, "NaN"],
+    }
+    # Each comes back as a number again, in its own type, a NaN as a NaN.
+    back = decompress_file(dst)["waveform"].attrs
+    with xr.open_dataset(src, engine="h5netcdf") as orig:
+        expected = dict(orig["waveform"].attrs)
+    assert back.keys() == expected.keys()
+    for name, value in expected.items():
+        np.testing.assert_array_equal(back[name], value)
+        assert type(back[name]) is type(value), name
+        if isinstance(value, np.ndarray | np.generic):
+            assert back[name].dtype == value.dtype, name
+    assert verify_file(src, dst).passed
+    # A file written before 1.0.0 may hold bare tokens, and no types: it still decodes.
+    with h5py.File(dst, "r+") as f:
+        f[GROUP].attrs["waveform_attrs"] = (
+            '{"units": "g", "unset": NaN, "weights": [0.5, NaN], "high": Infinity}'
+        )
+        del f[GROUP].attrs["waveform_attr_types"]
+    older = decompress_file(dst)["waveform"].attrs
+    assert older["units"] == "g" and np.isnan(older["unset"])
+    assert np.isnan(older["weights"][1]) and older["high"] == np.inf
+
+
+def test_a_non_finite_attribute_without_a_type_is_refused() -> None:
+    # Attributes read from a file are numpy values, whose types bring a NaN back from
+    # its name. A plain float has no type, so its name would come back as a string.
+    for value in (float("nan"), [1.0, float("-inf")]):
+        with pytest.raises(NotStandardLayout, match="'unset'"):
+            files._attrs_json({"units": "g", "unset": value})
+    typed = files._attrs_json({"unset": np.float64(np.nan)})
+    assert json.loads(typed, parse_constant=pytest.fail) == {"unset": "NaN"}
 
 
 def test_every_kind_of_encoding_value_is_strict_json() -> None:

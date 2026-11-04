@@ -6,6 +6,7 @@ The first release: the FLAC codec for float32 waveforms in netCDF files, as a pa
 
 - **A package of its own,** `waveform_compression_tools`, installed from a release tag, with the command `waveform-compression-tools`.
 - **The waveform's encoding is kept:** its `_FillValue` and `missing_value`, in the new group attribute `waveform_encoding`, and its attributes' types, in `waveform_attr_types`. Files written before 1.0.0 don't have them: they decompress with a NaN fill value, and their attributes in JSON's types.
+- **The waveform's attributes are strict JSON:** in `waveform_attrs`, a float that isn't finite is the string `"NaN"`, `"Infinity"` or `"-Infinity"`, which its type in `waveform_attr_types` makes a number again, so any JSON parser reads them. Files written before 1.0.0 may hold bare tokens, which still decode.
 - **Blocks follow a memory budget,** `BLOCK_BYTES` (128 MiB), in whole station chunks of the file unless those would exceed the budget by more than a quarter.
 - **compress checks its output in the same pass,** against the samples it read, and then the closed file against its original. `--no-check` or `check=False` leaves the check out.
 - **Refusals and failures have their own types:** `Refused` and its subclasses for an input that can't be used as it is, and `CheckFailed` for an output that fails the check. Neither leaves anything at the destination.

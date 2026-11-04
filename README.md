@@ -302,7 +302,7 @@ The waveform is float32 with the dimensions (component, station, time), its comp
 | `format_version` | `1`. A reader should refuse any other. |
 | `dims` | `["component", "station", "time"]` |
 | `dtype` | `"float32"` |
-| `waveform_attrs` | the original waveform's attributes, as a JSON string |
+| `waveform_attrs` | the original waveform's attributes, as a JSON string. A float that isn't finite, on its own or in a list, is the string `"NaN"`, `"Infinity"` or `"-Infinity"`, and its type in `waveform_attr_types` makes a number of it again. Files written before 1.0.0 may hold the bare tokens `NaN`, `Infinity` and `-Infinity` instead, which Python's `json` reads and stricter parsers refuse. |
 | `waveform_encoding` | a JSON string of the waveform's `_FillValue` and `missing_value`, as the original had them; a value that isn't finite is the string `"NaN"`, `"Infinity"` or `"-Infinity"`. An original with no `_FillValue` has `{"_FillValue": null}`: write the waveform without one. Files written before 1.0.0 don't have it, and decompress with a NaN `_FillValue`. |
 | `waveform_attr_types` | a JSON string mapping each numpy-typed attribute of `waveform_attrs` to its dtype, such as `"float32"` or `"int32"`. Files written before 1.0.0 don't have it, and their attributes come back in JSON's own types: float64 and int64. |
 | `bits` | the setting, an integer from 8 to 32 (see [Choosing a setting](#choosing-a-setting)) |
