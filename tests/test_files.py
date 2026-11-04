@@ -914,3 +914,19 @@ def test_verify_checks_the_flac_streams_of_real_stations_too(
     back = decompress_file(dst)["waveform"].values
     assert bit_identical(back[:, 1], original[:, 1])
     assert not verify_file(src, dst).passed
+
+
+@pytest.mark.parametrize("fill", [np.nan, -999.0])
+def test_verify_asks_whether_an_older_file_decompresses_to_the_original(
+    tmp_path: Path, standard_dataset: StandardDataset, fill: float
+) -> None:
+    # Without the two new attributes, a file decodes with a NaN fill value, so it
+    # verifies exactly when the original's was NaN.
+    ds = standard_dataset(2, nt=50)
+    ds["waveform"].encoding["_FillValue"] = np.float32(fill)
+    src, dst = write(ds, tmp_path / "in.nc"), tmp_path / "out.nc"
+    compress_file(src, dst)
+    with h5py.File(dst, "r+") as f:
+        del f[GROUP].attrs["waveform_encoding"]
+        del f[GROUP].attrs["waveform_attr_types"]
+    assert verify_file(src, dst).passed is bool(np.isnan(fill))

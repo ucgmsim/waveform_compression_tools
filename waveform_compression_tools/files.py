@@ -566,9 +566,10 @@ class _Streams:
         The quantisation setting the file declares, from 8 to 32.
     waveform_attrs : dict
         The original waveform's attributes, each numpy value in its own type.
-    encoding : dict or None
-        The waveform's ``_FillValue`` and ``missing_value`` to put back, or None
-        for a file without ``waveform_encoding``.
+    encoding : dict
+        The waveform's ``_FillValue`` and ``missing_value`` to put back. A file
+        without ``waveform_encoding`` gets what such files always decoded to, a NaN
+        ``_FillValue``.
     exact_stations : np.ndarray
         The real stations, in increasing order.
     exact_waveform : h5py.Dataset
@@ -584,7 +585,7 @@ class _Streams:
     nt: int
     bits: int
     waveform_attrs: dict
-    encoding: dict | None
+    encoding: dict
     exact_stations: np.ndarray
     exact_waveform: h5py.Dataset
 
@@ -710,7 +711,7 @@ def _open_streams(f: h5py.File, path: Path) -> _Streams:
             if isinstance(value, list)
             else np.dtype(dtype).type(value)
         )
-    encoding = group.attrs.get("waveform_encoding")
+    encoding = group.attrs.get("waveform_encoding", '{"_FillValue": "NaN"}')
     return _Streams(
         compressed=group["compressed"],
         starts=starts,
@@ -720,7 +721,7 @@ def _open_streams(f: h5py.File, path: Path) -> _Streams:
         nt=nt,
         bits=bits,
         waveform_attrs=waveform_attrs,
-        encoding=None if encoding is None else _encoding_back(encoding),
+        encoding=_encoding_back(encoding),
         exact_stations=exact_stations,
         exact_waveform=exact_waveform,
     )
@@ -763,8 +764,7 @@ def decompress_file(path: Path) -> xr.Dataset:
             waveform[:, s0:s1] = block
     ds = xr.load_dataset(path, engine="h5netcdf")
     ds["waveform"] = (STANDARD_DIMS, waveform, streams.waveform_attrs)
-    if streams.encoding is not None:
-        ds["waveform"].encoding.update(streams.encoding)
+    ds["waveform"].encoding.update(streams.encoding)
     return ds
 
 
@@ -842,9 +842,9 @@ def verify_file(
             xr.Dataset(attrs=streams.waveform_attrs)
         ) and _attr_types(waveform.attrs) == _attr_types(streams.waveform_attrs)
         # The encoding as JSON, so a NaN fill value equals a NaN one.
-        same_encoding = streams.encoding is not None and json.loads(
-            _encoding_json(waveform.encoding)
-        ) == json.loads(_encoding_json(streams.encoding))
+        same_encoding = json.loads(_encoding_json(waveform.encoding)) == json.loads(
+            _encoding_json(streams.encoding)
+        )
         passed = (
             ds.drop_vars("waveform").identical(rest)
             and same_attrs
