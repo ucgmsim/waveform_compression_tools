@@ -90,7 +90,7 @@ waveform-compression-tools compress realisation.nc realisation.flac.nc --bits 24
 3. DST's folder, and the record's, have to exist.
 4. SRC is hashed.
 5. SRC is read, encoded, written and checked, a block of stations at a time. Two refusals need the samples, so they come here: a trace that holds a NaN or an infinity, and a finite fill value within one step of a trace's range.
-6. DST is hashed.
+6. DST is hashed, under its `.partial` name, and then renamed into place.
 7. The record is written.
 
 On success it prints what it did, such as:
@@ -226,7 +226,7 @@ An unexpected error's reason starts with its type, such as `RuntimeError: …`. 
 - A write that fails partway, on a full disk or past a quota, fails the run with the system's reason, naming the output, as `waveform-compression-tools: out.nc: [Errno 28] No space left on device: 'out.nc'`, and `compress` stops at the end of the block of stations it was writing. HDF5 writes each output through a file object that never tells it a write failed, a workaround for an HDF5 bug: its own error would hide the system's, and HDF5 2.0.0 to 2.2.0 can crash Python afterwards.
 - A run that is killed, by a time limit, the out-of-memory killer or SIGKILL, may leave `DST.partial` behind. The next run replaces it, and it is safe to delete.
 - A file already at DST, or at the record's PATH, is replaced only with `--overwrite` (`overwrite=True` in Python).
-- With `--overwrite`, the earlier output stays until the new, checked file is renamed into place. If the run fails after that, while hashing the new file, the new file is deleted too, and nothing is left at DST. The input is untouched, so a rerun makes it again.
+- With `--overwrite`, the earlier output stays until the new file is checked, hashed and renamed into place, so a run that fails before then leaves it as it was. The input is untouched, so a rerun makes it again.
 - A destination that is the input, by its name, through a symbolic link or as a hard link, or whose `.partial` is, is refused, with or without `--overwrite`, so a command doesn't write over its own input. Anything else at a destination's `.partial` name, a link included, is removed before the file is written, and never written through.
 
 ## Python use
@@ -235,7 +235,12 @@ An unexpected error's reason starts with its type, such as `RuntimeError: …`. 
 from pathlib import Path
 
 from waveform_compression_tools.bbbin import convert_bbbin, read_bbbin
-from waveform_compression_tools.files import compress_file, decompress_file, verify_file
+from waveform_compression_tools.files import (
+    compress_file,
+    decompress_file,
+    decompress_to,
+    verify_file,
+)
 
 src, dst = Path("realisation.nc"), Path("realisation.flac.nc")
 result = compress_file(src, dst, bits=24)  # checks dst as it writes it
@@ -245,7 +250,7 @@ check = verify_file(src, dst)  # the original first
 print(check.passed, check.max_relative_error)
 
 ds = decompress_file(dst)  # an xarray Dataset, held in memory
-ds.to_netcdf("back.nc", engine="h5netcdf")
+decompress_to(dst, Path("back.nc"))  # the same, written to a netCDF file
 
 bb = read_bbbin(Path("BB.bin"))  # a Dataset in the standard layout
 convert_bbbin(Path("BB.bin"), Path("bb.nc"))  # the same, written to a netCDF file
@@ -253,10 +258,11 @@ convert_bbbin(Path("BB.bin"), Path("bb.nc"))  # the same, written to a netCDF fi
 
 A path can be given as a string or as a `pathlib.Path` object.
 
-- `compress_file(src, dst, bits=32, level=5, block_stations=None, check=True, overwrite=False)` returns a `CompressResult`: `bytes_in` and `bytes_out`, `n_traces`, `n_exact` (the real stations), `bits`, `checked`, `max_relative_error` (None without the check), and the wall and CPU time spent reading, encoding, writing and checking, from `read_s` to `check_cpu_s`. It first calls `check_compressible(src, dst, overwrite)`, which makes the refusals that need no samples, and which can be called on its own.
+- `compress_file(src, dst, bits=32, level=5, block_stations=None, check=True, overwrite=False)` returns a `CompressResult`: `bytes_in` and `bytes_out`, `n_traces`, `n_exact` (the real stations), `bits`, `max_relative_error` (None without the check), `output_hash` (the output's content hash), the wall time spent reading, encoding, writing, checking and hashing, from `read_s` to `hash_s`, and the CPU time of the first four, from `read_cpu_s` to `check_cpu_s`. It first makes the refusals of `check_compressible(src, dst, overwrite)`, those that need no samples, and checks that DST's folder exists; `check_compressible` can be called on its own.
 - `verify_file(original, compressed, block_stations=None)` returns a `VerifyResult`: `passed`, `max_relative_error`, `n_exact` and `verify_s`. A file that doesn't agree gives `passed=False`; it doesn't raise.
-- `decompress_file(path)` returns the original dataset, loaded into memory.
+- `decompress_file(path)` returns the original dataset, loaded into memory, and `decompress_to(src, dst, overwrite=False)` writes it to a netCDF file, through a `.partial`.
 - `read_bbbin(path)` reads a BB.bin file into a dataset in the standard layout, and `convert_bbbin(src, dst, overwrite=False)` writes that dataset to a netCDF file, through a `.partial`.
+- Every function that writes a file raises `FileNotFoundError`, naming the file, if there is no folder to write it in, before it reads its input.
 - `is_compressed(path)` says whether a file holds a compressed waveform.
 
 `block_stations` is the most stations in a block. By default it follows the memory budget and the file's chunks, as in [Blocks and memory](#blocks-and-memory).
@@ -279,6 +285,8 @@ A refusal raises `Refused`, or one of its subclasses, from `waveform_compression
 | `NotBBBin` | a file can't be a BB.bin file |
 
 `CheckFailed`, a `RuntimeError`, means that the output of `compress_file` failed its check. The output is deleted, so nothing is left at the destination, and a file already there stays as it was.
+
+A refusal and a failed check name the file they are about as their `filename`, as an `OSError` does, where it is known.
 
 Anything else is a failure of the run: `OSError` for a file that can't be read or written, `ValueError` for a bad argument (such as `bits` outside 8 to 32) or a damaged compressed file, and pyflac's exceptions when libFLAC can't encode a trace or decode a stream.
 
@@ -305,9 +313,9 @@ The waveform is float32 with the dimensions (component, station, time), its comp
 | `format_version` | `1`. A reader should refuse any other. |
 | `dims` | `["component", "station", "time"]` |
 | `dtype` | `"float32"` |
-| `waveform_attrs` | the original waveform's attributes, as a JSON string. A float that isn't finite, on its own or in a list, is the string `"NaN"`, `"Infinity"` or `"-Infinity"`, and its type in `waveform_attr_types` makes a number of it again. Files written before 1.0.0 may hold the bare tokens `NaN`, `Infinity` and `-Infinity` instead, which Python's `json` reads and stricter parsers refuse. |
-| `waveform_encoding` | a JSON string of the waveform's `_FillValue` and `missing_value`, as the original had them; a value that isn't finite is the string `"NaN"`, `"Infinity"` or `"-Infinity"`. An original with no `_FillValue` has `{"_FillValue": null}`: write the waveform without one. Files written before 1.0.0 don't have it, and decompress with a NaN `_FillValue`. |
-| `waveform_attr_types` | a JSON string mapping each numpy-typed attribute of `waveform_attrs` to its dtype, such as `"float32"` or `"int32"`. Files written before 1.0.0 don't have it, and their attributes come back in JSON's own types: float64 and int64. |
+| `waveform_attrs` | the original waveform's attributes, as a JSON string. A float that isn't finite, on its own or in a list, is the string `"NaN"`, `"Infinity"` or `"-Infinity"`, and its type in `waveform_attr_types` makes a number of it again. |
+| `waveform_encoding` | a JSON string of the waveform's `_FillValue` and `missing_value`, as the original had them; a value that isn't finite is the string `"NaN"`, `"Infinity"` or `"-Infinity"`. An original with no `_FillValue` has `{"_FillValue": null}`: write the waveform without one. |
+| `waveform_attr_types` | a JSON string mapping each numpy-typed attribute of `waveform_attrs` to its dtype, such as `"float32"` or `"int32"`. |
 | `bits` | the setting, an integer from 8 to 32 (see [Choosing a setting](#choosing-a-setting)) |
 | `encoder` | `"waveform_compression_tools"` and the version that wrote the file, such as `"waveform_compression_tools 1.0.0"`. Decoding doesn't use it. |
 | `exact_rule` | which stations are real, in words (see [Real stations stay exact](#real-stations-stay-exact)) |

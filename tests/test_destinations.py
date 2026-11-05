@@ -18,7 +18,13 @@ from hypothesis import strategies as st
 from waveform_compression_tools import destinations
 from waveform_compression_tools.destinations import HDF5Output, write_netcdf
 
-from helpers import StandardDataset, limits_file_sizes, run_python, write
+from helpers import (
+    StandardDataset,
+    limit_file_sizes,
+    limits_file_sizes,
+    run_python,
+    write,
+)
 
 if TYPE_CHECKING:
     from _typeshed import ReadableBuffer, WriteableBuffer
@@ -198,9 +204,9 @@ def test_a_failed_write_leaves_nothing_held_in_memory(tmp_path: Path) -> None:
     # memory back: neither the error nor the file it kept may keep the dataset, or what
     # was written after the failure, once the program lets go of them. A limit on the
     # size of each file fails the write as a full disk does.
-    code = textwrap.dedent(
+    code = limit_file_sizes(100_000) + textwrap.dedent(
         """
-        import gc, resource, weakref
+        import gc, weakref
         import numpy as np, xarray as xr
         from waveform_compression_tools.destinations import write_netcdf
 
@@ -208,8 +214,6 @@ def test_a_failed_write_leaves_nothing_held_in_memory(tmp_path: Path) -> None:
         ds = xr.Dataset({"waveform": (("component", "station", "time"), wave)})
         watched = weakref.ref(wave)
         del wave
-        hard = resource.getrlimit(resource.RLIMIT_FSIZE)[1]
-        resource.setrlimit(resource.RLIMIT_FSIZE, (100_000, hard))
         try:
             write_netcdf(ds, "out.nc")
         except OSError as error:
@@ -232,16 +236,14 @@ def test_a_failed_write_of_a_big_variable_holds_no_copy_of_it(tmp_path: Path) ->
     # isn't copied: a run that fails on a full disk mustn't need twice the memory that
     # it would to succeed. A limit on the size of each file fails the write as a full
     # disk does; tracemalloc follows numpy's memory and Python's.
-    code = textwrap.dedent(
+    code = limit_file_sizes(1_000_000) + textwrap.dedent(
         """
-        import resource, tracemalloc
+        import tracemalloc
         import numpy as np, xarray as xr
         from waveform_compression_tools.destinations import write_netcdf
 
         wave = np.ones((3, 1000, 5600), np.float32)  # 64 MiB, written in one go.
         ds = xr.Dataset({"waveform": (("component", "station", "time"), wave)})
-        hard = resource.getrlimit(resource.RLIMIT_FSIZE)[1]
-        resource.setrlimit(resource.RLIMIT_FSIZE, (1_000_000, hard))
         tracemalloc.start()
         try:
             write_netcdf(ds, "out.nc")

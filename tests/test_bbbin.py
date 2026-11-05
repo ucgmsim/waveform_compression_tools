@@ -12,7 +12,6 @@ from waveform_compression_tools.codec import (
     check_standard,
     max_relative_error,
 )
-from waveform_compression_tools.destinations import HDF5Output
 from waveform_compression_tools.errors import NotBBBin
 from waveform_compression_tools.files import (
     compress_file,
@@ -20,10 +19,7 @@ from waveform_compression_tools.files import (
     verify_file,
 )
 
-from helpers import partial_of
-
-# make_bbbin, the fixture that writes a BB.bin file, is in conftest.py.
-MakeBbbin = Callable[..., np.ndarray]
+from helpers import MakeBbbin
 
 
 # Shapes with one station, one sample, or both, where a dimension could be lost.
@@ -187,8 +183,8 @@ def test_convert_bbbin_writes_a_netcdf_file(
     # read back from it in that order isn't the standard layout's float32.
     make_bbbin(tmp_path / "BB.bin", nstat=3, nt=7, endian=endian)
     ds = read_bbbin(tmp_path / "BB.bin")
-    nc = convert_bbbin(tmp_path / "BB.bin", tmp_path / "BB.nc")
-    assert nc == tmp_path / "BB.nc"
+    nc = tmp_path / "BB.nc"
+    convert_bbbin(tmp_path / "BB.bin", nc)
     # The BB.bin and the converted file, and no partial file.
     assert sorted(p.name for p in tmp_path.iterdir()) == ["BB.bin", "BB.nc"]
     assert h5py.is_hdf5(nc)
@@ -206,7 +202,8 @@ def test_converted_file_compresses(tmp_path: Path, make_bbbin: MakeBbbin) -> Non
     # another length, is a real station, whose waveform is kept exactly.
     names = ["S000000", "S000001", "KIKS", "S000003", "S000004"]
     data = make_bbbin(tmp_path / "BB.bin", nstat=5, nt=400, endian="<", names=names)
-    nc = convert_bbbin(tmp_path / "BB.bin", tmp_path / "BB.nc")
+    nc = tmp_path / "BB.nc"
+    convert_bbbin(tmp_path / "BB.bin", nc)
     result = compress_file(nc, tmp_path / "BB.flac.nc")
     assert (result.n_traces, result.n_exact) == (15, 1)
     assert verify_file(nc, tmp_path / "BB.flac.nc").passed
@@ -216,33 +213,3 @@ def test_converted_file_compresses(tmp_path: Path, make_bbbin: MakeBbbin) -> Non
     got = decompress_file(tmp_path / "BB.flac.nc")["waveform"].values
     assert max_relative_error(expected, got).max() <= 4.7e-10
     np.testing.assert_array_equal(got[:, 2], expected[:, 2])
-
-
-@pytest.mark.parametrize(
-    "error",
-    [
-        pytest.param(RuntimeError, id="an error"),
-        pytest.param(KeyboardInterrupt, id="an interruption"),
-    ],
-)
-def test_failure_mid_write_leaves_nothing(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    error: type[BaseException],
-    make_bbbin: MakeBbbin,
-) -> None:
-    src, dst = tmp_path / "BB.bin", tmp_path / "BB.nc"
-    make_bbbin(src, nstat=3, nt=7, endian="<")
-    dst.write_bytes(b"an earlier conversion")
-
-    def write_some_then_fail(ds: xr.Dataset, out: HDF5Output, **kwargs: object) -> None:
-        assert Path(out.name) == partial_of(dst)
-        out.write(b"half a file")
-        raise error("writing failed")
-
-    monkeypatch.setattr(xr.Dataset, "to_netcdf", write_some_then_fail)
-    with pytest.raises(error, match="writing failed"):
-        convert_bbbin(src, dst, overwrite=True)
-    # The partial file is gone, the file that was at dst is as it was, and so is src.
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["BB.bin", "BB.nc"]
-    assert dst.read_bytes() == b"an earlier conversion"

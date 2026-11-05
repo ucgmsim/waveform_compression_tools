@@ -104,6 +104,23 @@ def writing(dst: str | os.PathLike[str]) -> Generator[Path]:
         raise
 
 
+def named_file(error: Exception) -> str | None:
+    """Return the file an error names, as an `OSError` or a refusal does, if it names one.
+
+    Parameters
+    ----------
+    error : Exception
+        The error.
+
+    Returns
+    -------
+    str or None
+        Its ``filename``, as text, or None if it has none, or one that isn't a path.
+    """
+    named = getattr(error, "filename", None)
+    return os.fsdecode(named) if isinstance(named, str | bytes | os.PathLike) else None
+
+
 @contextmanager
 def naming(path: str | os.PathLike[str]) -> Generator[None]:
     """Have an `OSError` that names no file, or `path`'s partial file, name `path`.
@@ -136,11 +153,7 @@ def naming(path: str | os.PathLike[str]) -> Generator[None]:
     try:
         yield
     except OSError as error:
-        named = error.filename
-        elsewhere = named is not None and not (
-            isinstance(named, str | bytes | os.PathLike)
-            and os.fsdecode(named) == partial
-        )
+        elsewhere = error.filename is not None and named_file(error) != partial
         if elsewhere or error.errno is None or error.strerror is None:
             raise
         raise OSError(error.errno, error.strerror, os.fspath(path)) from error
@@ -465,47 +478,89 @@ class HDF5Output(io.RawIOBase):
             self.raise_pending()
 
 
-def refuse_overwriting(
-    src: str | os.PathLike[str], dst: str | os.PathLike[str], overwrite: bool = False
-) -> None:
-    """Refuse to write `dst` where that would destroy `src`, or replace a file unasked.
+class _NoFolderError(FileNotFoundError):
+    """No folder to write a file in: it names the file, and its words are the reason."""
 
-    A file is written to `dst` with ``.partial`` added, once whatever is at that name
-    is removed, and then renamed to `dst`. Either would destroy `src` if it is `dst`,
-    or `dst` with ``.partial`` added. The checks are made in that order.
+    def __str__(self) -> str:
+        """Give the reason alone, without the error number or the file's name.
+
+        Returns
+        -------
+        str
+            The reason.
+        """
+        return str(self.strerror)
+
+
+def require_folder(dst: str | os.PathLike[str]) -> None:
+    """Fail unless the folder that a file is to be written in exists.
 
     Parameters
     ----------
-    src : str or os.PathLike
-        The file that is read.
+    dst : str or os.PathLike
+        The file.
+
+    Raises
+    ------
+    FileNotFoundError
+        If there is no folder at ``dst``'s parent. Its ``filename`` is `dst`, and its
+        message says which folder is missing.
+    """
+    dst = Path(dst)
+    if not dst.parent.is_dir():
+        raise _NoFolderError(
+            errno.ENOENT,
+            f"there is no folder {dst.parent} to write {dst.name} in",
+            os.fspath(dst),
+        )
+
+
+def refuse_overwriting(
+    dst: str | os.PathLike[str],
+    *sources: str | os.PathLike[str],
+    overwrite: bool = False,
+) -> None:
+    """Refuse to write `dst` where that would destroy a source, or replace a file unasked.
+
+    A file is written to `dst` with ``.partial`` added, once whatever is at that name
+    is removed, and then renamed to `dst`. Either would destroy a source that is `dst`,
+    or `dst` with ``.partial`` added. The checks are made in that order, for each
+    source in turn, and then that of a file already at `dst`.
+
+    Parameters
+    ----------
     dst : str or os.PathLike
         The file that is written.
+    *sources : str or os.PathLike
+        The files that are read.
     overwrite : bool, default False
         Whether a file already at `dst` may be replaced.
 
     Raises
     ------
     SameFile
-        If `dst`, or `dst` with ``.partial`` added, is `src`, by its name, through a
+        If `dst`, or `dst` with ``.partial`` added, is a source, by its name, through a
         link, or as a hard link to it, whatever `overwrite` says.
     OutputExists
         If something is at `dst` already, a broken link included, and `overwrite` is
         false.
     """
-    src, dst = Path(src), Path(dst)
+    dst = Path(dst)
     partial = _partial_name(dst)
-    same = src.resolve() in (dst.resolve(), partial.resolve())
-    if not same and src.exists():
-        # A hard link is another name for src, which only the files themselves show.
-        same = any(
-            path.exists() and os.path.samefile(src, path) for path in (dst, partial)
-        )
-    if same:
-        raise SameFile(f"writing {dst} would overwrite {src}")
+    for src in map(Path, sources):
+        same = src.resolve() in (dst.resolve(), partial.resolve())
+        if not same and src.exists():
+            # A hard link is another name for src, which only the files themselves show.
+            same = any(
+                path.exists() and os.path.samefile(src, path) for path in (dst, partial)
+            )
+        if same:
+            raise SameFile(f"writing {dst} would overwrite {src}", dst)
     if not overwrite and os.path.lexists(dst):
         raise OutputExists(
             f"{dst} exists already, and is replaced only if asked (--overwrite, or "
-            "overwrite=True)"
+            "overwrite=True)",
+            dst,
         )
 
 

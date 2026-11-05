@@ -1,11 +1,12 @@
 import struct
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 
 import h5py
 import numpy as np
 import pytest
-import xarray as xr
+
+from helpers import MakeBbbin, RealTraces, StandardDataset, build_standard_dataset
 
 # What make_bbbin writes in the header. Every number but dt is exact in float32.
 DURATION, DT, START_SEC = 123.5, 0.005, -1.0
@@ -15,7 +16,7 @@ HF_FILE = "/runs/fault1/rel01/HF/Acc/HF.bin"
 
 
 @pytest.fixture
-def standard_dataset() -> Callable[..., xr.Dataset]:
+def standard_dataset() -> StandardDataset:
     """Return a function that builds a dataset in the standard layout.
 
     ``standard_dataset(n_station, nt)`` holds a float32 ``waveform`` of random walks,
@@ -29,34 +30,11 @@ def standard_dataset() -> Callable[..., xr.Dataset]:
     like a real station's.
     """
 
-    def build(n_station: int, nt: int, real: Sequence[int] = ()) -> xr.Dataset:
-        rng = np.random.default_rng(0)
-        walks = np.cumsum(rng.normal(size=(3, n_station, nt)), axis=2)
-        return xr.Dataset(
-            {
-                "waveform": (
-                    ("component", "station", "time"),
-                    walks.astype(np.float32),
-                    {"units": "g"},
-                ),
-                "vs30": ("station", rng.uniform(150.0, 1500.0, n_station)),
-            },
-            coords={
-                "component": ["000", "090", "ver"],
-                "station": [
-                    f"R{i:03d}" if i in real else f"S{i:06d}" for i in range(n_station)
-                ],
-                "latitude": ("station", rng.uniform(-47.0, -34.0, n_station)),
-                "longitude": ("station", rng.uniform(166.0, 179.0, n_station)),
-            },
-            attrs={"dt": 0.005, "start_sec": -3.0},
-        )
-
-    return build
+    return build_standard_dataset
 
 
 @pytest.fixture
-def make_bbbin() -> Callable[..., np.ndarray]:
+def make_bbbin() -> MakeBbbin:
     """Return a function that writes a legacy BB.bin file.
 
     ``make_bbbin(path, nstat, nt, endian, names=None)`` writes a BB.bin file in the
@@ -118,7 +96,7 @@ REAL_TRACES = Path(__file__).parent / "real_traces"
 
 
 @pytest.fixture
-def real_traces() -> Callable[[str], np.ndarray]:
+def real_traces() -> RealTraces:
     """Return a function that loads one set of real traces from ``tests/real_traces``.
 
     Each file there holds one float32 dataset, ``waveform``, of shape (3, 10, nt): 10

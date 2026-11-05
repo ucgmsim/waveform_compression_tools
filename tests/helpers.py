@@ -3,15 +3,22 @@
 import os
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 
+import h5py
 import numpy as np
 import pytest
 import xarray as xr
 
-# The type of conftest.py's standard_dataset fixture.
+from waveform_compression_tools.codec import EncodedBlock
+from waveform_compression_tools.files import compress_file
+
+# The types of conftest.py's fixtures standard_dataset, make_bbbin and real_traces.
 StandardDataset = Callable[..., xr.Dataset]
+MakeBbbin = Callable[..., np.ndarray]
+RealTraces = Callable[[str], np.ndarray]
 
 # For a test that fails writes with a limit on the size of a file (see
 # limit_file_sizes), which Windows doesn't have.
@@ -58,6 +65,33 @@ def run_python(
     )
 
 
+def build_standard_dataset(
+    n_station: int, nt: int, real: Sequence[int] = ()
+) -> xr.Dataset:
+    # conftest.py's standard_dataset fixture gives this, and says what it builds.
+    rng = np.random.default_rng(0)
+    walks = np.cumsum(rng.normal(size=(3, n_station, nt)), axis=2)
+    return xr.Dataset(
+        {
+            "waveform": (
+                ("component", "station", "time"),
+                walks.astype(np.float32),
+                {"units": "g"},
+            ),
+            "vs30": ("station", rng.uniform(150.0, 1500.0, n_station)),
+        },
+        coords={
+            "component": ["000", "090", "ver"],
+            "station": [
+                f"R{i:03d}" if i in real else f"S{i:06d}" for i in range(n_station)
+            ],
+            "latitude": ("station", rng.uniform(-47.0, -34.0, n_station)),
+            "longitude": ("station", rng.uniform(166.0, 179.0, n_station)),
+        },
+        attrs={"dt": 0.005, "start_sec": -3.0},
+    )
+
+
 def write(ds: xr.Dataset, path: Path) -> Path:
     ds.to_netcdf(path, engine="h5netcdf")
     return path
@@ -65,6 +99,126 @@ def write(ds: xr.Dataset, path: Path) -> Path:
 
 def partial_of(path: Path) -> Path:
     return Path(f"{path}.partial")
+
+
+def nothing_left(dst: Path) -> bool:
+    # Neither the output nor its partial file is there.
+    return not dst.exists() and not partial_of(dst).exists()
+
+
+def contents(folder: Path) -> dict[str, bytes | Path]:
+    # Each file in a folder, by name: a file's bytes, and where a link points.
+    return {
+        path.name: path.readlink() if path.is_symlink() else path.read_bytes()
+        for path in folder.iterdir()
+    }
+
+
+def write_and_compress(
+    ds: xr.Dataset, folder: Path, **options: Any
+) -> tuple[Path, Path]:
+    # Writes a dataset to in.nc and compresses it to out.nc, returning both.
+    src, dst = write(ds, folder / "in.nc"), folder / "out.nc"
+    compress_file(src, dst, **options)
+    return src, dst
+
+
+def with_a_flipped_byte(encoded: EncodedBlock, c: int = 1, s: int = 2) -> EncodedBlock:
+    # A block's streams, with the middle byte of component c of station s flipped.
+    streams = list(encoded.streams)
+    k = c * encoded.gains.shape[1] + s  # In encode_block's (component, station) order.
+    stream = bytearray(streams[k])
+    stream[len(stream) // 2] ^= 0xFF
+    streams[k] = bytes(stream)
+    return EncodedBlock(streams, encoded.nbytes, encoded.gains)
+
+
+# The non-finite values of refused_input's cases.
+NON_FINITE = {"a NaN": np.nan, "an infinity": np.inf, "a negative infinity": -np.inf}
+
+
+def refused_input(
+    case: str, folder: Path, standard_dataset: StandardDataset
+) -> tuple[Path, Path, bool]:
+    # Writes the input for one of compress's refusals, named by `case`, and an earlier
+    # file at the destination unless that is the input. Returns the input, the
+    # destination, and whether to ask for overwriting. Every case asks, so that the
+    # earlier file is seen to stay, but three: the two that don't ask, so something at
+    # the destination is refused, and "the same path", which is the same file though a
+    # file is there.
+    src, dst = folder / "in.nc", folder / "out.nc"
+    ds = standard_dataset(3, nt=100)
+    if case == "its own partial":
+        src = partial_of(dst)
+    elif case == "every station real":
+        ds = standard_dataset(3, nt=100, real=(0, 1, 2))
+    elif case == "no stations":
+        ds = standard_dataset(0, nt=100)
+    elif case == "a float64 waveform":
+        ds["waveform"] = ds["waveform"].astype(np.float64)
+    elif case == "dimensions in another order":
+        ds["waveform"] = ds["waveform"].transpose("station", "component", "time")
+    elif case == "no waveform":
+        ds = ds.rename_vars(waveform="other")
+    elif case == "no station coordinate":
+        ds = ds.drop_vars("station")
+    elif case == "station names along another dimension":
+        # Names that would make station 1 real, but they aren't the stations' names.
+        names = ("site", ["6c5SYSL", "OPZ", "22008d3"])
+        ds = ds.drop_vars("station").assign_coords(station=names)
+    elif case == "station names of bytes that aren't ASCII":
+        names = np.array(["Ōtaki".encode(), b"S000001", b"S000002"])
+        ds = ds.assign_coords(station=names)
+    elif case in NON_FINITE:
+        # Station 2 is in the second of two blocks, after the first is in the partial
+        # file.
+        ds["waveform"][2, 2, 50] = NON_FINITE[case]
+    elif case == "a fill value inside the data":
+        ds["waveform"].encoding["_FillValue"] = np.float32(0.0)
+    elif case == "a missing_value inside the data":
+        # Without a _FillValue, so that only the missing_value is inside the data.
+        ds["waveform"].encoding.update(_FillValue=None, missing_value=np.float32(0.0))
+    write(ds, src)
+    if case == "an HDF5 group":
+        with h5py.File(src, "a") as f:
+            f.create_group("provenance").create_dataset("notes", data=np.arange(3))
+    elif case == "conflicting fill values":
+        # Beside xarray's NaN _FillValue, as another writer might give it. xarray
+        # couldn't write a decompressed file with both.
+        with h5py.File(src, "r+") as f:
+            f["waveform"].attrs["missing_value"] = np.float32(-1e6)
+    elif case == "a vector missing_value":
+        with h5py.File(src, "r+") as f:
+            f["waveform"].attrs["missing_value"] = np.array([-1e6, -2e6], np.float32)
+    elif case == "an attribute JSON can't hold":
+        with h5py.File(src, "r+") as f:
+            f["waveform"].attrs["gain"] = np.complex128(1 + 2j)
+    elif case == "an attribute whose type can't be kept":
+        with h5py.File(src, "r+") as f:
+            pair = np.zeros((), np.dtype([("a", "<i4"), ("b", "<f4")]))
+            f["waveform"].attrs.create("pair", pair)
+    elif case == "already compressed":
+        src = folder / "in.flac.nc"
+        compress_file(folder / "in.nc", src)
+    elif case == "a text file":
+        src = folder / "notes.nc"
+        src.write_text("station,pga\nS000000,0.12\n")
+    if case == "the same path":
+        return src, src, False
+    if case == "a link to it":
+        dst.symlink_to(src)
+    elif case == "a hard link to it":
+        # Another name for the input, which no comparison of names can see.
+        dst.hardlink_to(src)
+    elif case == "a hard link to it at its partial":
+        dst.write_bytes(b"an earlier file")
+        partial_of(dst).hardlink_to(src)
+    elif case == "a broken link at the output":
+        # Nothing to read there, but replacing the link would be overwriting.
+        dst.symlink_to(folder / "missing.nc")
+    else:
+        dst.write_bytes(b"an earlier file")
+    return src, dst, case not in ("the output exists", "a broken link at the output")
 
 
 def within_one_step_of_the_setting(

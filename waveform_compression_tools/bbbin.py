@@ -26,7 +26,7 @@ import numpy as np
 import xarray as xr
 
 from .codec import STANDARD_COMPONENTS, STANDARD_DIMS
-from .destinations import refuse_overwriting, write_netcdf
+from .destinations import refuse_overwriting, require_folder, write_netcdf
 from .errors import NotBBBin
 
 # The size of a file's header, and of each station's record that follows it.
@@ -157,7 +157,7 @@ def read_bbbin(path: str | os.PathLike[str]) -> xr.Dataset:
         head = f.read(_HEAD_BYTES)
         layout = _layout(head, size)
         if layout is None:
-            raise NotBBBin(f"not a BB.bin file: {path} ({size} bytes)")
+            raise NotBBBin(f"not a BB.bin file: {path} ({size} bytes)", path)
         endian, nstat, nt = layout
         records = f.read(nstat * _STATION_BYTES)
         samples = f.read(nstat * nt * _SAMPLE_BYTES)
@@ -170,7 +170,9 @@ def read_bbbin(path: str | os.PathLike[str]) -> xr.Dataset:
             np.frombuffer(head, "S256", count=3, offset=20).astype(str).tolist()
         )
     except UnicodeDecodeError as e:
-        raise NotBBBin(f"not a BB.bin file: {path} holds text that isn't ASCII") from e
+        raise NotBBBin(
+            f"not a BB.bin file: {path} holds text that isn't ASCII", path
+        ) from e
     raw = np.frombuffer(samples, f"{endian}f4", count=nstat * nt * _N_COMPONENT)
     raw = raw.reshape(nstat, nt, _N_COMPONENT)
     waveform = np.empty((_N_COMPONENT, nstat, nt), dtype=np.float32)
@@ -208,15 +210,15 @@ def read_bbbin(path: str | os.PathLike[str]) -> xr.Dataset:
 
 def convert_bbbin(
     src: str | os.PathLike[str], dst: str | os.PathLike[str], overwrite: bool = False
-) -> Path:
+) -> None:
     """Convert a BB.bin file to a netCDF file in the standard layout.
 
     The destination is checked first (see
-    `waveform_compression_tools.destinations.refuse_overwriting`). The dataset that
-    `read_bbbin` gives is then written by xarray with the h5netcdf engine to `dst` with
-    ``.partial`` added, and renamed to `dst` when it is complete. If anything goes
-    wrong, the partial file is deleted and the exception raised again; a file already
-    at `dst` is then as it was. As in `read_bbbin`, the whole file is read into memory.
+    `waveform_compression_tools.destinations.refuse_overwriting`), and its folder. The
+    dataset that `read_bbbin` gives is then written by xarray with the h5netcdf engine
+    to `dst` with ``.partial`` added, and renamed to `dst` when it is complete. If
+    anything goes wrong, the partial file is deleted and the exception raised again; a
+    file already at `dst` is then as it was. As in `read_bbbin`, the whole file is read into memory.
 
     Parameters
     ----------
@@ -227,11 +229,6 @@ def convert_bbbin(
     overwrite : bool, default False
         Whether to replace a file already at `dst`. `src` itself is never replaced.
 
-    Returns
-    -------
-    Path
-        `dst`, as a Path.
-
     Raises
     ------
     SameFile
@@ -239,10 +236,11 @@ def convert_bbbin(
         says. Nothing is written.
     OutputExists
         If a file is at `dst` already and `overwrite` is false. Nothing is written.
+    FileNotFoundError
+        If there is no folder to write `dst` in, before `src` is read.
     NotBBBin
         If `src` is not a BB.bin file (see `read_bbbin`). Nothing is written.
     """
-    src, dst = Path(src), Path(dst)
-    refuse_overwriting(src, dst, overwrite)
+    refuse_overwriting(dst, src, overwrite=overwrite)
+    require_folder(dst)
     write_netcdf(read_bbbin(src), dst)
-    return dst

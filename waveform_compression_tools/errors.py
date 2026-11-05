@@ -5,11 +5,36 @@ is: it can't be compressed, decompressed, verified or converted. Nothing is writ
 file appears at the destination, and a file already there stays as it was. A failed
 check, `CheckFailed`, says that the compressed output didn't come back as it should. It
 is deleted, so nothing appears at the destination either.
+
+Each names the file it is about as its `filename`, where that is known, as an `OSError`
+does; its message is the same either way.
 """
+
+import os
 
 
 class Refused(ValueError):  # noqa: N818
-    """An input can't be used as it is. Nothing is written."""
+    """An input can't be used as it is. Nothing is written.
+
+    Parameters
+    ----------
+    message : str
+        What is wrong.
+    filename : str or os.PathLike, optional
+        The file the refusal is about.
+
+    Attributes
+    ----------
+    filename : str or os.PathLike or None
+        The file the refusal is about, or None if that isn't known.
+    """
+
+    def __init__(  # numpydoc ignore=PR01
+        self, message: str, filename: str | os.PathLike[str] | None = None
+    ) -> None:
+        """Keep the message, and the file it is about."""
+        super().__init__(message)
+        self.filename = filename
 
 
 class NotStandardLayout(Refused):
@@ -59,4 +84,23 @@ class CheckFailed(RuntimeError):  # noqa: N818
     """The compressed output didn't pass the check. Nothing is left at the destination.
 
     An error while decoding during the check counts as a failed check.
+
+    Parameters
+    ----------
+    message : str
+        What is wrong.
+    filename : str or os.PathLike, optional
+        Where the compressed file was going.
+
+    Attributes
+    ----------
+    filename : str or os.PathLike or None
+        Where the compressed file was going, or None if that isn't known.
     """
+
+    def __init__(  # numpydoc ignore=PR01
+        self, message: str, filename: str | os.PathLike[str] | None = None
+    ) -> None:
+        """Keep the message, and the file it is about."""
+        super().__init__(message)
+        self.filename = filename

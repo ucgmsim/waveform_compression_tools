@@ -26,16 +26,8 @@ def content_hash(path: str | os.PathLike[str]) -> str:
         The hash, as 64 lower-case hexadecimal digits.
     """
     outer = hashlib.sha256()
+    # A buffered read returns a whole block, or what is left at the end of the file.
     with Path(path).open("rb") as f:
-        while True:
-            block = f.read(BLOCK_BYTES)
-            # A short read does not mean the end: fill the block.
-            while block and len(block) < BLOCK_BYTES:
-                more = f.read(BLOCK_BYTES - len(block))
-                if not more:
-                    break
-                block += more
-            if not block:
-                break
+        while block := f.read(BLOCK_BYTES):
             outer.update(hashlib.sha256(block).digest())
     return outer.hexdigest()

@@ -24,9 +24,8 @@ with ``--overwrite``.
 """
 
 import logging
-import os
 import time
-from collections.abc import Generator, Mapping
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, NoReturn
@@ -36,14 +35,7 @@ import typer
 
 from . import bbbin, destinations, files
 from .content_hash import content_hash
-from .errors import (
-    CheckFailed,
-    NotBBBin,
-    NotStandardLayout,
-    OutputExists,
-    Refused,
-    SameFile,
-)
+from .errors import CheckFailed, Refused, SameFile
 from .record import make_record, write_record
 
 EXIT_OK = 0
@@ -53,8 +45,6 @@ EXIT_REFUSED = 3
 
 # How every error line starts.
 _PROGRAM = "waveform-compression-tools"
-# The errors that are about a command's output, whichever of its steps raises them.
-_ABOUT_THE_OUTPUT = (SameFile, OutputExists, CheckFailed)
 # What the functions behind the commands document raising when an input can't be used
 # or a run goes wrong. Anything else is unexpected, and its line gives its type.
 _EXPECTED = (OSError, ValueError, CheckFailed)
@@ -176,21 +166,16 @@ class _Stop(Exception):  # noqa: N818
 
 
 @contextmanager
-def _about(
-    path: Path,
-    others: Mapping[type[Exception] | tuple[type[Exception], ...], Path] | None = None,
-) -> Generator[None]:
+def _about(path: Path) -> Generator[None]:
     """Turn any error in a block into a `_Stop` that names the file it is about.
 
-    An `OSError` that says which file it is about names that file instead.
+    An error that says which file it is about, as an `OSError`, a refusal or a failed
+    check does, names that file instead.
 
     Parameters
     ----------
     path : Path
-        The file an error in the block is about.
-    others : Mapping, optional
-        Errors that are about another file instead: each kind of error, or a tuple of
-        kinds, and the file.
+        The file an error in the block is about, unless it says otherwise.
 
     Yields
     ------
@@ -207,59 +192,8 @@ def _about(
         yield
     # Every error becomes one line, never a traceback.
     except Exception as error:
-        for kinds, other in (others or {}).items():
-            if isinstance(error, kinds):
-                path = other
-                break
-        if isinstance(error, OSError) and isinstance(
-            error.filename, str | bytes | os.PathLike
-        ):
-            path = Path(os.fsdecode(error.filename))
-        raise _Stop(path, error) from error
-
-
-def _require_folder(path: Path) -> None:
-    """Fail unless the folder that a file is to be written in exists.
-
-    Parameters
-    ----------
-    path : Path
-        The file.
-
-    Raises
-    ------
-    FileNotFoundError
-        If there is no folder at ``path.parent``.
-    """
-    if not path.parent.is_dir():
-        raise FileNotFoundError(
-            f"there is no folder {path.parent} to write {path.name} in"
-        )
-
-
-def _refuse_a_record_over(record: Path, src: Path, dst: Path) -> None:
-    """Refuse a record that would be written over the input or the output.
-
-    Parameters
-    ----------
-    record : Path
-        Where the record is to go.
-    src : Path
-        The input.
-    dst : Path
-        The output.
-
-    Raises
-    ------
-    typer.BadParameter
-        A usage error, if `record`, or `record` with ``.partial`` added, is `src` or
-        `dst` (see `waveform_compression_tools.destinations.refuse_overwriting`).
-    """
-    for path in (src, dst):
-        try:
-            destinations.refuse_overwriting(path, record, overwrite=True)
-        except SameFile as error:
-            raise typer.BadParameter(str(error), param_hint="'--record'") from error
+        named = destinations.named_file(error)
+        raise _Stop(path if named is None else Path(named), error) from error
 
 
 def _hash(path: Path, seconds: dict[str, float]) -> str:
@@ -284,38 +218,13 @@ def _hash(path: Path, seconds: dict[str, float]) -> str:
         seconds["hash"] += time.perf_counter() - start
 
 
-def _hash_output(dst: Path, seconds: dict[str, float]) -> str:
-    """Hash the compressed file, or delete it if hashing fails or is interrupted.
-
-    A run whose output isn't hashed doesn't succeed, and a run that doesn't succeed
-    leaves nothing at its destination.
-
-    Parameters
-    ----------
-    dst : Path
-        The compressed file.
-    seconds : dict[str, float]
-        The run's timings: the time is added to ``"hash"``.
-
-    Returns
-    -------
-    str
-        The file's content hash.
-    """
-    try:
-        return _hash(dst, seconds)
-    except BaseException:
-        dst.unlink(missing_ok=True)
-        raise
-
-
 def _write_compress_record(
     path: Path,
     *,
     src: Path,
     bits: int,
     start: float,
-    seconds: dict[str, float],
+    hash_s: float,
     input_hash: str | None,
     result: files.CompressResult | None,
     output: tuple[Path, int, str] | None,
@@ -333,9 +242,8 @@ def _write_compress_record(
         The setting asked for.
     start : float
         When the command started, by `time.perf_counter`.
-    seconds : dict[str, float]
-        The run's timings so far: the time spent hashing, as ``"hash"``, and 0.0 for
-        ``"compress"`` and ``"check"``, which come from `result`.
+    hash_s : float
+        The time spent hashing the input, in seconds.
     input_hash : str or None
         The input's content hash, if the run got as far as hashing it.
     result : CompressResult or None
@@ -351,27 +259,17 @@ def _write_compress_record(
         With `EXIT_FAILED`, after the error line, if the record can't be written. A
         compressed file stays where it is.
     """
-    seconds = {**seconds, "total": time.perf_counter() - start}
-    if result is not None:
-        seconds["compress"] = result.read_s + result.encode_s + result.write_s
-        seconds["check"] = result.check_s
-    output_path, output_bytes, output_hash = output or (None, None, None)
+    total_s = time.perf_counter() - start
     try:
         record = make_record(
-            status="ok" if stop is None else stop.status,
-            reason="" if stop is None else stop.reason,
             input_path=src,
-            input_bytes=src.stat().st_size,
             input_hash=input_hash,
-            output_path=output_path,
-            output_bytes=output_bytes,
-            output_hash=output_hash,
             bits=bits,
-            checked=result is not None and result.checked,
-            max_relative_error=None if result is None else result.max_relative_error,
-            n_traces=None if result is None else result.n_traces,
-            n_exact_stations=None if result is None else result.n_exact,
-            seconds=seconds,
+            result=result,
+            output=output,
+            failure=None if stop is None else (stop.status, stop.reason),
+            hash_s=hash_s,
+            total_s=total_s,
         )
         write_record(record, path)
     # Every error becomes one line, never a traceback.
@@ -554,33 +452,36 @@ def compress(
     """
     start = time.perf_counter()
     if record is not None:
-        _refuse_a_record_over(record, src, dst)
-        # The record is a destination too, checked before the input is read. Refusing it
+        # The record is a destination too, checked before the input is read. One that
+        # would be written over the input or the output is a usage error. Refusing it
         # writes no record, so an earlier one, which may say that DST is complete, stays
         # as it was.
         try:
             with _about(record):
-                destinations.refuse_overwriting(src, record, overwrite)
+                destinations.refuse_overwriting(record, src, dst, overwrite=overwrite)
         except _Stop as stop:
+            if isinstance(stop.__cause__, SameFile):
+                raise typer.BadParameter(
+                    stop.reason, param_hint="'--record'"
+                ) from stop.__cause__
             stop.exit()
-    seconds = {"hash": 0.0, "compress": 0.0, "check": 0.0}
+    seconds = {"hash": 0.0}
     input_hash: str | None = None
     result: files.CompressResult | None = None
     try:
-        with _about(src, {_ABOUT_THE_OUTPUT: dst}):
+        with _about(src):
             files.check_compressible(src, dst, overwrite)
-        # Before the input is hashed, so that a mistyped folder costs no hash.
-        for path in (dst,) if record is None else (dst, record):
-            with _about(path):
-                _require_folder(path)
+        # Before the input is hashed, so that a mistyped folder costs no hash. DST's is
+        # checked by check_compressible.
+        if record is not None:
+            with _about(record):
+                destinations.require_folder(record)
         with _about(src):
             input_hash = _hash(src, seconds)
-        with _about(src, {_ABOUT_THE_OUTPUT: dst}):
+        with _about(src):
             result = files.compress_file(
                 src, dst, bits, level, check=not no_check, overwrite=overwrite
             )
-        with _about(dst):
-            output_hash = _hash_output(dst, seconds)
     except _Stop as stop:
         # Unless it is the record's own folder that is missing.
         if record is not None and stop.path != record:
@@ -589,7 +490,7 @@ def compress(
                 src=src,
                 bits=bits,
                 start=start,
-                seconds=seconds,
+                hash_s=seconds["hash"],
                 input_hash=input_hash,
                 result=result,
                 output=None,
@@ -602,10 +503,10 @@ def compress(
             src=src,
             bits=bits,
             start=start,
-            seconds=seconds,
+            hash_s=seconds["hash"],
             input_hash=input_hash,
             result=result,
-            output=(dst, result.bytes_out, output_hash),
+            output=(dst, result.bytes_out, result.output_hash),
             stop=None,
         )
     typer.echo(
@@ -677,8 +578,8 @@ def decompress(
     """
     try:
         with _about(dst):
-            destinations.refuse_overwriting(src, dst, overwrite)
-            _require_folder(dst)
+            destinations.refuse_overwriting(dst, src, overwrite=overwrite)
+            destinations.require_folder(dst)
         with _about(src):
             ds = files.decompress_file(src)
         with _about(dst):
@@ -741,8 +642,7 @@ def verify(
         fails the check or can't be checked.
     """
     try:
-        # verify_file checks only the original's layout.
-        with _about(compressed, {NotStandardLayout: original}):
+        with _about(compressed):
             result = files.verify_file(original, compressed)
     except _Stop as stop:
         stop.exit()
@@ -804,9 +704,6 @@ def convert_bbbin(
     """
     try:
         with _about(dst):
-            _require_folder(dst)
-        # Only a file that can't be a BB.bin is about SRC: the rest is the writing's.
-        with _about(dst, {NotBBBin: src}):
             bbbin.convert_bbbin(src, dst, overwrite)
     except _Stop as stop:
         stop.exit()

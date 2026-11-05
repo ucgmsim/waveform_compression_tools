@@ -1,5 +1,3 @@
-from collections.abc import Callable
-
 import numpy as np
 import pytest
 from hypothesis import given
@@ -13,7 +11,7 @@ from waveform_compression_tools.codec import (
     within_one_step,
 )
 
-from helpers import within_one_step_of_the_setting
+from helpers import RealTraces, within_one_step_of_the_setting
 
 # Total FLAC bytes of each set of real traces at each setting, as measured with an
 # independent implementation of this encoder (level 5, float64 gains).
@@ -83,7 +81,7 @@ def hard_traces(nt: int) -> dict[str, np.ndarray]:
 @pytest.mark.parametrize("name", REAL_TRACE_FLAC_BYTES)
 @pytest.mark.parametrize("bits", [32, 24, 17])
 def test_real_trace_sizes_match_the_reference(
-    real_traces: Callable[[str], np.ndarray], name: str, bits: int
+    real_traces: RealTraces, name: str, bits: int
 ) -> None:
     # The only check of compressed size: a change that made files bigger, such as to
     # pyflac or to the encoder's settings, fails here and nowhere else.
@@ -95,7 +93,7 @@ def test_real_trace_sizes_match_the_reference(
 
 @pytest.mark.parametrize("bits", [32, 24, 17])
 def test_real_traces_round_trip_within_one_step(
-    real_traces: Callable[[str], np.ndarray], bits: int
+    real_traces: RealTraces, bits: int
 ) -> None:
     w = real_traces("bb")
     back = round_trip(w, bits)

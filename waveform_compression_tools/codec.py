@@ -15,6 +15,7 @@ package handles. `max_relative_error` and `within_one_step` compare a decoded bl
 with the original.
 """
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -34,7 +35,7 @@ STANDARD_COMPONENTS = ("000", "090", "ver")
 STEP_SLACK = 1e-9
 
 
-def check_standard(ds: xr.Dataset) -> None:
+def check_standard(ds: xr.Dataset, path: str | os.PathLike[str] | None = None) -> None:
     """Check that a dataset holds its waveform in the layout this package handles.
 
     The layout is a data variable ``waveform`` of float32 with the dimensions
@@ -47,6 +48,8 @@ def check_standard(ds: xr.Dataset) -> None:
     ----------
     ds : xr.Dataset
         The dataset to check. The waveform itself is not read.
+    path : str or os.PathLike, optional
+        The file the dataset is read from, which a refusal names as its ``filename``.
 
     Raises
     ------
@@ -55,14 +58,15 @@ def check_standard(ds: xr.Dataset) -> None:
     """
     if "waveform" not in ds.data_vars:
         raise NotStandardLayout(
-            f"no data variable 'waveform' (the data variables are {list(ds.data_vars)})"
+            f"no data variable 'waveform' (the data variables are {list(ds.data_vars)})",
+            path,
         )
     waveform = ds["waveform"]
     if waveform.dtype != np.float32:
-        raise NotStandardLayout(f"'waveform' is {waveform.dtype}, not float32")
+        raise NotStandardLayout(f"'waveform' is {waveform.dtype}, not float32", path)
     if waveform.dims != STANDARD_DIMS:
         raise NotStandardLayout(
-            f"'waveform' has dimensions {waveform.dims}, not {STANDARD_DIMS}"
+            f"'waveform' has dimensions {waveform.dims}, not {STANDARD_DIMS}", path
         )
 
 
@@ -126,11 +130,11 @@ def encode_block(waveform: np.ndarray, bits: int = 32, level: int = 5) -> Encode
         )
     streams: list[bytes] = []
     gains = np.empty(waveform.shape[:2], dtype=np.float64)
+    # Each trace's largest absolute sample, exactly: a NaN or an infinity stays.
+    peaks = np.maximum(-waveform.min(axis=2), waveform.max(axis=2))
     for c, s in np.ndindex(*gains.shape):
-        trace = waveform[c, s]
-        peak = np.abs(trace.astype(np.float64)).max()
-        gains[c, s] = gain_for(peak, bits)
-        streams.append(encode_stream(quantise(trace, gains[c, s]), level))
+        gains[c, s] = gain_for(peaks[c, s], bits)
+        streams.append(encode_stream(quantise(waveform[c, s], gains[c, s]), level))
     nbytes = np.array([len(stream) for stream in streams], dtype=np.int64)
     return EncodedBlock(streams, nbytes.reshape(gains.shape), gains)
 

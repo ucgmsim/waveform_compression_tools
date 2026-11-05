@@ -4,8 +4,6 @@ import logging
 import logging.handlers
 import os
 import struct
-import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -26,13 +24,7 @@ from waveform_compression_tools.cli import (
     EXIT_USAGE,
     app,
 )
-from waveform_compression_tools.codec import (
-    STANDARD_DIMS,
-    STEP_SLACK,
-    EncodedBlock,
-    encode_block,
-    max_relative_error,
-)
+from waveform_compression_tools.codec import STEP_SLACK, EncodedBlock, encode_block
 from waveform_compression_tools.content_hash import content_hash
 from waveform_compression_tools.destinations import HDF5Output
 from waveform_compression_tools.files import (
@@ -48,10 +40,14 @@ from waveform_compression_tools.stream import encode_stream
 
 from helpers import (
     StandardDataset,
+    contents,
     limit_file_sizes,
     limits_file_sizes,
+    nothing_left,
     partial_of,
+    refused_input,
     run_python,
+    with_a_flipped_byte,
     write,
 )
 
@@ -105,11 +101,6 @@ def assert_stopped(result: Result, status: int, path: Path) -> str:
     assert reason.strip() != ""
     assert not reason.startswith((f"{path}: ", f"{path} ")), result.stderr
     return reason
-
-
-def contents(folder: Path) -> dict[str, bytes]:
-    # Each file in a folder, by name, with its bytes.
-    return {path.name: path.read_bytes() for path in folder.iterdir()}
 
 
 def read_record(path: Path) -> dict:
@@ -228,7 +219,8 @@ def test_compress_ok_writes_a_record(
         return content_hash(path)
 
     monkeypatch.setattr(files, "compress_file", compress_and_keep)
-    monkeypatch.setattr(cli, "content_hash", hash_slowly)
+    for module in (cli, files):  # The input's hash, and the output's.
+        monkeypatch.setattr(module, "content_hash", hash_slowly)
     result = run("compress", src, dst, "--record", rec, *options)
     assert_exit(result, EXIT_OK)
     assert result.stderr == ""
@@ -277,9 +269,10 @@ def test_compress_ok_writes_a_record(
     assert seconds["hash"] + seconds["compress"] + seconds["check"] <= seconds["total"]
 
 
-# Each refusal of compress, one for each Refused class it raises and a few more: the
-# file its line names, whether it comes after the input is hashed (only the refusals
-# that need the samples do), and a word of its reason.
+# Each refusal of compress, as helpers.refused_input writes it, one for each Refused
+# class it raises and a few more: the file its line names, whether it comes after the
+# input is hashed (only the refusals that need the samples do), and a word of its
+# reason.
 REFUSALS = {
     "the same path": ("dst", False, "overwrite"),  # SameFile
     "the output exists": ("dst", False, "exists"),  # OutputExists
@@ -294,49 +287,16 @@ REFUSALS = {
 }
 
 
-def refused_input(
-    case: str, folder: Path, standard_dataset: StandardDataset
-) -> tuple[Path, Path]:
-    # Writes the input for a refusal of compress. Returns it and the destination.
-    src, dst = folder / "in.nc", folder / "out.nc"
-    ds = standard_dataset(3, nt=100)
-    if case == "a float64 waveform":
-        ds["waveform"] = ds["waveform"].astype(np.float64)
-    elif case == "every station real":
-        ds = standard_dataset(3, nt=100, real=(0, 1, 2))
-    elif case == "a NaN":
-        ds["waveform"][2, 2, 50] = np.nan
-    elif case == "a fill value inside the data":
-        ds["waveform"].encoding["_FillValue"] = np.float32(0.0)
-    write(ds, src)
-    if case == "an HDF5 group":
-        with h5py.File(src, "a") as f:
-            f.create_group("provenance").create_dataset("notes", data=np.arange(3))
-    elif case == "an attribute JSON can't hold":
-        with h5py.File(src, "r+") as f:
-            f["waveform"].attrs["gain"] = np.complex128(1 + 2j)
-    elif case == "already compressed":
-        src = folder / "in.flac.nc"
-        compress_file(folder / "in.nc", src)
-    elif case == "the output exists":
-        dst.write_bytes(b"an earlier file")
-    elif case == "the same path":
-        dst = src
-    elif case == "a text file":
-        src = folder / "notes.nc"
-        src.write_text("station,pga\nS000000,0.12\n")
-    return src, dst
-
-
 @pytest.mark.parametrize("case", REFUSALS)
 def test_each_refusal_exits_3_with_one_line_and_a_record(
     tmp_path: Path, standard_dataset: StandardDataset, case: str
 ) -> None:
     named, after_the_hash, word = REFUSALS[case]
-    src, dst = refused_input(case, tmp_path, standard_dataset)
+    src, dst, overwrite = refused_input(case, tmp_path, standard_dataset)
     rec = tmp_path / "rec.json"
     before = contents(tmp_path)
-    result = run("compress", src, dst, "--record", rec)
+    options = ["--overwrite"] if overwrite else []
+    result = run("compress", src, dst, "--record", rec, *options)
     reason = assert_stopped(result, EXIT_REFUSED, {"src": src, "dst": dst}[named])
     assert word in reason
     # Nothing is written but the record: the input, and a file already at the
@@ -365,12 +325,12 @@ def test_each_refusal_exits_3_with_one_line_and_a_record(
     assert (record["seconds"]["hash"] > 0) is after_the_hash
 
 
-# Failures once compression has begun: which file the line names, a word of its reason,
-# and whether compressing finished before the run failed.
+# Failures once compression has begun: which file the line names, and a word of its
+# reason. The output's hash is part of compressing, so none of them finishes it.
 FAILURES = {
-    "a damaged stream": ("dst", "don't decode", False),
-    "a stream libFLAC can't finish": ("src", "couldn't be encoded", False),
-    "an output it can't hash": ("dst", "Input/output error", True),
+    "a damaged stream": ("dst", "don't decode"),
+    "a stream libFLAC can't finish": ("src", "couldn't be encoded"),
+    "an output it can't hash": ("dst", "Input/output error"),
 }
 
 
@@ -384,24 +344,20 @@ def test_a_failed_check_exits_1_and_leaves_nothing(
     # The encoder flips a byte of one trace's stream, which the check finds as it
     # decodes what was written: libFLAC reports it, and the command says it once. Or
     # libFLAC fails to finish a stream, as it has. Or the output passes its check but
-    # can't be read back to be hashed, so nothing vouches for it.
-    named, word, finished = FAILURES[failure]
+    # can't be read back to be hashed, so nothing vouches for it. An earlier file at
+    # DST, asked to be replaced, stays as it was in each case.
+    named, word = FAILURES[failure]
     src = write(standard_dataset(3, nt=5_000), tmp_path / "in.nc")
     dst, rec = tmp_path / "out.nc", tmp_path / "rec.json"
+    dst.write_bytes(b"an earlier file")
 
     def encode_then_flip_a_byte(
         waveform: np.ndarray, bits: int, level: int
     ) -> EncodedBlock:
-        encoded = encode_block(waveform, bits, level)
-        streams = list(encoded.streams)
-        k = 1 * waveform.shape[1] + 2  # Component 1 of station 2.
-        stream = bytearray(streams[k])
-        stream[len(stream) // 2] ^= 0xFF
-        streams[k] = bytes(stream)
-        return EncodedBlock(streams, encoded.nbytes, encoded.gains)
+        return with_a_flipped_byte(encode_block(waveform, bits, level))
 
     def hash_all_but_the_output(path: Path) -> str:
-        if path == dst:
+        if path == partial_of(dst):
             raise OSError(errno.EIO, "Input/output error")
         return content_hash(path)
 
@@ -410,17 +366,19 @@ def test_a_failed_check_exits_1_and_leaves_nothing(
     elif failure == "a stream libFLAC can't finish":
         monkeypatch.setattr(pyflac.StreamEncoder, "finish", lambda self: False)
     else:
-        monkeypatch.setattr(cli, "content_hash", hash_all_but_the_output)
+        monkeypatch.setattr(files, "content_hash", hash_all_but_the_output)
     before = contents(tmp_path)
-    result = run("compress", src, dst, "--record", rec)
+    result = run("compress", src, dst, "--record", rec, "--overwrite")
     path = {"src": src, "dst": dst}[named]
     reason = assert_stopped(result, EXIT_FAILED, path)
     assert word in reason
-    # The line names the file once, though the check's own message starts with it. It
-    # names the file the run was making, not the partial file it was checking.
-    assert result.stderr.count(str(path)) == 1
+    # The line names the file once, though the check's own message starts with it. An
+    # OSError's words end with the file, as those of a write to DST that fails do.
+    if failure != "an output it can't hash":
+        assert result.stderr.count(str(path)) == 1
+    # It names the file the run was making, not the partial file it was checking.
     assert ".partial" not in result.stderr
-    # No output and no partial file: nothing but the record.
+    # No new output and no partial file: nothing but the record.
     assert contents(tmp_path) == {**before, "rec.json": rec.read_bytes()}
     # The record keeps the library's whole message.
     record = read_record(rec)
@@ -428,10 +386,8 @@ def test_a_failed_check_exits_1_and_leaves_nothing(
     # The input was hashed before it was compressed, and there is no output.
     assert record["input"]["content_hash"] == content_hash(src)
     assert record["output"] is None
-    # What compressing made is recorded only if it finished.
-    assert (record["checked"], record["n_traces"]) == (
-        (True, 9) if finished else (False, None)
-    )
+    # Compressing didn't finish, so nothing it would have made is recorded.
+    assert (record["checked"], record["n_traces"]) == (False, None)
 
 
 @pytest.mark.parametrize("outcome", ["compressed", "refused"])
@@ -539,7 +495,8 @@ def test_a_missing_destination_folder_fails_naming_the_file(
     # compress's record, if its own folder is there.
     after = contents(tmp_path)
     if command == "compress" and missing == "DST":
-        record = json.loads(after.pop("rec.json"))
+        del after["rec.json"]
+        record = read_record(rec)
         assert (record["status"], record["reason"]) == ("failed", reason)
         # The folders are checked before the input is hashed.
         assert record["input"]["content_hash"] is None
@@ -675,26 +632,14 @@ def test_overwrite_replaces_an_existing_destination(
 def test_decompress_gives_back_the_standard_layout(
     tmp_path: Path, standard_dataset: StandardDataset
 ) -> None:
-    src, packed = compressed_file(standard_dataset(5, nt=300, real=(1,)), tmp_path)
+    # The file holds what decompress_file gives back, which test_files.py checks.
+    _, packed = compressed_file(standard_dataset(5, nt=300, real=(1,)), tmp_path)
     back = tmp_path / "back.nc"
     result = run("decompress", packed, back)
     assert_exit(result, EXIT_OK)
     assert "15 traces of 300 samples" in result.stdout
     assert not partial_of(back).exists() and not is_compressed(back)
-    with (
-        xr.open_dataset(src, engine="h5netcdf") as orig,
-        xr.open_dataset(back, engine="h5netcdf") as got,
-    ):
-        assert got["waveform"].dims == STANDARD_DIMS
-        assert got["waveform"].dtype == np.float32
-        assert got["waveform"].attrs == {"units": "g"}
-        xr.testing.assert_identical(
-            got.drop_vars("waveform"), orig.drop_vars("waveform")
-        )
-        original, decoded = orig["waveform"].values, got["waveform"].values
-    assert max_relative_error(original, decoded).max() <= 1 / full_scale(32)
-    # Station 1 is real, so it comes back as it was, to the bit.
-    assert np.array_equal(original[:, 1].view(np.uint32), decoded[:, 1].view(np.uint32))
+    assert_complete("decompress", packed, back)
 
 
 # Damage that decompressing and verifying both meet, to one trace's stream or to the
@@ -765,7 +710,7 @@ def test_a_damaged_file_fails_the_check(
 # What each command's line gives when its write fails, or None where the failure is an
 # interruption, which isn't caught. The unexpected error's message is of two lines, as
 # some of xarray's are, which the line joins into one.
-@pytest.mark.parametrize("command", ["compress", "decompress"])
+@pytest.mark.parametrize("command", ["compress", "decompress", "convert-bbbin"])
 @pytest.mark.parametrize(
     ("error", "shown"),
     [
@@ -813,7 +758,8 @@ def test_a_failed_write_leaves_no_partial_file_and_keeps_the_old_one(
         # A failure, an unexpected one with its type. An OSError as the output is
         # written names the output, whichever command writes it. Compress names its
         # input for anything else that goes wrong while it compresses, but for a refusal
-        # to write or a failed check; decompress names the file it was writing.
+        # to write or a failed check; decompress and convert-bbbin name the file they
+        # were writing.
         named = src if command == "compress" and not isinstance(error, OSError) else dst
         assert shown in assert_stopped(result, EXIT_FAILED, named)
         assert command != "compress" or read_record(rec)["status"] == "failed"
@@ -884,8 +830,7 @@ def test_a_disk_that_fills_partway_fails_the_run_naming_the_output(
     assert ran.stdout == "" and ran.stderr.count("\n") == 1, ran.stderr
     assert ran.stderr.startswith(f"{PROGRAM}: out.nc: "), ran.stderr
     assert "File too large" in ran.stderr
-    assert not (tmp_path / "out.nc").exists()
-    assert not partial_of(tmp_path / "out.nc").exists()
+    assert nothing_left(tmp_path / "out.nc")
     assert command != "compress" or read_record(tmp_path / "rec.json")["status"] == (
         "failed"
     )
@@ -909,22 +854,16 @@ def test_an_os_error_names_the_file_it_is_about(
     assert [p.name for p in tmp_path.iterdir()] == ["BB.bin"]
 
 
-def test_importing_the_command_line_leaves_logging_alone() -> None:
+def test_importing_the_command_line_leaves_logging_alone(tmp_path: Path) -> None:
     # pyflac's logger is quietened when a command runs, not when cli.py is imported, so
     # a program that only imports it keeps its logging as it was. This needs a fresh
-    # interpreter, started as this one was so that it imports the same package.
+    # interpreter.
     code = (
         "import logging, waveform_compression_tools.cli; "
         "log = logging.getLogger('pyflac'); "
         "assert log.propagate and not log.handlers, (log.propagate, log.handlers)"
     )
-    flags = ["-S"] if sys.flags.no_site else []
-    imported = subprocess.run(
-        [sys.executable, *flags, "-c", code],
-        capture_output=True,
-        text=True,
-        check=False,  # The child's own error is shown below instead.
-    )
+    imported = run_python(code, cwd=tmp_path)
     assert imported.returncode == 0, imported.stderr
 
 

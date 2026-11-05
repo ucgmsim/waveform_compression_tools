@@ -10,7 +10,7 @@ from waveform_compression_tools.files import (
     verify_file,
 )
 
-from helpers import StandardDataset
+from helpers import StandardDataset, build_standard_dataset, write
 
 
 def test_block_sizes() -> None:
@@ -61,27 +61,45 @@ def _peak(step: str, src: Path, dst: Path, again: Path) -> int:
         tracemalloc.stop()
 
 
+# Some stations of 2,000 samples, four times as many stations, and four times as many
+# samples. A budget of 512 KiB makes blocks of 21 stations of 2,000 samples.
+SIZES = [(250, 2_000), (1_000, 2_000), (250, 8_000)]
+SMALL_BLOCK_BYTES = 512 * 2**10
+
+
+@pytest.fixture(scope="module")
+def compressed_sizes(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> dict[tuple[int, int], tuple[Path, Path]]:
+    # Each size, written and compressed once, untraced, which also loads what loads on
+    # first use.
+    folder = tmp_path_factory.mktemp("sizes")
+    written = {}
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(files, "BLOCK_BYTES", SMALL_BLOCK_BYTES)
+        for n_station, nt in SIZES:
+            ds = build_standard_dataset(n_station, nt=nt)
+            src = write(ds, folder / f"in{n_station}_{nt}.nc")
+            dst = folder / f"out{n_station}_{nt}.nc"
+            compress_file(src, dst)
+            written[n_station, nt] = src, dst
+    return written
+
+
 @pytest.mark.parametrize("step", ["compress", "verify"])
 def test_peak_memory_stays_flat(
     tmp_path: Path,
-    standard_dataset: StandardDataset,
+    compressed_sizes: dict[tuple[int, int], tuple[Path, Path]],
     monkeypatch: pytest.MonkeyPatch,
     step: str,
 ) -> None:
-    # A budget of 2 MiB makes blocks of 87 stations of 2,000 samples. The peak must
-    # not follow the number of stations or the length of the traces.
-    monkeypatch.setattr(files, "BLOCK_BYTES", 2 * 2**20)
-    peaks = {}
-    for n_station, nt in [(1_000, 2_000), (4_000, 2_000), (1_000, 8_000)]:
-        src, dst = tmp_path / f"in{n_station}_{nt}.nc", tmp_path / "out.nc"
-        standard_dataset(n_station, nt=nt).to_netcdf(src, engine="h5netcdf")
-        dst.unlink(missing_ok=True)
-        compress_file(src, dst)  # Also loads what loads on first use.
-        again = tmp_path / "again.nc"
-        again.unlink(missing_ok=True)
-        peaks[n_station, nt] = _peak(step, src, dst, again)
+    # The peak must not follow the number of stations or the length of the traces.
+    monkeypatch.setattr(files, "BLOCK_BYTES", SMALL_BLOCK_BYTES)
+    peaks = {
+        size: _peak(step, src, dst, tmp_path / f"again{size[0]}_{size[1]}.nc")
+        for size, (src, dst) in compressed_sizes.items()
+    }
     print(step, peaks)
-    assert peaks[4_000, 2_000] < 1.5 * peaks[1_000, 2_000]
-    assert peaks[1_000, 2_000] < 1.5 * peaks[4_000, 2_000]
-    assert peaks[1_000, 8_000] < 1.5 * peaks[1_000, 2_000]
-    assert peaks[1_000, 2_000] < 1.5 * peaks[1_000, 8_000]
+    few, many, long = (peaks[size] for size in SIZES)
+    assert many < 1.5 * few and few < 1.5 * many
+    assert long < 1.5 * few and few < 1.5 * long

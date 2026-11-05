@@ -23,7 +23,7 @@ xarray with the h5netcdf engine. In the waveform's place, the HDF5 group
 
 The group's attributes are ``format_version`` (1), ``dims``
 (``["component", "station", "time"]``), ``dtype`` (``"float32"``),
-``waveform_attrs`` (the waveform's attributes, as JSON), the optional
+``waveform_attrs`` (the waveform's attributes, as JSON),
 ``waveform_encoding`` (its ``_FillValue`` and ``missing_value``, as JSON) and
 ``waveform_attr_types`` (the dtype of each numpy-typed attribute), ``bits`` (the quantisation
 setting), ``encoder`` (``"waveform_compression_tools"`` and the package's version) and
@@ -44,6 +44,7 @@ import json
 import os
 import time
 import zlib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,7 +63,15 @@ from .codec import (
     max_relative_error,
     within_one_step,
 )
-from .destinations import HDF5Output, naming, refuse_overwriting, writing
+from .content_hash import content_hash
+from .destinations import (
+    HDF5Output,
+    naming,
+    refuse_overwriting,
+    require_folder,
+    write_netcdf,
+    writing,
+)
 from .errors import (
     AllStationsReal,
     AlreadyCompressed,
@@ -106,17 +115,19 @@ class CompressResult:
         The number of real stations, whose traces were also copied exactly.
     bits : int
         The quantisation setting.
-    checked : bool
-        Whether the compressed file was checked as it was written (see
-        `compress_file`): each block decoded from the bytes written and held to
-        `verify_file`'s rules against the samples read, and the closed file shown to
-        hold what was judged and to agree with the original in everything but the
-        waveform's samples. A checked file passes `verify_file`, unless it was changed
-        after it was judged in a way that its CRC-32s miss.
     max_relative_error : float or None
         The largest error the check found in a trace that isn't kept exactly, as a
         fraction of that trace's peak: 0.0 if every such trace came back exactly or is
-        all zeros. None if the file wasn't checked.
+        all zeros. None if the file wasn't checked. The check (see `compress_file`)
+        decodes each block from the bytes written and holds it to `verify_file`'s rules
+        against the samples read, and shows the closed file to hold what was judged and
+        to agree with the original in everything but the waveform's samples. A checked
+        file passes `verify_file`, unless it was changed after it was judged in a way
+        that its CRC-32s miss.
+    output_hash : str
+        The compressed file's content hash (see
+        `waveform_compression_tools.content_hash`), taken before it was renamed into
+        place.
     read_s : float
         Wall time spent opening the original and reading its waveform, in seconds.
     encode_s : float
@@ -125,6 +136,8 @@ class CompressResult:
         Wall time spent writing the compressed file, in seconds.
     check_s : float
         Wall time spent checking the compressed file, in seconds: 0.0 if it wasn't.
+    hash_s : float
+        Wall time spent hashing the compressed file, in seconds.
     read_cpu_s : float
         CPU time spent opening the original and reading its waveform, in seconds:
         the process's, as `time.process_time` counts it, in all its threads.
@@ -141,12 +154,13 @@ class CompressResult:
     n_traces: int
     n_exact: int
     bits: int
-    checked: bool
     max_relative_error: float | None
+    output_hash: str
     read_s: float
     encode_s: float
     write_s: float
     check_s: float
+    hash_s: float
     read_cpu_s: float
     encode_cpu_s: float
     write_cpu_s: float
@@ -191,8 +205,9 @@ class _Stopwatch:
     """
 
     def __init__(self) -> None:  # numpydoc ignore=GL08
-        self.seconds = {"read": 0.0, "encode": 0.0, "write": 0.0, "check": 0.0}
-        self.cpu_seconds = {"read": 0.0, "encode": 0.0, "write": 0.0, "check": 0.0}
+        stages = ("read", "encode", "write", "check", "hash")
+        self.seconds = dict.fromkeys(stages, 0.0)
+        self.cpu_seconds = dict.fromkeys(stages, 0.0)
         self._last = time.perf_counter()
         self._last_cpu = time.process_time()
 
@@ -202,7 +217,7 @@ class _Stopwatch:
         Parameters
         ----------
         stage : str
-            ``"read"``, ``"encode"``, ``"write"`` or ``"check"``.
+            ``"read"``, ``"encode"``, ``"write"``, ``"check"`` or ``"hash"``.
         """
         now, now_cpu = time.perf_counter(), time.process_time()
         self.seconds[stage] += now - self._last
@@ -210,17 +225,13 @@ class _Stopwatch:
         self._last, self._last_cpu = now, now_cpu
 
 
-def block_stations_for(
-    n_component: int,
-    nt: int,
-    station_chunk: int | None,
-    block_bytes: int = BLOCK_BYTES,
-) -> int:
+def block_stations_for(n_component: int, nt: int, station_chunk: int | None) -> int:
     """Choose how many stations to read at once.
 
     The budget gives the number of stations whose float32 samples fit in
-    `block_bytes`. For a chunked waveform the block is whole station chunks, so no
-    chunk is read twice, unless that would exceed the budget by more than a quarter.
+    `BLOCK_BYTES`, as it is when this is called. For a chunked waveform the block is
+    whole station chunks, so no chunk is read twice, unless that would exceed the
+    budget by more than a quarter.
 
     Parameters
     ----------
@@ -230,15 +241,13 @@ def block_stations_for(
         The number of samples in a trace.
     station_chunk : int or None
         The waveform's chunk along the station axis, or None if it is contiguous.
-    block_bytes : int, default BLOCK_BYTES
-        The memory budget for a block of the waveform.
 
     Returns
     -------
     int
         The number of stations in a block, at least 1.
     """
-    stations = max(1, block_bytes // (4 * n_component * nt))
+    stations = max(1, BLOCK_BYTES // (4 * n_component * nt))
     if station_chunk is None:
         return stations
     block = max(1, round(stations / station_chunk)) * station_chunk
@@ -275,15 +284,18 @@ def _blocks(n_station: int, block_stations: int) -> list[tuple[int, int]]:
 
 
 def _station_blocks(
-    waveform: xr.DataArray, block_stations: int | None = None
+    shape: tuple[int, ...],
+    chunks: Sequence[int] | None,
+    block_stations: int | None = None,
 ) -> list[tuple[int, int]]:
     """Split a waveform's stations into the blocks it is read in.
 
     Parameters
     ----------
-    waveform : xr.DataArray
-        The waveform, as opened from a file, with dimensions (component, station,
-        time).
+    shape : tuple of int
+        The waveform's shape: (component, station, time).
+    chunks : sequence of int or None
+        The waveform's chunks in its file, or None if it is contiguous.
     block_stations : int, optional
         The most stations in a block. By default a block holds about `BLOCK_BYTES` of
         the waveform, in whole chunks of stations if it is chunked (see
@@ -299,11 +311,10 @@ def _station_blocks(
     ValueError
         If `block_stations` is less than 1.
     """
-    n_component, n_station, nt = waveform.shape
+    n_component, n_station, nt = shape
     if block_stations is None:
-        chunks = waveform.encoding.get("chunksizes")
         station_chunk = None if chunks is None else int(chunks[1])
-        block_stations = block_stations_for(n_component, nt, station_chunk, BLOCK_BYTES)
+        block_stations = block_stations_for(n_component, nt, station_chunk)
     return _blocks(n_station, block_stations)
 
 
@@ -342,7 +353,9 @@ def _attr_types(attrs: dict) -> dict[str, str]:
     return types
 
 
-def _json_value(value: object, name: str, typed: bool) -> object:
+def _json_value(
+    value: object, name: str, typed: bool, path: Path | None = None
+) -> object:
     """Make an attribute's value one that strict JSON holds.
 
     A numpy value becomes plain Python, an array lists. Each float that isn't finite,
@@ -358,6 +371,9 @@ def _json_value(value: object, name: str, typed: bool) -> object:
     typed : bool
         Whether the attribute has a numpy type, which brings a number back from its
         name when the file is read.
+    path : Path, optional
+        The file the attribute is read from, which a refusal names as its
+        ``filename``.
 
     Returns
     -------
@@ -374,18 +390,19 @@ def _json_value(value: object, name: str, typed: bool) -> object:
     if isinstance(value, np.ndarray | np.generic):
         value = value.tolist()
     if isinstance(value, list | tuple):
-        return [_json_value(v, name, typed) for v in value]
+        return [_json_value(v, name, typed, path) for v in value]
     if isinstance(value, float) and not np.isfinite(value):
         if not typed:
             raise NotStandardLayout(
                 f"attribute {name!r} holds {value}, which strict JSON can't hold and "
-                "which has no numpy type to come back as"
+                "which has no numpy type to come back as",
+                path,
             )
         return str(value).replace("inf", "Infinity").replace("nan", "NaN")
     if value is None or isinstance(value, str | int | float):
         return value
     raise NotStandardLayout(
-        f"an attribute of type {type(value).__name__} can't go in JSON"
+        f"an attribute of type {type(value).__name__} can't go in JSON", path
     )
 
 
@@ -448,7 +465,7 @@ def _written_dtypes(attrs: dict) -> dict[str, str]:
 
 
 def _refuse_fill_in_range(
-    block: np.ndarray, fills: list[float], bits: int, encoding_name: str
+    block: np.ndarray, fills: list[float], bits: int, src: Path
 ) -> None:
     """Refuse a block with a trace that reaches a finite fill value.
 
@@ -463,8 +480,8 @@ def _refuse_fill_in_range(
         The finite ``_FillValue`` and ``missing_value`` of the waveform.
     bits : int
         The quantisation setting.
-    encoding_name : str
-        Names the waveform in the message.
+    src : Path
+        The file the block is read from, for the message.
 
     Raises
     ------
@@ -480,18 +497,22 @@ def _refuse_fill_in_range(
     for fill in fills:
         if np.any((low - step <= fill) & (fill <= high + step)):
             raise NotStandardLayout(
-                f"{encoding_name} has the finite fill value {fill} inside the data's "
-                "range, which can't survive lossy compression"
+                f"{src} has the finite fill value {fill} inside the data's range, "
+                "which can't survive lossy compression",
+                src,
             )
 
 
-def _encoding_json(encoding: dict) -> str:
+def _encoding_json(encoding: dict, path: Path | None = None) -> str:
     """Write the waveform's ``_FillValue`` and ``missing_value`` as strict JSON.
 
     Parameters
     ----------
     encoding : dict
         The waveform's netCDF encoding, as xarray read it.
+    path : Path, optional
+        The file the waveform is read from, which a refusal names as its
+        ``filename``.
 
     Returns
     -------
@@ -499,13 +520,43 @@ def _encoding_json(encoding: dict) -> str:
         A JSON object. A float that isn't finite is the string ``"NaN"``,
         ``"Infinity"`` or ``"-Infinity"``. A waveform with no ``_FillValue`` has
         ``{"_FillValue": null}``, so it is written back without one.
+
+    Raises
+    ------
+    NotStandardLayout
+        If a value is of a type JSON can't hold (see `_json_value`).
     """
     out: dict[str, object] = {"_FillValue": None}
     for name in ("_FillValue", "missing_value"):
         if name in encoding:
             # Read back as the waveform's type, which brings a number back from its name.
-            out[name] = _json_value(encoding[name], name, typed=True)
+            out[name] = _json_value(encoding[name], name, typed=True, path=path)
     return json.dumps(out, allow_nan=False)
+
+
+def _comparable_fills(encoding: dict, path: Path | None = None) -> dict:
+    """Give the waveform's ``_FillValue`` and ``missing_value`` in a form to compare.
+
+    Parameters
+    ----------
+    encoding : dict
+        The waveform's netCDF encoding.
+    path : Path, optional
+        The file the waveform is read from, which a refusal names as its
+        ``filename``.
+
+    Returns
+    -------
+    dict
+        Each of them as `_encoding_json` writes it, read back: a NaN is the string
+        ``"NaN"``, so two NaNs compare equal.
+
+    Raises
+    ------
+    NotStandardLayout
+        If a value is of a type JSON can't hold (see `_json_value`).
+    """
+    return json.loads(_encoding_json(encoding, path))
 
 
 def _encoding_back(text: str) -> dict:
@@ -531,7 +582,7 @@ def _refuse_unkeepable_fill_values(encoding: dict, src: Path) -> None:
     """Refuse a waveform whose ``_FillValue`` and ``missing_value`` couldn't be kept.
 
     Each has to be one value. If both are there, they have to be the same, a NaN the
-    same as a NaN, as the check compares them: xarray can't write a dataset whose two
+    same as a NaN, as the check compares them (see `_comparable_fills`): xarray can't write a dataset whose two
     differ, so the file would compress and verify, but the dataset it decompresses to
     couldn't be written to a file.
 
@@ -556,25 +607,29 @@ def _refuse_unkeepable_fill_values(encoding: dict, src: Path) -> None:
         if np.ndim(value) != 0:
             raise NotStandardLayout(
                 f"{src} has a {name} of {np.size(value)} values, not one, which a "
-                "compressed file can't keep"
+                "compressed file can't keep",
+                src,
             )
     if len(given) == 2:
-        fills = json.loads(_encoding_json(encoding))
+        fills = _comparable_fills(encoding, src)
         if fills["_FillValue"] != fills["missing_value"]:
             raise NotStandardLayout(
                 f"{src} has a _FillValue of {fills['_FillValue']} and a missing_value "
                 f"of {fills['missing_value']}, which differ, so the file it "
-                "decompresses to couldn't be written"
+                "decompresses to couldn't be written",
+                src,
             )
 
 
-def _real_stations(ds: xr.Dataset) -> np.ndarray:
+def _real_stations(ds: xr.Dataset, path: Path | None = None) -> np.ndarray:
     """Find the real stations of a dataset, by their names.
 
     Parameters
     ----------
     ds : xr.Dataset
         A dataset in the standard layout. Its waveform is not read.
+    path : Path, optional
+        The file the dataset is read from, which a refusal names as its ``filename``.
 
     Returns
     -------
@@ -591,18 +646,19 @@ def _real_stations(ds: xr.Dataset) -> np.ndarray:
     if "station" not in ds.coords or ds["station"].dims != ("station",):
         raise NotStandardLayout(
             "no 'station' coordinate along the station dimension, so the real "
-            "stations can't be told from a synthetic grid's"
+            "stations can't be told from a synthetic grid's",
+            path,
         )
     try:
         real = [is_real_station(name) for name in ds["station"].values]
     except UnicodeDecodeError as e:
         raise NotStandardLayout(
-            f"a station's name is bytes that aren't ASCII ({e})"
+            f"a station's name is bytes that aren't ASCII ({e})", path
         ) from e
     return np.flatnonzero(real).astype(np.int64)
 
 
-def _in_block(stations: np.ndarray, s0: int, s1: int) -> slice:
+def _in_block(stations: np.ndarray, s0: int, s1: int) -> tuple[slice, np.ndarray]:
     """Find which of some stations are in a block.
 
     Parameters
@@ -616,11 +672,14 @@ def _in_block(stations: np.ndarray, s0: int, s1: int) -> slice:
 
     Returns
     -------
-    slice
+    here : slice
         The part of `stations` from `s0` up to, but not including, `s1`.
+    local : np.ndarray
+        Those stations, counted from `s0`.
     """
     k0, k1 = np.searchsorted(stations, (s0, s1))
-    return slice(int(k0), int(k1))
+    here = slice(int(k0), int(k1))
+    return here, stations[here] - s0
 
 
 def _refuse_unless_hdf5(path: Path, refusal: type[Refused], consequence: str) -> None:
@@ -647,7 +706,7 @@ def _refuse_unless_hdf5(path: Path, refusal: type[Refused], consequence: str) ->
         `refusal`, if `path` is a regular file that `h5py.is_hdf5` says isn't HDF5.
     """
     if path.is_file() and not h5py.is_hdf5(path):
-        raise refusal(f"{path} isn't an HDF5 file, so it {consequence}")
+        raise refusal(f"{path} isn't an HDF5 file, so it {consequence}", path)
 
 
 def _refuse_subgroups(path: Path) -> None:
@@ -672,12 +731,63 @@ def _refuse_subgroups(path: Path) -> None:
     with h5py.File(path, "r") as f:
         groups = [name for name, item in f.items() if isinstance(item, h5py.Group)]
     if GROUP in groups:
-        raise AlreadyCompressed(f"{path} is compressed already")
+        raise AlreadyCompressed(f"{path} is compressed already", path)
     if groups:
         raise HasGroups(
             f"{path} holds HDF5 groups besides its root ({', '.join(groups)}), "
-            "which a compressed file would go without"
+            "which a compressed file would go without",
+            path,
         )
+
+
+def _refuse_file(src: Path, dst: Path, overwrite: bool) -> None:
+    """Make `check_compressible`'s refusals that need the files, not the dataset in `src`.
+
+    Parameters
+    ----------
+    src : Path
+        The netCDF file to compress.
+    dst : Path
+        Where the compressed file is to go.
+    overwrite : bool
+        Whether a file already at `dst` may be replaced.
+    """
+    refuse_overwriting(dst, src, overwrite=overwrite)
+    _refuse_unless_hdf5(src, NotStandardLayout, "isn't netCDF in the standard layout")
+    _refuse_subgroups(src)
+
+
+def _check_dataset(src: Path, ds: xr.Dataset) -> np.ndarray:
+    """Make `check_compressible`'s refusals of the dataset, and find its real stations.
+
+    Parameters
+    ----------
+    src : Path
+        The file the dataset is opened from, for the messages.
+    ds : xr.Dataset
+        The dataset, open. Its waveform is not read.
+
+    Returns
+    -------
+    np.ndarray
+        The real stations (see `_real_stations`).
+    """
+    check_standard(ds, src)
+    exact = _real_stations(ds, src)
+    waveform = ds["waveform"]
+    n_station = waveform.shape[1]
+    if n_station == 0:
+        raise NotStandardLayout(
+            f"{src} has no stations, so there is nothing to compress", src
+        )
+    # Each refuses an attribute that the compressed file can't keep.
+    _attrs_json(waveform.attrs)
+    _refuse_unkeepable_fill_values(waveform.encoding, src)
+    if exact.size == n_station:
+        raise AllStationsReal(
+            f"all {n_station} stations of {src} are real, so it isn't compressed", src
+        )
+    return exact
 
 
 def check_compressible(
@@ -687,9 +797,10 @@ def check_compressible(
 
     These are the refusals that need no samples, made in this order: `dst` is `src`, a
     file is at `dst` already, `src` isn't an HDF5 file, it is compressed already, it
-    holds an HDF5 group, it isn't in the standard layout, and every station is real.
-    Only metadata and station names are read, so a refused file costs no full read.
-    `compress_file` calls this first. The refusals that need the samples, of a NaN or
+    holds an HDF5 group, it isn't in the standard layout, every station is real, and
+    then a failure: there is no folder to write `dst` in. Only metadata and station
+    names are read, so a refused file costs no full read.
+    `compress_file` makes these first. The refusals that need the samples, of a NaN or
     an infinity and of a fill value inside a trace's range, come during its pass.
 
     Parameters
@@ -723,27 +834,15 @@ def check_compressible(
         they differ.
     AllStationsReal
         If every station of `src` is real, so it stays exact as it is.
+    FileNotFoundError
+        If there is no folder to write `dst` in, naming `dst` (see
+        `waveform_compression_tools.destinations.require_folder`).
     """
     src, dst = Path(src), Path(dst)
-    refuse_overwriting(src, dst, overwrite)
-    _refuse_unless_hdf5(src, NotStandardLayout, "isn't netCDF in the standard layout")
-    _refuse_subgroups(src)
+    _refuse_file(src, dst, overwrite)
     with xr.open_dataset(src, engine="h5netcdf") as ds:
-        check_standard(ds)
-        exact = _real_stations(ds)
-        waveform = ds["waveform"]
-        n_station = waveform.shape[1]
-        if n_station == 0:
-            raise NotStandardLayout(
-                f"{src} has no stations, so there is nothing to compress"
-            )
-        # Each refuses an attribute that the compressed file can't keep.
-        _attrs_json(waveform.attrs)
-        _refuse_unkeepable_fill_values(waveform.encoding, src)
-        if exact.size == n_station:
-            raise AllStationsReal(
-                f"all {n_station} stations of {src} are real, so it isn't compressed"
-            )
+        _check_dataset(src, ds)
+    require_folder(dst)
 
 
 def compress_file(
@@ -789,9 +888,11 @@ def compress_file(
       waveform's attributes and encoding as a reader gets them back, and exact copies
       of the real stations and of no others.
 
-    Only then is the file renamed to `dst`. A file that passes the check passes
-    `verify_file`, unless it was changed after it was judged in a way that its CRC-32s
-    miss.
+    Then the closed partial file is hashed (see
+    `waveform_compression_tools.content_hash`), with or without the check, and only
+    then is it renamed to `dst`, so a file that can't be hashed leaves nothing there. A
+    file that passes the check passes `verify_file`, unless it was changed after it was
+    judged in a way that its CRC-32s miss.
 
     Parameters
     ----------
@@ -818,8 +919,9 @@ def compress_file(
     -------
     CompressResult
         The sizes of both files, the numbers of traces and of real stations, the
-        setting, the largest error the check found, and the wall and CPU time spent
-        reading, encoding, writing and checking.
+        setting, the largest error the check found, the compressed file's content
+        hash, and the wall time spent reading, encoding, writing, checking and hashing,
+        and the CPU time of the first four.
 
     Raises
     ------
@@ -836,9 +938,11 @@ def compress_file(
     ValueError
         If `bits` is outside 8 to 32, which is checked first, or if `block_stations`
         is less than 1.
+    FileNotFoundError
+        As `check_compressible` raises it, before any sample is read.
     OSError
         If `src` can't be read, naming it, or the compressed file can't be written, as
-        on a full disk, naming `dst`.
+        on a full disk, or read back to be hashed, naming `dst`.
     pyflac.EncoderInitException
         If libFLAC can't start a trace's stream.
     pyflac.EncoderProcessException
@@ -847,132 +951,149 @@ def compress_file(
     full_scale(bits)  # Refuses a setting outside 8 to 32 before the file is opened.
     src, dst = Path(src), Path(dst)
     stopwatch = _Stopwatch()
-    check_compressible(src, dst, overwrite)
-    with writing(dst) as partial, xr.open_dataset(src, engine="h5netcdf") as ds:
-        exact = _real_stations(ds)
-        waveform = ds["waveform"]
-        n_component, n_station, nt = waveform.shape
-        blocks = _station_blocks(waveform, block_stations)
-        waveform_encoding = _encoding_json(waveform.encoding)
-        attrs: dict[str, object] = {
-            "format_version": _FORMAT_VERSION,
-            "dims": list(STANDARD_DIMS),
-            "dtype": "float32",
-            "waveform_attrs": _attrs_json(waveform.attrs),
-            "waveform_encoding": waveform_encoding,
-            "waveform_attr_types": json.dumps(_attr_types(waveform.attrs)),
-            "bits": bits,
-            "encoder": ENCODER,
-            "exact_rule": REAL_STATION_RULE,
-        }
-        # Each is one value, if it is there (see check_compressible).
-        fills = [
-            float(v)
-            for v in map(waveform.encoding.get, ("_FillValue", "missing_value"))
-            if v is not None and np.isfinite(v)
-        ]
-        stopwatch.lap("read")
-        # An OSError as the file is written names dst, and one as src is read, src. The
-        # file is written through out, which never tells HDF5 that a write failed.
-        with naming(dst), HDF5Output(partial) as out:
-            rest = ds.drop_vars("waveform")
-            # A dimension that only the waveform had, as time is in a file without a
-            # time coordinate, is gone, so it can't be declared unlimited any more.
-            unlimited = ds.encoding.get("unlimited_dims", ())
-            rest.to_netcdf(
-                out,
-                engine="h5netcdf",
-                unlimited_dims=[name for name in unlimited if name in rest.dims],
-            )
-            out.raise_pending()
-            with h5py.File(out, "r+") as f:
-                group = f.create_group(GROUP)
-                chunk = min(_CHUNK_BYTES, max(1, 4 * n_component * n_station * nt))
-                compressed = group.create_dataset(
-                    "compressed",
-                    shape=(0,),
-                    maxshape=(None,),
-                    dtype=np.uint8,
-                    chunks=(chunk,),
+    _refuse_file(src, dst, overwrite)
+    with xr.open_dataset(src, engine="h5netcdf") as ds:
+        exact = _check_dataset(src, ds)
+        require_folder(dst)
+        with writing(dst) as partial:
+            waveform = ds["waveform"]
+            n_component, n_station, nt = waveform.shape
+            chunks = waveform.encoding.get("chunksizes")
+            blocks = _station_blocks(waveform.shape, chunks, block_stations)
+            waveform_encoding = _encoding_json(waveform.encoding)
+            attrs: dict[str, object] = {
+                "format_version": _FORMAT_VERSION,
+                "dims": list(STANDARD_DIMS),
+                "dtype": "float32",
+                "waveform_attrs": _attrs_json(waveform.attrs),
+                "waveform_encoding": waveform_encoding,
+                "waveform_attr_types": json.dumps(_attr_types(waveform.attrs)),
+                "bits": bits,
+                "encoder": ENCODER,
+                "exact_rule": REAL_STATION_RULE,
+            }
+            # Each is one value, if it is there (see check_compressible).
+            fills = [
+                float(v)
+                for v in map(waveform.encoding.get, ("_FillValue", "missing_value"))
+                if v is not None and np.isfinite(v)
+            ]
+            # An OSError as src is read names src, and one as the file is written, dst.
+            # Everything but the waveform is small, and is read once, here.
+            with naming(src):
+                rest = ds.drop_vars("waveform").load()
+            stopwatch.lap("read")
+            # The file is written through out, which never tells HDF5 that a write
+            # failed.
+            with naming(dst), HDF5Output(partial) as out:
+                # A dimension that only the waveform had, as time is in a file without a
+                # time coordinate, is gone, so it can't be declared unlimited any more.
+                unlimited = ds.encoding.get("unlimited_dims", ())
+                rest.to_netcdf(
+                    out,
+                    engine="h5netcdf",
+                    unlimited_dims=[name for name in unlimited if name in rest.dims],
                 )
-                exact_waveform = group.create_dataset(
-                    "exact_waveform",
-                    shape=(n_component, exact.size, nt),
-                    dtype=np.float32,
-                )
-                traces = (n_component, n_station)
-                starts, nbytes = np.zeros(traces, np.int64), np.zeros(traces, np.int64)
-                gains, offsets = np.zeros(traces), np.zeros(traces)
-                # The file as a reader sees it, each block as soon as it is written.
-                written = _Streams(
-                    compressed=compressed,
-                    starts=starts,
-                    nbytes=nbytes,
-                    gains=gains,
-                    offsets=offsets,
-                    nt=nt,
-                    bits=bits,
-                    waveform_attrs=dict(waveform.attrs),
-                    encoding=_encoding_back(waveform_encoding),
-                    exact_stations=exact,
-                    exact_waveform=exact_waveform,
-                )
-                stream_crcs = np.zeros(traces, np.uint32)
-                exact_crcs = np.zeros((n_component, exact.size), np.uint32)
-                worst = 0.0
-                stopwatch.lap("write")
-                for s0, s1 in blocks:
-                    with naming(src):
-                        block = waveform[:, s0:s1, :].values
-                    stopwatch.lap("read")
-                    _refuse_fill_in_range(block, fills, bits, str(src))
-                    encoded = encode_block(block, bits, level)
-                    stopwatch.lap("encode")
-                    # The block's streams go after those already written, in the
-                    # order encode_block gives them.
-                    end = compressed.shape[0]
-                    sizes = encoded.nbytes.ravel()
-                    block_starts = end + np.cumsum(sizes) - sizes
-                    starts[:, s0:s1] = block_starts.reshape(encoded.nbytes.shape)
-                    nbytes[:, s0:s1] = encoded.nbytes
-                    gains[:, s0:s1] = encoded.gains
-                    compressed.resize((end + int(sizes.sum()),))
-                    compressed[end:] = np.frombuffer(
-                        b"".join(encoded.streams), dtype=np.uint8
+                out.raise_pending()
+                with h5py.File(out, "r+") as f:
+                    group = f.create_group(GROUP)
+                    chunk = min(_CHUNK_BYTES, max(1, 4 * n_component * n_station * nt))
+                    compressed = group.create_dataset(
+                        "compressed",
+                        shape=(0,),
+                        maxshape=(None,),
+                        dtype=np.uint8,
+                        chunks=(chunk,),
                     )
-                    # The streams are in the file now, and the check reads them back.
-                    del encoded
-                    here = _in_block(exact, s0, s1)
-                    exact_waveform[:, here] = block[:, exact[here] - s0]
-                    # A write that failed, or a Ctrl-C, stops the run here, before what
-                    # HDF5 writes from then on, held in memory, adds up.
-                    out.raise_pending()
+                    exact_waveform = group.create_dataset(
+                        "exact_waveform",
+                        shape=(n_component, exact.size, nt),
+                        dtype=np.float32,
+                    )
+                    traces = (n_component, n_station)
+                    starts, nbytes = (
+                        np.zeros(traces, np.int64),
+                        np.zeros(traces, np.int64),
+                    )
+                    gains, offsets = np.zeros(traces), np.zeros(traces)
+                    # The file as a reader sees it, each block as soon as it is written.
+                    written = _Streams(
+                        compressed=compressed,
+                        starts=starts,
+                        nbytes=nbytes,
+                        gains=gains,
+                        offsets=offsets,
+                        nt=nt,
+                        bits=bits,
+                        waveform_attrs=dict(waveform.attrs),
+                        encoding=_encoding_back(waveform_encoding),
+                        exact_stations=exact,
+                        exact_waveform=exact_waveform,
+                    )
+                    stream_crcs = np.zeros(traces, np.uint32)
+                    exact_crcs = np.zeros((n_component, exact.size), np.uint32)
+                    worst = 0.0
                     stopwatch.lap("write")
-                    if check:
-                        error, stream_crcs[:, s0:s1], exact_crcs[:, here] = (
-                            _check_block(written, block, s0, s1, dst)
+                    for s0, s1 in blocks:
+                        with naming(src):
+                            block = waveform[:, s0:s1, :].values
+                        stopwatch.lap("read")
+                        _refuse_fill_in_range(block, fills, bits, src)
+                        encoded = encode_block(block, bits, level)
+                        stopwatch.lap("encode")
+                        # The block's streams go after those already written, in the
+                        # order encode_block gives them.
+                        end = compressed.shape[0]
+                        sizes = encoded.nbytes.ravel()
+                        block_starts = end + np.cumsum(sizes) - sizes
+                        starts[:, s0:s1] = block_starts.reshape(encoded.nbytes.shape)
+                        nbytes[:, s0:s1] = encoded.nbytes
+                        gains[:, s0:s1] = encoded.gains
+                        compressed.resize((end + int(sizes.sum()),))
+                        compressed[end:] = np.concatenate(
+                            [
+                                np.frombuffer(stream, np.uint8)
+                                for stream in encoded.streams
+                            ]
                         )
-                        worst = max(worst, error)
-                        stopwatch.lap("check")
-                    # pyflac's encoders keep their output in reference cycles, which
-                    # would otherwise wait for the next collection and add up.
-                    gc.collect()
-                datasets = {
-                    "stream_starts": starts,
-                    "stream_bytes": nbytes,
-                    "stream_gains": gains,
-                    "stream_offsets": offsets,
-                    "exact_stations": exact,
-                }
-                for name, data in datasets.items():
-                    group.create_dataset(name, data=data)
-                group["stream_starts"].attrs["stream_size"] = nt
-                group.attrs.update(attrs)
-        stopwatch.lap("write")
-        if check:
-            record = _Record(datasets, attrs, nt, stream_crcs, exact_crcs, blocks)
-            _check_reopened(partial, ds, exact, record, dst)
-            stopwatch.lap("check")
+                        # The streams are in the file now, and the check reads them back.
+                        del encoded
+                        here, local = _in_block(exact, s0, s1)
+                        exact_waveform[:, here] = block[:, local]
+                        # A write that failed, or a Ctrl-C, stops the run here, before what
+                        # HDF5 writes from then on, held in memory, adds up.
+                        out.raise_pending()
+                        stopwatch.lap("write")
+                        if check:
+                            error, stream_crcs[:, s0:s1], exact_crcs[:, here] = (
+                                _check_block(written, block, s0, s1, dst)
+                            )
+                            worst = max(worst, error)
+                            stopwatch.lap("check")
+                        # pyflac's encoders keep their output in reference cycles, which
+                        # would otherwise wait for the next collection and add up.
+                        gc.collect()
+                    datasets = {
+                        "stream_starts": starts,
+                        "stream_bytes": nbytes,
+                        "stream_gains": gains,
+                        "stream_offsets": offsets,
+                        "exact_stations": exact,
+                    }
+                    for name, data in datasets.items():
+                        group.create_dataset(name, data=data)
+                    group["stream_starts"].attrs["stream_size"] = nt
+                    group.attrs.update(attrs)
+            stopwatch.lap("write")
+            if check:
+                record = _Record(datasets, attrs, nt, stream_crcs, exact_crcs, blocks)
+                with naming(dst):
+                    _check_reopened(partial, rest, waveform, record, dst)
+                stopwatch.lap("check")
+            # Before the rename, so that a file that can't be read back isn't put there.
+            with naming(dst):
+                output_hash = content_hash(partial)
+            stopwatch.lap("hash")
     stopwatch.lap("write")  # The rename.
     return CompressResult(
         bytes_in=src.stat().st_size,
@@ -980,12 +1101,13 @@ def compress_file(
         n_traces=n_component * n_station,
         n_exact=int(exact.size),
         bits=bits,
-        checked=check,
         max_relative_error=worst if check else None,
+        output_hash=output_hash,
         read_s=stopwatch.seconds["read"],
         encode_s=stopwatch.seconds["encode"],
         write_s=stopwatch.seconds["write"],
         check_s=stopwatch.seconds["check"],
+        hash_s=stopwatch.seconds["hash"],
         read_cpu_s=stopwatch.cpu_seconds["read"],
         encode_cpu_s=stopwatch.cpu_seconds["encode"],
         write_cpu_s=stopwatch.cpu_seconds["write"],
@@ -1019,9 +1141,7 @@ class _Streams:
     waveform_attrs : dict
         The original waveform's attributes, each numpy value in its own type.
     encoding : dict
-        The waveform's ``_FillValue`` and ``missing_value`` to put back. A file
-        without ``waveform_encoding`` gets what such files always decoded to, a NaN
-        ``_FillValue``.
+        The waveform's ``_FillValue`` and ``missing_value`` to put back.
     exact_stations : np.ndarray
         The real stations, in increasing order.
     exact_waveform : h5py.Dataset
@@ -1111,8 +1231,7 @@ class _Streams:
         np.ndarray
             The stations whose traces were put back, counted from `s0`.
         """
-        here = _in_block(self.exact_stations, s0, s1)
-        stations = self.exact_stations[here] - s0
+        here, stations = _in_block(self.exact_stations, s0, s1)
         block[:, stations] = self.exact_waveform[:, here]
         return stations
 
@@ -1166,18 +1285,23 @@ def _open_streams(f: h5py.File, path: Path) -> _Streams:
     """
     group = _compressed_group(f)
     if group is None:
-        raise NotCompressed(f"{path} has no group {GROUP}, so it is not compressed")
+        raise NotCompressed(
+            f"{path} has no group {GROUP}, so it is not compressed", path
+        )
     version = int(group.attrs["format_version"])
     if version != _FORMAT_VERSION:
         raise UnknownFormat(
             f"{path} is in format version {version}, "
-            f"and only version {_FORMAT_VERSION} can be read"
+            f"and only version {_FORMAT_VERSION} can be read",
+            path,
         )
     bits = int(group.attrs["bits"])
     try:
         full_scale(bits)
     except ValueError as e:
-        raise UnknownFormat(f"{path} has a setting that can't be read: {e}") from e
+        raise UnknownFormat(
+            f"{path} has a setting that can't be read: {e}", path
+        ) from e
     starts = group["stream_starts"][...]
     # A block reads only its own stations, so it would never see a value too many.
     for name in ("stream_bytes", "stream_gains", "stream_offsets"):
@@ -1208,7 +1332,7 @@ def _open_streams(f: h5py.File, path: Path) -> _Streams:
             f"{exact_waveform.shape}, not float32 of shape {shape}"
         )
     waveform_attrs = json.loads(group.attrs["waveform_attrs"])
-    for name, dtype in json.loads(group.attrs.get("waveform_attr_types", "{}")).items():
+    for name, dtype in json.loads(group.attrs["waveform_attr_types"]).items():
         if name not in waveform_attrs:
             raise ValueError(
                 f"{path}: waveform_attr_types names the attribute {name!r}, which "
@@ -1220,7 +1344,6 @@ def _open_streams(f: h5py.File, path: Path) -> _Streams:
             if isinstance(value, list)
             else np.dtype(dtype).type(value)
         )
-    encoding = group.attrs.get("waveform_encoding", '{"_FillValue": "NaN"}')
     return _Streams(
         compressed=group["compressed"],
         starts=starts,
@@ -1230,14 +1353,19 @@ def _open_streams(f: h5py.File, path: Path) -> _Streams:
         nt=nt,
         bits=bits,
         waveform_attrs=waveform_attrs,
-        encoding=_encoding_back(encoding),
+        encoding=_encoding_back(group.attrs["waveform_encoding"]),
         exact_stations=exact_stations,
         exact_waveform=exact_waveform,
     )
 
 
 def _same_besides_samples(
-    original: xr.Dataset, real: np.ndarray, rest: xr.Dataset, streams: _Streams
+    original_rest: xr.Dataset,
+    waveform: xr.DataArray,
+    real: np.ndarray,
+    rest: xr.Dataset,
+    streams: _Streams,
+    path: Path | None = None,
 ) -> bool:
     """Say whether a compressed file holds all of its original but the waveform's samples.
 
@@ -1250,8 +1378,10 @@ def _same_besides_samples(
 
     Parameters
     ----------
-    original : xr.Dataset
-        The original, open, in the standard layout.
+    original_rest : xr.Dataset
+        The original, in the standard layout, without its waveform.
+    waveform : xr.DataArray
+        The original's waveform, for its attributes and encoding.
     real : np.ndarray
         The original's real stations, in increasing order.
     rest : xr.Dataset
@@ -1259,24 +1389,30 @@ def _same_besides_samples(
     streams : _Streams
         The compressed file's streams, with the waveform's attributes and encoding as a
         reader gets them.
+    path : Path, optional
+        The original, which a refusal of its fill values names as its ``filename``.
 
     Returns
     -------
     bool
         Whether the file agrees with the original in all of these.
+
+    Raises
+    ------
+    NotStandardLayout
+        If the original's ``_FillValue`` or ``missing_value`` is of a type JSON can't
+        hold, so it can't be compared.
     """
-    waveform = original["waveform"]
     # `identical` compares attribute values and not their types, so the types and the
     # encoding are compared on their own.
     same_attrs = xr.Dataset(attrs=dict(waveform.attrs)).identical(
         xr.Dataset(attrs=streams.waveform_attrs)
     ) and _written_dtypes(waveform.attrs) == _written_dtypes(streams.waveform_attrs)
-    # The encoding as JSON, so a NaN fill value equals a NaN one.
-    same_encoding = json.loads(_encoding_json(waveform.encoding)) == json.loads(
-        _encoding_json(streams.encoding)
+    same_encoding = _comparable_fills(waveform.encoding, path) == _comparable_fills(
+        streams.encoding
     )
     return (
-        original.drop_vars("waveform").identical(rest)
+        original_rest.identical(rest)
         and same_attrs
         and same_encoding
         and np.array_equal(streams.exact_stations, real)
@@ -1340,7 +1476,7 @@ def _compare_block(
     put_back = streams.put_back_exact(decoded, s0, s1)
     # The error reported is of the file as it decompresses.
     error[:, put_back] = max_relative_error(block[:, put_back], decoded[:, put_back])
-    here = real[_in_block(real, s0, s1)] - s0  # Counted from the block's first.
+    _, here = _in_block(real, s0, s1)
     passed = passed and np.array_equal(
         block[:, here].view(np.uint32), decoded[:, here].view(np.uint32)
     )
@@ -1441,17 +1577,18 @@ def _check_block(
         pyflac.DecoderProcessException,
     ) as e:
         raise CheckFailed(
-            f"{path}: stations {s0} to {s1 - 1} don't decode ({e})"
+            f"{path}: stations {s0} to {s1 - 1} don't decode ({e})", path
         ) from e
     real = streams.exact_stations
     error, passed = _compare_block(streams, block, decoded, real, s0, s1)
     if not passed:
         raise CheckFailed(
             f"{path}: stations {s0} to {s1 - 1} don't come back as they should at "
-            f"{streams.bits} bits"
+            f"{streams.bits} bits",
+            path,
         )
     data, starts = read
-    copies = real[_in_block(real, s0, s1)] - s0  # Counted from the block's first.
+    _, copies = _in_block(real, s0, s1)
     stream_crcs = _stream_crcs(data, starts, streams.nbytes[:, s0:s1])
     return error, stream_crcs, _trace_crcs(decoded[:, copies])
 
@@ -1489,8 +1626,8 @@ class _Record:
 
 def _check_reopened(
     partial: Path,
-    original: xr.Dataset,
-    real: np.ndarray,
+    original_rest: xr.Dataset,
+    waveform: xr.DataArray,
     record: _Record,
     path: Path,
 ) -> None:
@@ -1507,18 +1644,18 @@ def _check_reopened(
     - read back a block at a time, every stream and every exact copy has the CRC-32 of
       the bytes judged during the pass, so the file holds what was judged.
 
-    Then it is compared with the original, still open, in everything but the
-    waveform's samples, as `verify_file` compares them (see `_same_besides_samples`).
-    The original's samples aren't read again.
+    Then it is compared with the original in everything but the waveform's samples, as
+    `verify_file` compares them (see `_same_besides_samples`). The original isn't read
+    again.
 
     Parameters
     ----------
     partial : Path
         The compressed file, closed since it was written, under its partial name.
-    original : xr.Dataset
-        The original, open.
-    real : np.ndarray
-        The original's real stations, in increasing order.
+    original_rest : xr.Dataset
+        The original without its waveform, as it was read.
+    waveform : xr.DataArray
+        The original's waveform, for its attributes and encoding.
     record : _Record
         What the pass wrote, and the CRC-32s of what it judged.
     path : Path
@@ -1530,57 +1667,67 @@ def _check_reopened(
         If the file differs from the record or from the original in any of these.
     """
     datasets, nt = record.datasets, record.nt
-    n_component = datasets["stream_starts"].shape[0]
-    n_exact = datasets["exact_stations"].size
     shapes = {
         "compressed": (np.dtype(np.uint8), (int(datasets["stream_bytes"].sum()),)),
-        "exact_waveform": (np.dtype(np.float32), (n_component, n_exact, nt)),
     }
     with h5py.File(partial, "r") as f:
         group = _compressed_group(f)
-        if group is None or set(group) != {*datasets, *shapes}:
-            raise CheckFailed(f"{path} doesn't hold the datasets that were written")
+        if group is None or set(group) != {*datasets, *shapes, "exact_waveform"}:
+            raise CheckFailed(
+                f"{path} doesn't hold the datasets that were written", path
+            )
         if set(group.attrs) != set(record.attrs) or not all(
             np.array_equal(group.attrs[name], value)
             for name, value in record.attrs.items()
         ):
             raise CheckFailed(
-                f"{path}: the attributes of {GROUP} differ from those written"
+                f"{path}: the attributes of {GROUP} differ from those written", path
             )
         for name, data in datasets.items():
             if group[name].dtype != data.dtype or not np.array_equal(
                 group[name][...], data
             ):
-                raise CheckFailed(f"{path}: {name} differs from what was written")
+                raise CheckFailed(f"{path}: {name} differs from what was written", path)
         for name, (dtype, shape) in shapes.items():
             if (group[name].dtype, group[name].shape) != (dtype, shape):
                 raise CheckFailed(
                     f"{path}: {name} is {group[name].dtype} of shape "
-                    f"{group[name].shape}, not {dtype} of shape {shape}"
+                    f"{group[name].shape}, not {dtype} of shape {shape}",
+                    path,
                 )
         if dict(group["stream_starts"].attrs) != {"stream_size": nt}:
-            raise CheckFailed(f"{path}: stream_size isn't {nt}, the samples in a trace")
-        # As written, so it opens as a reader opens it.
-        streams = _open_streams(f, path)
+            raise CheckFailed(
+                f"{path}: stream_size isn't {nt}, the samples in a trace", path
+            )
+        # As written, so it opens as a reader opens it. That checks exact_waveform's
+        # type and shape.
+        try:
+            streams = _open_streams(f, path)
+        except ValueError as e:
+            raise CheckFailed(str(e), path) from e
         for s0, s1 in record.blocks:
             data, starts = streams.read(s0, s1)
             crcs = _stream_crcs(data, starts, streams.nbytes[:, s0:s1])
             if not np.array_equal(crcs, record.stream_crcs[:, s0:s1]):
                 raise CheckFailed(
                     f"{path}: a stream of stations {s0} to {s1 - 1} differs from the "
-                    "one checked"
+                    "one checked",
+                    path,
                 )
-            here = _in_block(streams.exact_stations, s0, s1)
+            here, _ = _in_block(streams.exact_stations, s0, s1)
             crcs = _trace_crcs(streams.exact_waveform[:, here])
             if not np.array_equal(crcs, record.exact_crcs[:, here]):
                 raise CheckFailed(
                     f"{path}: an exact copy of stations {s0} to {s1 - 1} differs from "
-                    "the one checked"
+                    "the one checked",
+                    path,
                 )
+        real = datasets["exact_stations"]
         with xr.open_dataset(partial, engine="h5netcdf") as rest:
-            if not _same_besides_samples(original, real, rest, streams):
+            if not _same_besides_samples(original_rest, waveform, real, rest, streams):
                 raise CheckFailed(
-                    f"{path} differs from the original besides the waveform's samples"
+                    f"{path} differs from the original besides the waveform's samples",
+                    path,
                 )
 
 
@@ -1623,9 +1770,9 @@ def decompress_file(path: str | os.PathLike[str]) -> xr.Dataset:
     with h5py.File(path, "r") as f:
         streams = _open_streams(f, path)
         n_component, n_station = streams.starts.shape
-        waveform = np.empty((n_component, n_station, streams.nt), np.float32)
-        block_stations = block_stations_for(n_component, streams.nt, None, BLOCK_BYTES)
-        for s0, s1 in _blocks(n_station, block_stations):
+        shape = (n_component, n_station, streams.nt)
+        waveform = np.empty(shape, np.float32)
+        for s0, s1 in _station_blocks(shape, None):
             # Straight into place, so no block is kept while the next is decoded.
             waveform[:, s0:s1] = streams.decode(s0, s1)
             streams.put_back_exact(waveform[:, s0:s1], s0, s1)
@@ -1633,6 +1780,46 @@ def decompress_file(path: str | os.PathLike[str]) -> xr.Dataset:
     ds["waveform"] = (STANDARD_DIMS, waveform, streams.waveform_attrs)
     ds["waveform"].encoding.update(streams.encoding)
     return ds
+
+
+def decompress_to(
+    src: str | os.PathLike[str], dst: str | os.PathLike[str], overwrite: bool = False
+) -> None:
+    """Decompress a file written by `compress_file` to a netCDF file.
+
+    The destination is checked first (see
+    `waveform_compression_tools.destinations.refuse_overwriting`), and its folder. The
+    dataset that `decompress_file` gives is then written by xarray with the h5netcdf
+    engine to `dst` with ``.partial`` added, and renamed to `dst` when it is complete
+    (see `waveform_compression_tools.destinations.write_netcdf`). If anything goes
+    wrong, the partial file is deleted and the exception raised again; a file already
+    at `dst` is then as it was. As in `decompress_file`, the whole waveform is decoded
+    into memory.
+
+    Parameters
+    ----------
+    src : str or os.PathLike
+        The compressed file.
+    dst : str or os.PathLike
+        Where to write the netCDF file.
+    overwrite : bool, default False
+        Whether to replace a file already at `dst`. `src` itself is never replaced.
+
+    Raises
+    ------
+    SameFile
+        If `dst`, or `dst` with ``.partial`` added, is `src`, whatever `overwrite`
+        says. Nothing is written.
+    OutputExists
+        If a file is at `dst` already and `overwrite` is false. Nothing is written.
+    FileNotFoundError
+        If there is no folder to write `dst` in, before `src` is read.
+    NotCompressed, UnknownFormat
+        As `decompress_file` raises them. Nothing is written.
+    """
+    refuse_overwriting(dst, src, overwrite=overwrite)
+    require_folder(dst)
+    write_netcdf(decompress_file(src), dst)
 
 
 def verify_file(
@@ -1706,8 +1893,8 @@ def verify_file(
         xr.open_dataset(compressed, engine="h5netcdf") as rest,
         h5py.File(compressed, "r") as f,
     ):
-        check_standard(ds)
-        real = _real_stations(ds)
+        check_standard(ds, original)
+        real = _real_stations(ds, original)
         waveform = ds["waveform"]
         streams = _open_streams(f, compressed)
         shape = (*streams.starts.shape, streams.nt)
@@ -1716,8 +1903,11 @@ def verify_file(
                 f"{compressed} decodes to a waveform of shape {shape}, but the "
                 f"original {original} holds one of shape {waveform.shape}"
             )
-        passed = _same_besides_samples(ds, real, rest, streams)
-        for s0, s1 in _station_blocks(waveform, block_stations):
+        passed = _same_besides_samples(
+            ds.drop_vars("waveform"), waveform, real, rest, streams, original
+        )
+        chunks = waveform.encoding.get("chunksizes")
+        for s0, s1 in _station_blocks(waveform.shape, chunks, block_stations):
             block = waveform[:, s0:s1, :].values
             decoded = streams.decode(s0, s1)
             error, block_passed = _compare_block(streams, block, decoded, real, s0, s1)

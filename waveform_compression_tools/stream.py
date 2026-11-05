@@ -80,10 +80,11 @@ def encode_stream(q: np.ndarray, level: int = 5, blocksize: int = 4096) -> bytes
 
 # The decoder below depends on pyflac 3.0.0's internals, not on its public API: the
 # base class pyflac.decoder._Decoder, the cffi objects pyflac.decoder._lib and _ffi,
-# and the attributes that pyflac's read callback expects a decoder to have (_buffer,
-# _done, _event and _lock). Any new pyflac release can change them without notice,
-# which is why the package pins pyflac==3.0.0. Run the tests again before moving the
-# pin.
+# the attributes that pyflac's read callback expects a decoder to have (_buffer,
+# _done, _event and _lock), and its write callback's handing over each frame as a new
+# array of its own (from np.column_stack). Any new pyflac release can change them
+# without notice, which is why the package pins pyflac==3.0.0. Run the tests again
+# before moving the pin.
 
 
 class _EndWhenEmpty:
@@ -191,13 +192,14 @@ class _WholeStreamDecoder(pyflac_decoder._Decoder):
     def write_callback(
         self, data: np.ndarray, sample_rate: int, channels: int, blocksize: int
     ) -> None:
-        """Keep a copy of a decoded frame; pyflac's write callback calls this.
+        """Keep a decoded frame; pyflac's write callback calls this.
 
         Parameters
         ----------
         data : np.ndarray
-            The frame's samples, of shape (block size, channels). The array may
-            not be ours to keep, so a copy is stored.
+            The frame's samples, of shape (block size, channels). pyflac 3.0.0 makes
+            a new array for each frame, with np.column_stack, which nothing else
+            holds, so it is kept as it is.
         sample_rate : int
             The stream's sample-rate field. Ignored.
         channels : int
@@ -205,7 +207,7 @@ class _WholeStreamDecoder(pyflac_decoder._Decoder):
         blocksize : int
             The number of samples in the frame. Ignored.
         """
-        self.frames.append(np.array(data, copy=True))
+        self.frames.append(data)
 
 
 def decode_stream(blob: bytes) -> np.ndarray:

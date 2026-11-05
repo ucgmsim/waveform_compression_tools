@@ -14,6 +14,7 @@ from waveform_compression_tools.codec import (
     encode_block,
     within_one_step,
 )
+from waveform_compression_tools.content_hash import content_hash
 from waveform_compression_tools.errors import (
     AllStationsReal,
     AlreadyCompressed,
@@ -35,20 +36,14 @@ from waveform_compression_tools.files import (
 from waveform_compression_tools.quantise import full_scale, quantise
 from waveform_compression_tools.stream import encode_stream
 
-from helpers import StandardDataset, partial_of, write
-
-
-def nothing_left(dst: Path) -> bool:
-    # Neither the output nor its partial file is there.
-    return not dst.exists() and not partial_of(dst).exists()
-
-
-def contents(folder: Path) -> dict[str, bytes | Path]:
-    # Each file in a folder, by name: a file's bytes, and where a link points.
-    return {
-        path.name: path.readlink() if path.is_symlink() else path.read_bytes()
-        for path in folder.iterdir()
-    }
+from helpers import (
+    StandardDataset,
+    contents,
+    nothing_left,
+    refused_input,
+    with_a_flipped_byte,
+    write,
+)
 
 
 def test_compress_checks_and_reports(
@@ -56,7 +51,8 @@ def test_compress_checks_and_reports(
 ) -> None:
     src = write(standard_dataset(5, nt=500, real=(1,)), tmp_path / "in.nc")
     res = compress_file(src, tmp_path / "out.nc", bits=24)
-    assert res.checked
+    # The output's content hash, taken before it was renamed into place.
+    assert res.output_hash == content_hash(tmp_path / "out.nc") and res.hash_s > 0
     error = res.max_relative_error
     assert error is not None and 0 < error <= (1 + STEP_SLACK) / full_scale(24)
     # The error of the file as it decompresses, which verify reports too: the real
@@ -64,7 +60,7 @@ def test_compress_checks_and_reports(
     assert error == verify_file(src, tmp_path / "out.nc").max_relative_error
     assert res.check_s > 0 and res.check_cpu_s > 0
     unchecked = compress_file(src, tmp_path / "unchecked.nc", bits=24, check=False)
-    assert (unchecked.checked, unchecked.max_relative_error) == (False, None)
+    assert unchecked.max_relative_error is None
     assert (unchecked.check_s, unchecked.check_cpu_s) == (0.0, 0.0)
     # Every station but the real one holds zeros, which come back exactly, so the error
     # is 0, though the real station's own streams are lossy: its exact copy is what
@@ -100,15 +96,13 @@ def test_a_corrupted_stream_fails_the_check_and_leaves_nothing(
 ) -> None:
     def encode_then_damage(waveform: np.ndarray, bits: int, level: int) -> EncodedBlock:
         encoded = encode_block(waveform, bits, level)
+        if damage == "a flipped byte":
+            return with_a_flipped_byte(encoded)
         streams, nbytes = list(encoded.streams), encoded.nbytes.copy()
         # Component 1 of station 2, in encode_block's (component, station) order.
         c, s = 1, 2
         k = c * waveform.shape[1] + s
-        if damage == "a flipped byte":
-            stream = bytearray(streams[k])
-            stream[len(stream) // 2] ^= 0xFF
-            streams[k] = bytes(stream)
-        elif damage == "a cut between frames":
+        if damage == "a cut between frames":
             # The trace's first frame of 4,096 samples, as a stream of its own.
             q = quantise(waveform[c, s, :4096], encoded.gains[c, s])
             streams[k] = encode_stream(q, level)
@@ -305,8 +299,9 @@ def test_damage_after_the_pass_fails_the_structure_check(
     assert contents(tmp_path) == before
 
 
-# Each refusal: what it raises, whether check_compressible finds it before any sample is
-# read, and what its message says. The others need the samples, so the pass finds them.
+# Each refusal, as helpers.refused_input writes it: what it raises, whether
+# check_compressible finds it before any sample is read, and what its message says. The
+# others need the samples, so the pass finds them.
 REFUSALS = {
     "the same path": (SameFile, True, "overwrite"),
     "a link to it": (SameFile, True, "overwrite"),
@@ -315,6 +310,7 @@ REFUSALS = {
     "a hard link to it at its partial": (SameFile, True, "overwrite"),
     "the output exists": (OutputExists, True, "exists"),
     "a broken link at the output": (OutputExists, True, "exists"),
+    "a text file": (NotStandardLayout, True, "isn't an HDF5 file"),
     "already compressed": (AlreadyCompressed, True, "compressed already"),
     "an HDF5 group": (HasGroups, True, "provenance"),
     "a float64 waveform": (NotStandardLayout, True, "float32"),
@@ -335,92 +331,11 @@ REFUSALS = {
     "a fill value inside the data": (NotStandardLayout, False, "fill value"),
     "a missing_value inside the data": (NotStandardLayout, False, "fill value"),
 }
-NON_FINITE = {"a NaN": np.nan, "an infinity": np.inf, "a negative infinity": -np.inf}
 # xarray warns as it opens a waveform with several fill values, which it reads as
 # missing, before the refusal.
 SEVERAL_FILL_VALUES = pytest.mark.filterwarnings(
     "ignore:variable 'waveform' has multiple fill values:xarray.SerializationWarning"
 )
-
-
-def refused_input(
-    case: str, folder: Path, standard_dataset: StandardDataset
-) -> tuple[Path, Path, bool]:
-    # Writes the input for a case, and an earlier file at the destination unless that is
-    # the input. Returns the input, the destination, and whether to ask for overwriting.
-    # Every case asks, so that the earlier file is seen to stay, but three: the two that
-    # don't ask, so something at the destination is refused, and "the same path", which
-    # is the same file though a file is there.
-    src, dst = folder / "in.nc", folder / "out.nc"
-    ds = standard_dataset(3, nt=100)
-    if case == "its own partial":
-        src = partial_of(dst)
-    elif case == "every station real":
-        ds = standard_dataset(3, nt=100, real=(0, 1, 2))
-    elif case == "no stations":
-        ds = standard_dataset(0, nt=100)
-    elif case == "a float64 waveform":
-        ds["waveform"] = ds["waveform"].astype(np.float64)
-    elif case == "dimensions in another order":
-        ds["waveform"] = ds["waveform"].transpose("station", "component", "time")
-    elif case == "no waveform":
-        ds = ds.rename_vars(waveform="other")
-    elif case == "no station coordinate":
-        ds = ds.drop_vars("station")
-    elif case == "station names along another dimension":
-        # Names that would make station 1 real, but they aren't the stations' names.
-        names = ("site", ["6c5SYSL", "OPZ", "22008d3"])
-        ds = ds.drop_vars("station").assign_coords(station=names)
-    elif case == "station names of bytes that aren't ASCII":
-        names = np.array(["Ōtaki".encode(), b"S000001", b"S000002"])
-        ds = ds.assign_coords(station=names)
-    elif case in NON_FINITE:
-        # Station 2 is in the second of two blocks, after the first is in the partial
-        # file.
-        ds["waveform"][2, 2, 50] = NON_FINITE[case]
-    elif case == "a fill value inside the data":
-        ds["waveform"].encoding["_FillValue"] = np.float32(0.0)
-    elif case == "a missing_value inside the data":
-        # Without a _FillValue, so that only the missing_value is inside the data.
-        ds["waveform"].encoding.update(_FillValue=None, missing_value=np.float32(0.0))
-    write(ds, src)
-    if case == "an HDF5 group":
-        with h5py.File(src, "a") as f:
-            f.create_group("provenance").create_dataset("notes", data=np.arange(3))
-    elif case == "conflicting fill values":
-        # Beside xarray's NaN _FillValue, as another writer might give it. xarray
-        # couldn't write a decompressed file with both.
-        with h5py.File(src, "r+") as f:
-            f["waveform"].attrs["missing_value"] = np.float32(-1e6)
-    elif case == "a vector missing_value":
-        with h5py.File(src, "r+") as f:
-            f["waveform"].attrs["missing_value"] = np.array([-1e6, -2e6], np.float32)
-    elif case == "an attribute JSON can't hold":
-        with h5py.File(src, "r+") as f:
-            f["waveform"].attrs["gain"] = np.complex128(1 + 2j)
-    elif case == "an attribute whose type can't be kept":
-        with h5py.File(src, "r+") as f:
-            pair = np.zeros((), np.dtype([("a", "<i4"), ("b", "<f4")]))
-            f["waveform"].attrs.create("pair", pair)
-    elif case == "already compressed":
-        src = folder / "in.flac.nc"
-        compress_file(folder / "in.nc", src)
-    if case == "the same path":
-        return src, src, False
-    if case == "a link to it":
-        dst.symlink_to(src)
-    elif case == "a hard link to it":
-        # Another name for the input, which no comparison of names can see.
-        dst.hardlink_to(src)
-    elif case == "a hard link to it at its partial":
-        dst.write_bytes(b"an earlier file")
-        partial_of(dst).hardlink_to(src)
-    elif case == "a broken link at the output":
-        # Nothing to read there, but replacing the link would be overwriting.
-        dst.symlink_to(folder / "missing.nc")
-    else:
-        dst.write_bytes(b"an earlier file")
-    return src, dst, case not in ("the output exists", "a broken link at the output")
 
 
 @pytest.mark.parametrize(
