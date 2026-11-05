@@ -9,6 +9,10 @@ jobs:
   ci:
     uses: ucgmsim/meta-ci-action/.github/workflows/ci.yml@v2
     with:
+      # For the docstring job; the other jobs get their Python from .python-version.
+      python-version: "3.14"
+      # For the test that decodes a compressed file with ffmpeg, as the README does.
+      system-packages: ffmpeg
       exclude-init: false
       enable-coverage: true
       cov-package: waveform_compression_tools

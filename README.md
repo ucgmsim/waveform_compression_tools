@@ -347,6 +347,8 @@ trace = (q.astype(np.float64) / gain + offset).astype(np.float32)
 uv sync --all-extras
 ```
 
+Development and CI use Python 3.14, pinned in `.python-version`. The package itself supports Python 3.11 and newer.
+
 These checks have to pass before a commit:
 
 ```bash
