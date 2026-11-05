@@ -12,6 +12,7 @@ from waveform_compression_tools.codec import (
     check_standard,
     max_relative_error,
 )
+from waveform_compression_tools.destinations import HDF5Output
 from waveform_compression_tools.errors import NotBBBin
 from waveform_compression_tools.files import (
     compress_file,
@@ -234,9 +235,9 @@ def test_failure_mid_write_leaves_nothing(
     make_bbbin(src, nstat=3, nt=7, endian="<")
     dst.write_bytes(b"an earlier conversion")
 
-    def write_some_then_fail(ds: xr.Dataset, path: Path, **kwargs: object) -> None:
-        assert path == partial_of(dst)
-        path.write_bytes(b"half a file")
+    def write_some_then_fail(ds: xr.Dataset, out: HDF5Output, **kwargs: object) -> None:
+        assert Path(out.name) == partial_of(dst)
+        out.write(b"half a file")
         raise error("writing failed")
 
     monkeypatch.setattr(xr.Dataset, "to_netcdf", write_some_then_fail)

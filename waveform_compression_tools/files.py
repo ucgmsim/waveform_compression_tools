@@ -62,7 +62,7 @@ from .codec import (
     max_relative_error,
     within_one_step,
 )
-from .destinations import naming, refuse_overwriting, writing
+from .destinations import HDF5Output, naming, refuse_overwriting, writing
 from .errors import (
     AllStationsReal,
     AlreadyCompressed,
@@ -765,8 +765,9 @@ def compress_file(
     name, and renamed to `dst` when it is complete (see
     `waveform_compression_tools.destinations.writing`). If anything goes wrong, the
     partial file is deleted and the exception raised again, so nothing appears at `dst`,
-    and a file already there stays as it was. An `OSError` while it is written that
-    names no file, as h5py's don't, names `dst`.
+    and a file already there stays as it was. The file is written through a
+    `waveform_compression_tools.destinations.HDF5Output`, so a write that fails, as on
+    a full disk, stops the run at the end of its block with its own error, naming `dst`.
 
     With `check`, the compressed file is checked as it is written, against what was
     read, so the original's samples are read only once:
@@ -835,6 +836,9 @@ def compress_file(
     ValueError
         If `bits` is outside 8 to 32, which is checked first, or if `block_stations`
         is less than 1.
+    OSError
+        If `src` can't be read, naming it, or the compressed file can't be written, as
+        on a full disk, naming `dst`.
     pyflac.EncoderInitException
         If libFLAC can't start a trace's stream.
     pyflac.EncoderProcessException
@@ -868,18 +872,20 @@ def compress_file(
             if v is not None and np.isfinite(v)
         ]
         stopwatch.lap("read")
-        # An OSError as the file is written names dst, and one as src is read, src.
-        with naming(dst):
+        # An OSError as the file is written names dst, and one as src is read, src. The
+        # file is written through out, which never tells HDF5 that a write failed.
+        with naming(dst), HDF5Output(partial) as out:
             rest = ds.drop_vars("waveform")
             # A dimension that only the waveform had, as time is in a file without a
             # time coordinate, is gone, so it can't be declared unlimited any more.
             unlimited = ds.encoding.get("unlimited_dims", ())
             rest.to_netcdf(
-                partial,
+                out,
                 engine="h5netcdf",
                 unlimited_dims=[name for name in unlimited if name in rest.dims],
             )
-            with h5py.File(partial, "a") as f:
+            out.raise_pending()
+            with h5py.File(out, "r+") as f:
                 group = f.create_group(GROUP)
                 chunk = min(_CHUNK_BYTES, max(1, 4 * n_component * n_station * nt))
                 compressed = group.create_dataset(
@@ -938,6 +944,9 @@ def compress_file(
                     del encoded
                     here = _in_block(exact, s0, s1)
                     exact_waveform[:, here] = block[:, exact[here] - s0]
+                    # A write that failed, or a Ctrl-C, stops the run here, before what
+                    # HDF5 writes from then on, held in memory, adds up.
+                    out.raise_pending()
                     stopwatch.lap("write")
                     if check:
                         error, stream_crcs[:, s0:s1], exact_crcs[:, here] = (

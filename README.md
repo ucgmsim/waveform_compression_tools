@@ -189,7 +189,7 @@ Every command exits with one of these statuses. They are published, and are the 
 | Status | Constant | Means |
 |---|---|---|
 | 0 | `EXIT_OK` | The command did its work. For `compress`, the output is in place, and checked unless `--no-check` was given; for `verify`, the file passed. |
-| 1 | `EXIT_FAILED` | The run went wrong: a failed check (`compress`'s own, or a file that doesn't agree with its original in `verify`); a damaged compressed file; a compressed file whose waveform has another shape than its original's; an error from libFLAC; a file that can't be read or written, including a missing, unreadable or cut-short input and a missing destination or record folder; an output that can't be hashed; a record that can't be written; or anything unexpected. |
+| 1 | `EXIT_FAILED` | The run went wrong: a failed check (`compress`'s own, or a file that doesn't agree with its original in `verify`); a damaged compressed file; a compressed file whose waveform has another shape than its original's; an error from libFLAC; a file that can't be read or written, including a missing, unreadable or cut-short input, a missing destination or record folder, and a full disk or quota; an output that can't be hashed; a record that can't be written; or anything unexpected. |
 | 2 | `EXIT_USAGE` | Typer refused the arguments: a missing input, a folder where a file is named, `--bits` outside 8 to 32, `--level` outside 0 to 8, an unknown option, or a `--record` that is SRC or DST, or whose `.partial` is. Typer prints its own message, of a few lines. |
 | 3 | `EXIT_REFUSED` | An input can't be used as it is, or a destination is taken (see below). |
 
@@ -202,7 +202,7 @@ The refusals, by command:
 
 A refusal writes nothing but `compress`'s record, and leaves a file already at the destination as it was. A file that isn't HDF5 at all is refused, while an HDF5 file that is damaged or cut short is a failure: it may be the right kind of file, and the run went wrong.
 
-An interruption (Ctrl-C) is left to Typer, which ends the run with its own status; `compress` writes no record then.
+An interruption (Ctrl-C) is left to Typer, which ends the run with its own status; `compress` writes no record then. While a file is written, a Ctrl-C waits until it is safe to act on, so that HDF5 never takes it for a failed write: for `compress`, until the end of the block of stations, and for `decompress` and `convert-bbbin`, until the file is written, which is then deleted. Pressed again while it waits, Ctrl-C ends the run at once, leaving `DST.partial`.
 
 ### The error line
 
@@ -223,6 +223,7 @@ An unexpected error's reason starts with its type, such as `RuntimeError: …`. 
 ### Destinations, partial files and reruns
 
 - Every command that writes a file writes it to the destination with `.partial` added, and renames it when it is complete, so a file appears at its destination complete or not at all. A run that fails deletes its partial file.
+- A write that fails partway, on a full disk or past a quota, fails the run with the system's reason, naming the output, as `waveform-compression-tools: out.nc: [Errno 28] No space left on device: 'out.nc'`, and `compress` stops at the end of the block of stations it was writing. HDF5 writes each output through a file object that never tells it a write failed, a workaround for an HDF5 bug: its own error would hide the system's, and HDF5 2.0.0 to 2.2.0 can crash Python afterwards.
 - A run that is killed, by a time limit, the out-of-memory killer or SIGKILL, may leave `DST.partial` behind. The next run replaces it, and it is safe to delete.
 - A file already at DST, or at the record's PATH, is replaced only with `--overwrite` (`overwrite=True` in Python).
 - With `--overwrite`, the earlier output stays until the new, checked file is renamed into place. If the run fails after that, while hashing the new file, the new file is deleted too, and nothing is left at DST. The input is untouched, so a rerun makes it again.

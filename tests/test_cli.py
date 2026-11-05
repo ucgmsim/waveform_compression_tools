@@ -34,6 +34,7 @@ from waveform_compression_tools.codec import (
     max_relative_error,
 )
 from waveform_compression_tools.content_hash import content_hash
+from waveform_compression_tools.destinations import HDF5Output
 from waveform_compression_tools.files import (
     GROUP,
     CompressResult,
@@ -45,7 +46,14 @@ from waveform_compression_tools.files import (
 from waveform_compression_tools.quantise import full_scale, quantise
 from waveform_compression_tools.stream import encode_stream
 
-from helpers import StandardDataset, partial_of, write
+from helpers import (
+    StandardDataset,
+    limit_file_sizes,
+    limits_file_sizes,
+    partial_of,
+    run_python,
+    write,
+)
 
 runner = CliRunner()
 
@@ -783,10 +791,10 @@ def test_a_failed_write_leaves_no_partial_file_and_keeps_the_old_one(
     written = []
 
     def write_part_then_fail(
-        self: xr.Dataset, path: Path, *args: object, **kwargs: object
+        self: xr.Dataset, out: HDF5Output, *args: object, **kwargs: object
     ) -> None:
-        written.append(Path(path))
-        Path(path).write_bytes(b"half a file")
+        written.append(Path(out.name))
+        out.write(b"half a file")
         raise error
 
     monkeypatch.setattr(xr.Dataset, "to_netcdf", write_part_then_fail)
@@ -817,7 +825,8 @@ def test_a_failed_write_leaves_no_partial_file_and_keeps_the_old_one(
 def test_a_folder_that_cant_be_written_in_fails_naming_the_output(
     tmp_path: Path, standard_dataset: StandardDataset, command: str
 ) -> None:
-    # h5py's error names no file, yet the line names the output, not the input.
+    # The error names the partial file that can't be made, yet the line names the
+    # output, not its partial file or the input.
     src = an_input(command, tmp_path, standard_dataset)
     folder = tmp_path / "read-only"
     folder.mkdir()
@@ -829,6 +838,57 @@ def test_a_folder_that_cant_be_written_in_fails_naming_the_output(
         folder.chmod(0o700)
     assert "Permission denied" in assert_stopped(result, EXIT_FAILED, dst)
     assert list(folder.iterdir()) == []
+
+
+@limits_file_sizes
+@pytest.mark.parametrize(
+    ("command", "options", "where"),
+    [
+        ("compress", [], "in the coordinates"),
+        ("compress", [], "at the last byte"),
+        ("compress", ["--no-check"], "at the last byte"),
+        ("decompress", [], "halfway"),
+        ("convert-bbbin", [], "halfway"),
+    ],
+)
+def test_a_disk_that_fills_partway_fails_the_run_naming_the_output(
+    tmp_path: Path,
+    standard_dataset: StandardDataset,
+    command: str,
+    options: list[str],
+    where: str,
+) -> None:
+    # A write that fails partway, as on a full disk or past a quota, fails the run: one
+    # line that names the output with the system's reason, status 1, and nothing left
+    # at DST. Each file the command writes is held to a limit on its size, which fails
+    # writes the same way. Python mustn't crash either, as it did when HDF5 2.0.0 was
+    # told of a failed write and then failed to close the file. compress writes its
+    # coordinates first, 8 KiB here, where the record takes less than 1 KiB, and its
+    # last byte as the file is closed, after every block; without the check, which
+    # reads the file back, only the error that the write met can stop that run.
+    src = an_input(command, tmp_path, standard_dataset)
+    full = tmp_path / "full.nc"
+    assert_exit(run(command, src, full, *options), EXIT_OK)
+    size = full.stat().st_size
+    limit = {
+        "in the coordinates": 2048,
+        "halfway": size // 2,
+        "at the last byte": size - 1,
+    }[where]
+    args = [command, src.name, "out.nc", *options]
+    if command == "compress":
+        args += ["--record", "rec.json"]
+    cli = "from waveform_compression_tools.cli import app; app()"
+    ran = run_python(limit_file_sizes(limit) + cli, *args, cwd=tmp_path)
+    assert ran.returncode == EXIT_FAILED, ran.stderr
+    assert ran.stdout == "" and ran.stderr.count("\n") == 1, ran.stderr
+    assert ran.stderr.startswith(f"{PROGRAM}: out.nc: "), ran.stderr
+    assert "File too large" in ran.stderr
+    assert not (tmp_path / "out.nc").exists()
+    assert not partial_of(tmp_path / "out.nc").exists()
+    assert command != "compress" or read_record(tmp_path / "rec.json")["status"] == (
+        "failed"
+    )
 
 
 def test_an_os_error_names_the_file_it_is_about(

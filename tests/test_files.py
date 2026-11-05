@@ -1,8 +1,10 @@
+import errno
 import json
 import shutil
 import string
 import struct
 import subprocess
+import textwrap
 import warnings
 from collections.abc import Callable
 from pathlib import Path
@@ -37,7 +39,15 @@ from waveform_compression_tools.quantise import full_scale, gain_for, quantise
 from waveform_compression_tools.record import write_record
 from waveform_compression_tools.stream import encode_stream
 
-from helpers import StandardDataset, partial_of, within_one_step_of_the_setting, write
+from helpers import (
+    StandardDataset,
+    limit_file_sizes,
+    limits_file_sizes,
+    partial_of,
+    run_python,
+    within_one_step_of_the_setting,
+    write,
+)
 
 
 def bit_identical(a: np.ndarray, b: np.ndarray) -> bool:
@@ -247,6 +257,63 @@ def test_failure_mid_write_leaves_nothing(
         compress_file(src, dst, block_stations=2)
     assert encoded == [(3, 2, 100)]
     assert not dst.exists() and not partial_of(dst).exists()
+
+
+@limits_file_sizes
+def test_a_full_disk_stops_compress_at_its_block_and_hdf5_carries_on(
+    tmp_path: Path, standard_dataset: StandardDataset
+) -> None:
+    # When a write fails, as on a full disk, compress raises the error, naming the file,
+    # at the end of that block: what HDF5 writes after the failure is held in memory,
+    # so going on would hold the rest of the file there. A limit on the size of each
+    # file fails writes the same way. HDF5 is never told of the failure, so it closes
+    # the file cleanly, and the process can go on using it: closing another file it
+    # wrote looks at every dataset HDF5 has open, where HDF5 2.0.0, had it been told,
+    # would have left one that crashes Python. In 20 blocks of about 2 MiB of streams,
+    # the first write comes once HDF5's 8 MiB cache of chunks fills, past the limit. A
+    # cache of 32 MiB or more would hold the streams until the file is closed.
+    if h5py.h5p.create(h5py.h5p.FILE_ACCESS).get_cache()[2] >= 32 * 2**20:
+        pytest.skip("HDF5's cache of chunks holds all the streams")
+    write(standard_dataset(4000, nt=1000), tmp_path / "in.nc")
+    code = limit_file_sizes(1_000_000) + textwrap.dedent(
+        """
+        import json
+        import h5py, numpy as np
+        from waveform_compression_tools import files
+        from waveform_compression_tools.destinations import HDF5Output
+
+        encoded, first_failure = [], []
+
+        def counted(*args):
+            encoded.append(None)
+            return encode_block(*args)
+
+        def watched(self, data):
+            written = write(self, data)
+            if self.failure is not None and not first_failure:
+                first_failure.append(len(encoded))  # The blocks encoded by then.
+            return written
+
+        encode_block, files.encode_block = files.encode_block, counted
+        write, HDF5Output.write = HDF5Output.write, watched
+        try:
+            files.compress_file("in.nc", "out.nc", block_stations=200)
+        except OSError as error:
+            print(json.dumps([error.errno, error.filename, len(encoded)]))
+        print(json.dumps(first_failure))
+        with h5py.File("again.h5", "w") as f:
+            f["x"] = np.arange(10)
+        print("HDF5 carries on")
+        """
+    )
+    ran = run_python(code, cwd=tmp_path)
+    assert ran.returncode == 0, ran.stderr
+    raised, first_failure, carried_on = ran.stdout.splitlines()
+    error_number, filename, encoded = json.loads(raised)
+    assert (error_number, filename) == (errno.EFBIG, "out.nc")
+    assert json.loads(first_failure) == [encoded] and encoded < 20
+    assert carried_on == "HDF5 carries on"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["again.h5", "in.nc"]
 
 
 def test_a_stream_that_decodes_short_is_named_by_its_station_in_the_file(
