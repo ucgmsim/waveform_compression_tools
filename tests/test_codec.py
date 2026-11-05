@@ -15,14 +15,12 @@ from waveform_compression_tools.codec import (
 
 from helpers import within_one_step_of_the_setting
 
-# Total FLAC bytes for each kit file and setting, as measured with an independent
-# implementation of this encoder (level 5, float64 gains).
-KIT_FLAC_BYTES = {
-    "A.lf": {32: 722_764, 24: 276_475, 17: 162_256},
-    "A.hf": {32: 881_307, 24: 514_114, 17: 253_797},
-    "A.bb": {32: 1_264_501, 24: 615_835, 17: 297_263},
-    "D.lf": {32: 5_809_568, 24: 2_165_814, 17: 988_995},
-    "J.bbbin_275MB": {32: 1_141_390, 24: 608_484, 17: 284_822},
+# Total FLAC bytes of each set of real traces at each setting, as measured with an
+# independent implementation of this encoder (level 5, float64 gains).
+REAL_TRACE_FLAC_BYTES = {
+    "lf": {32: 722_764, 24: 276_475, 17: 162_256},
+    "hf": {32: 881_307, 24: 514_114, 17: 253_797},
+    "bb": {32: 1_264_501, 24: 615_835, 17: 297_263},
 }
 
 # The largest error over the peak that each setting can report: one step, which is
@@ -82,22 +80,24 @@ def hard_traces(nt: int) -> dict[str, np.ndarray]:
     return {name: trace.astype(np.float32) for name, trace in traces.items()}
 
 
-@pytest.mark.parametrize("name", KIT_FLAC_BYTES)
+@pytest.mark.parametrize("name", REAL_TRACE_FLAC_BYTES)
 @pytest.mark.parametrize("bits", [32, 24, 17])
-def test_kit_sizes_match_the_reference(
-    kit: Callable[[str], np.ndarray], name: str, bits: int
+def test_real_trace_sizes_match_the_reference(
+    real_traces: Callable[[str], np.ndarray], name: str, bits: int
 ) -> None:
-    block = encode_block(kit(name), bits)
+    # The only check of compressed size: a change that made files bigger, such as to
+    # pyflac or to the encoder's settings, fails here and nowhere else.
+    block = encode_block(real_traces(name), bits)
     assert sum(map(len, block.streams)) == pytest.approx(
-        KIT_FLAC_BYTES[name][bits], rel=0.01
+        REAL_TRACE_FLAC_BYTES[name][bits], rel=0.01
     )
 
 
 @pytest.mark.parametrize("bits", [32, 24, 17])
-def test_kit_round_trip_within_one_step(
-    kit: Callable[[str], np.ndarray], bits: int
+def test_real_traces_round_trip_within_one_step(
+    real_traces: Callable[[str], np.ndarray], bits: int
 ) -> None:
-    w = kit("A.bb")
+    w = real_traces("bb")
     back = round_trip(w, bits)
     assert within_one_step(w, back, encode_block(w, bits).gains)
     assert max_relative_error(w, back).max() <= RELATIVE_ERROR_LIMIT[bits]

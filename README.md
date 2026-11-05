@@ -358,4 +358,4 @@ uv run deptry .
 uvx npdlint check --extend-exclude "**/__init__.py"
 ```
 
-`lefthook.yml` runs the shared CI checks as git hooks, once `uvx lefthook install` has set them up. pyflac is pinned to 3.0.0 because `stream.py` decodes through its internals: run the tests again before moving the pin. A few tests read real traces, which aren't distributed, from the folder named by `WAVEFORM_COMPRESSION_KIT`, and skip when it isn't set.
+`lefthook.yml` runs the shared CI checks as git hooks, once `uvx lefthook install` has set them up. pyflac is pinned to 3.0.0 because `stream.py` decodes through its internals: run the tests again before moving the pin. A few tests compress the real traces in `tests/real_traces/` and compare their sizes with those an independent implementation measured: they are the only check that a change hasn't made the files bigger.

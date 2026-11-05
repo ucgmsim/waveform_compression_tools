@@ -1,4 +1,3 @@
-import os
 import struct
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -115,27 +114,21 @@ def make_bbbin() -> Callable[..., np.ndarray]:
     return write
 
 
-@pytest.fixture
-def kit() -> Callable[[str], np.ndarray]:
-    """Return a function that loads one set of real traces from the kit.
+REAL_TRACES = Path(__file__).parent / "real_traces"
 
-    The kit is a folder of real traces that isn't distributed: HDF5 files, each
-    holding a float32 dataset ``waveform`` of shape (3, 10, nt). The folder is named
-    by ``$WAVEFORM_COMPRESSION_KIT``, which has no default. A test that needs the kit
-    is skipped when that is not set, or when the folder lacks the file it asks for.
+
+@pytest.fixture
+def real_traces() -> Callable[[str], np.ndarray]:
+    """Return a function that loads one set of real traces from ``tests/real_traces``.
+
+    Each file there holds one float32 dataset, ``waveform``, of shape (3, 10, nt): 10
+    stations' records from one physics-based simulation of an earthquake, as its
+    low-frequency (``lf``), high-frequency (``hf``) and broadband (``bb``) traces. The
+    numbers are copied bit for bit from the simulation's files, and nothing else is.
     """
-    env = os.environ.get("WAVEFORM_COMPRESSION_KIT")
-    if not env:
-        pytest.skip("WAVEFORM_COMPRESSION_KIT is not set")
-    folder = Path(env).expanduser()
 
     def load(name: str) -> np.ndarray:
-        path = folder / f"{name}.h5"
-        if not path.is_file():
-            pytest.skip(
-                f"{path} not found (set WAVEFORM_COMPRESSION_KIT to the kit's folder)"
-            )
-        with h5py.File(path, "r") as f:
+        with h5py.File(REAL_TRACES / f"{name}.h5", "r") as f:
             return f["waveform"][...]
 
     return load
