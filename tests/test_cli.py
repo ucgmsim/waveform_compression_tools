@@ -3,7 +3,6 @@ import json
 import logging
 import logging.handlers
 import os
-import struct
 import time
 from pathlib import Path
 from typing import Any
@@ -43,12 +42,15 @@ from helpers import (
     contents,
     limit_file_sizes,
     limits_file_sizes,
+    names_in,
     nothing_left,
     partial_of,
+    read,
     refused_input,
     run_python,
     with_a_flipped_byte,
     write,
+    write_bbbin,
 )
 
 runner = CliRunner()
@@ -107,25 +109,6 @@ def read_record(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
-def write_bbbin(path: Path, names: list[str], nt: int) -> None:
-    # A little-endian BB.bin file, packed with struct: a header of 0x500 bytes (the
-    # numbers of stations and samples, then duration, dt and start_sec, then three
-    # empty strings), a record of 0x2C bytes for each station, then float32 samples of
-    # shape (station, time, 3). A name is written as UTF-8.
-    rng = np.random.default_rng(0)
-    header = struct.pack("<2i3f", len(names), nt, nt * 0.005, 0.005, 0.0)
-    records = b"".join(
-        struct.pack(
-            "<ff8s3i4f", 170.5, -40.5, name.encode(), 1, 2, 3, 4.0, 5.0, 6.0, 7.0
-        )
-        for name in names
-    )
-    samples = 0.01 * np.cumsum(rng.normal(size=(len(names), nt, 3)), axis=1)
-    path.write_bytes(
-        header.ljust(0x500, b"\0") + records + samples.astype("<f4").tobytes()
-    )
-
-
 def compressed_file(ds: xr.Dataset, tmp_path: Path) -> tuple[Path, Path]:
     # Writes a dataset and compresses it with the command, returning both files.
     src = write(ds, tmp_path / "in.nc")
@@ -138,7 +121,7 @@ def an_input(command: str, folder: Path, standard_dataset: StandardDataset) -> P
     # A file that the command takes: a netCDF file with a real station for compress, the
     # file compressed from it for decompress, and a BB.bin for convert-bbbin.
     if command == "convert-bbbin":
-        write_bbbin(folder / "BB.bin", ["S000000", "S000001", "KIKS"], nt=200)
+        write_bbbin(folder / "BB.bin", 3, 200, names=["S000000", "S000001", "KIKS"])
         return folder / "BB.bin"
     src = write(standard_dataset(3, nt=200, real=(2,)), folder / "in.nc")
     if command == "compress":
@@ -147,15 +130,28 @@ def an_input(command: str, folder: Path, standard_dataset: StandardDataset) -> P
     return folder / "in.flac.nc"
 
 
-def assert_complete(command: str, src: Path, dst: Path) -> None:
+def command_args(
+    command: str, src: Path, dst: Path, rec: Path, *options: str
+) -> list[str | Path]:
+    # The command's arguments, with compress's record at rec.
+    args: list[str | Path] = [command, src, dst, *options]
+    if command == "compress":
+        args += ["--record", rec]
+    return args
+
+
+def assert_complete(
+    command: str, src: Path, dst: Path, rec: Path | None = None
+) -> None:
     # The output that the command wrote from src is whole: compress's passes verify, and
-    # decompress's and convert-bbbin's hold what the library reads from src.
+    # its record at rec, if given, says so; decompress's and convert-bbbin's hold what
+    # the library reads from src.
     if command == "compress":
         assert verify_file(src, dst).passed
+        assert rec is None or read_record(rec)["status"] == "ok"
         return
     expected = decompress_file(src) if command == "decompress" else read_bbbin(src)
-    with xr.open_dataset(dst, engine="h5netcdf") as written:
-        xr.testing.assert_identical(written, expected)
+    xr.testing.assert_identical(read(dst), expected)
 
 
 def test_compress_then_verify(tmp_path: Path) -> None:
@@ -165,7 +161,7 @@ def test_compress_then_verify(tmp_path: Path) -> None:
     bb, nc, packed, back = (
         tmp_path / name for name in ("BB.bin", "BB.nc", "BB.flac.nc", "back.nc")
     )
-    write_bbbin(bb, ["S000000", "S000001", "KIKS"], nt=200)
+    write_bbbin(bb, 3, 200, names=["S000000", "S000001", "KIKS"])
     steps = [
         (("convert-bbbin", bb, nc), [bb], nc),
         (("compress", nc, packed), [nc], packed),
@@ -180,12 +176,7 @@ def test_compress_then_verify(tmp_path: Path) -> None:
         assert output is None or output.is_file(), args
         assert [path.read_bytes() for path in inputs] == before, args
     # Nothing else, no partial file included, was left behind.
-    assert sorted(p.name for p in tmp_path.iterdir()) == [
-        "BB.bin",
-        "BB.flac.nc",
-        "BB.nc",
-        "back.nc",
-    ]
+    assert names_in(tmp_path) == ["BB.bin", "BB.flac.nc", "BB.nc", "back.nc"]
 
 
 @pytest.mark.parametrize(
@@ -224,7 +215,7 @@ def test_compress_ok_writes_a_record(
     result = run("compress", src, dst, "--record", rec, *options)
     assert_exit(result, EXIT_OK)
     assert result.stderr == ""
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["in.nc", "out.json", "out.nc"]
+    assert names_in(tmp_path) == ["in.nc", "out.json", "out.nc"]
     [compressed] = results
     record = read_record(rec)
     assert (record["status"], record["reason"]) == ("ok", "")
@@ -281,6 +272,7 @@ REFUSALS = {
     "an HDF5 group": ("src", False, "groups"),  # HasGroups
     "a float64 waveform": ("src", False, "float32"),  # NotStandardLayout
     "an attribute JSON can't hold": ("src", False, "JSON"),  # NotStandardLayout
+    "a _FillValue JSON can't hold": ("src", False, "JSON"),  # NotStandardLayout
     "every station real": ("src", False, "real"),  # AllStationsReal
     "a NaN": ("src", True, "non-finite"),  # NonFiniteSamples
     "a fill value inside the data": ("src", True, "fill value"),  # NotStandardLayout
@@ -429,16 +421,12 @@ def test_a_stale_partial_is_replaced_and_the_rerun_succeeds(
     assert_exit(run(command, src, dst), EXIT_OK)
     partial_of(dst).write_bytes(dst.read_bytes()[: dst.stat().st_size // 2])
     dst.unlink()
-    args: list[str | Path] = [command, src, dst]
     if command == "compress":
         partial_of(rec).write_text('{"record_version": 1, "tool": ')
-        args += ["--record", rec]
     # The same command again replaces them, and finishes.
-    assert_exit(run(*args), EXIT_OK)
+    assert_exit(run(*command_args(command, src, dst, rec)), EXIT_OK)
     assert not partial_of(dst).exists() and not partial_of(rec).exists()
-    assert_complete(command, src, dst)
-    if command == "compress":
-        assert read_record(rec)["status"] == "ok"
+    assert_complete(command, src, dst, rec)
 
 
 @pytest.mark.parametrize("command", ["compress", "decompress", "convert-bbbin"])
@@ -450,21 +438,17 @@ def test_a_link_at_a_partial_name_is_removed_not_written_through(
     # destroy its target, and the rename would then put the link at the destination.
     src = an_input(command, tmp_path, standard_dataset)
     dst, rec = tmp_path / "out.nc", tmp_path / "rec.json"
-    args: list[str | Path] = [command, src, dst]
     links = {dst: tmp_path / "unrelated.nc"}
     if command == "compress":
         links[rec] = tmp_path / "unrelated.json"
-        args += ["--record", rec]
     for path, target in links.items():
         target.write_bytes(b"an unrelated file")
         partial_of(path).symlink_to(target)
-    assert_exit(run(*args), EXIT_OK)
+    assert_exit(run(*command_args(command, src, dst, rec)), EXIT_OK)
     for path, target in links.items():
         assert target.read_bytes() == b"an unrelated file"
         assert not path.is_symlink() and not os.path.lexists(partial_of(path))
-    assert_complete(command, src, dst)
-    if command == "compress":
-        assert read_record(rec)["status"] == "ok"
+    assert_complete(command, src, dst, rec)
 
 
 @pytest.mark.parametrize(
@@ -483,11 +467,8 @@ def test_a_missing_destination_folder_fails_naming_the_file(
     nowhere = tmp_path / "nowhere"
     dst = nowhere / "out.nc" if missing == "DST" else tmp_path / "out.nc"
     rec = nowhere / "rec.json" if missing == "--record" else tmp_path / "rec.json"
-    args: list[str | Path] = [command, src, dst]
-    if command == "compress":
-        args += ["--record", rec]
     before = contents(tmp_path)
-    result = run(*args)
+    result = run(*command_args(command, src, dst, rec))
     reason = assert_stopped(result, EXIT_FAILED, dst if missing == "DST" else rec)
     # Said before any work is done, rather than found when the write fails.
     assert f"there is no folder {nowhere}" in reason
@@ -504,6 +485,52 @@ def test_a_missing_destination_folder_fails_naming_the_file(
     assert after == before
 
 
+@pytest.mark.parametrize("missing", ["DST", "--record"])
+def test_a_missing_folder_is_found_before_the_input_is_refused(
+    tmp_path: Path, standard_dataset: StandardDataset, missing: str
+) -> None:
+    # Both destinations are checked, their folders included, before the input is: a
+    # mistyped folder fails the run, though the input would be refused too.
+    src = write(standard_dataset(3, nt=100, real=(0, 1, 2)), tmp_path / "in.nc")
+    nowhere = tmp_path / "nowhere"
+    dst = nowhere / "out.nc" if missing == "DST" else tmp_path / "out.nc"
+    rec = nowhere / "rec.json" if missing == "--record" else tmp_path / "rec.json"
+    result = run("compress", src, dst, "--record", rec)
+    reason = assert_stopped(result, EXIT_FAILED, dst if missing == "DST" else rec)
+    assert reason.startswith(f"there is no folder {nowhere}")
+    if missing == "DST":
+        record = read_record(rec)
+        assert (record["status"], record["reason"]) == ("failed", reason)
+    else:
+        # No record can be written, and none is tried.
+        assert names_in(tmp_path) == ["in.nc"]
+
+
+@pytest.mark.parametrize("recorded", [False, True])
+def test_the_input_is_hashed_only_for_the_record(
+    tmp_path: Path,
+    standard_dataset: StandardDataset,
+    monkeypatch: pytest.MonkeyPatch,
+    recorded: bool,
+) -> None:
+    # The input's hash goes only in the record, so a run without one doesn't read the
+    # input to hash it. The output is hashed by compress_file either way.
+    src = write(standard_dataset(3, nt=100, real=(1,)), tmp_path / "in.nc")
+    dst, rec = tmp_path / "out.nc", tmp_path / "rec.json"
+    hashed: list[Path] = []
+
+    def hash_and_say(path: Path) -> str:
+        hashed.append(Path(path))
+        return content_hash(path)
+
+    monkeypatch.setattr(cli, "content_hash", hash_and_say)
+    record = ["--record", rec] if recorded else []
+    assert_exit(run("compress", src, dst, *record), EXIT_OK)
+    assert hashed == ([src] if recorded else [])
+    if recorded:
+        assert read_record(rec)["input"]["content_hash"] == content_hash(src)
+
+
 @pytest.mark.parametrize(
     ("option", "value"),
     [("--bits", "7"), ("--bits", "33"), ("--level", "-1"), ("--level", "9")],
@@ -517,7 +544,7 @@ def test_bits_out_of_range_is_a_usage_error(
     assert_exit(result, EXIT_USAGE)  # As Typer reports one.
     assert option in result.stderr and result.stdout == ""
     # A usage error writes nothing, not even a record.
-    assert [p.name for p in tmp_path.iterdir()] == ["in.nc"]
+    assert names_in(tmp_path) == ["in.nc"]
 
 
 # What decompress, verify and convert-bbbin each refuse, as compress refuses its own:
@@ -576,7 +603,7 @@ def test_decompress_verify_and_convert_use_the_same_codes(
     if case == "a file that isn't a BB.bin":
         bb.write_bytes(bytes(2000))
     else:
-        write_bbbin(bb, ["Ōtaki", "S000001"], nt=20)
+        write_bbbin(bb, 2, 20, names=["Ōtaki", "S000001"])
     # Decompress and convert-bbbin take the file and where to write; verify takes the
     # original and the compressed file.
     args = {
@@ -624,9 +651,7 @@ def test_overwrite_replaces_an_existing_destination(
     assert contents(tmp_path) == before  # Nothing is written, not even a record.
     assert_exit(run(*args, "--overwrite"), EXIT_OK)
     assert not partial_of(dst).exists() and not partial_of(rec).exists()
-    assert_complete(command, src, dst)
-    if earlier != "DST":
-        assert read_record(rec)["status"] == "ok"
+    assert_complete(command, src, dst, None if earlier == "DST" else rec)
 
 
 def test_decompress_gives_back_the_standard_layout(
@@ -645,11 +670,11 @@ def test_decompress_gives_back_the_standard_layout(
 # Damage that decompressing and verifying both meet, to one trace's stream or to the
 # types of the waveform's attributes, and a word of the reason each gives.
 DAMAGE = {
-    "a zeroed fLaC marker": "damaged",
-    "a flipped byte": "damaged",
-    "the last 10 bytes cut off": "damaged",
-    "a cut between frames": "decodes to 8192 samples",
-    "a cut to nothing": "decodes to 0 samples",
+    "a zeroed fLaC marker": "component 1, station 2: a FLAC stream is damaged (",
+    "a flipped byte": "component 1, station 2: a FLAC stream is damaged (",
+    "the last 10 bytes cut off": "component 1, station 2: a FLAC stream is damaged (",
+    "a cut between frames": "component 1, station 2: the stream decodes to 8192",
+    "a cut to nothing": "component 1, station 2: the stream decodes to 0 samples",
     "a type for an attribute that isn't there": "waveform_attr_types",
 }
 # Damage that only a check against the original can find.
@@ -698,13 +723,13 @@ def test_a_damaged_file_fails_the_check(
     if damage == "an original of another shape":
         original = write(ds.isel(station=slice(0, 2)), tmp_path / "other.nc")
     back = tmp_path / "back.nc"
-    before = sorted(tmp_path.iterdir())
+    before = contents(tmp_path)
     # Decompress takes the compressed file and where to write; verify takes the
     # original and the compressed file.
     args = {"decompress": (packed, back), "verify": (original, packed)}[command]
     reason = assert_stopped(run(command, *args), EXIT_FAILED, packed)
     assert (DAMAGE | CHECK_DAMAGE)[damage] in reason
-    assert sorted(tmp_path.iterdir()) == before  # Nothing at DST, nor anywhere else.
+    assert contents(tmp_path) == before  # Nothing at DST, nor anywhere else.
 
 
 # What each command's line gives when its write fails, or None where the failure is an
@@ -743,10 +768,7 @@ def test_a_failed_write_leaves_no_partial_file_and_keeps_the_old_one(
         raise error
 
     monkeypatch.setattr(xr.Dataset, "to_netcdf", write_part_then_fail)
-    args: list[str | Path] = [command, src, dst, "--overwrite"]
-    if command == "compress":
-        args += ["--record", rec]
-    result = run(*args)
+    result = run(*command_args(command, src, dst, rec, "--overwrite"))
     assert written == [partial_of(dst)]  # The write began.
     if shown is None:
         # Typer ends an interruption its own way: it isn't a failure of the file, so no
@@ -782,8 +804,33 @@ def test_a_folder_that_cant_be_written_in_fails_naming_the_output(
         result = run(command, src, dst)
     finally:
         folder.chmod(0o700)
-    assert "Permission denied" in assert_stopped(result, EXIT_FAILED, dst)
+    reason = assert_stopped(result, EXIT_FAILED, dst)
+    assert "Permission denied" in reason and reason.endswith(f"'{dst}'")
     assert list(folder.iterdir()) == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can write in any folder")
+def test_a_record_that_cant_be_written_fails_naming_the_record(
+    tmp_path: Path, standard_dataset: StandardDataset
+) -> None:
+    # As for an output: the error names the record's partial file, which can't be
+    # made, yet the line names the record. The compressed file stays.
+    src = write(standard_dataset(3, nt=100, real=(1,)), tmp_path / "in.nc")
+    dst, folder = tmp_path / "out.nc", tmp_path / "read-only"
+    folder.mkdir()
+    rec = folder / "rec.json"
+    folder.chmod(0o500)
+    try:
+        result = run("compress", src, dst, "--record", rec)
+    finally:
+        folder.chmod(0o700)
+    reason = assert_stopped(result, EXIT_FAILED, rec)
+    assert reason.startswith(
+        "the record can't be written: [Errno 13] Permission denied"
+    )
+    assert reason.endswith(f"'{rec}'")
+    assert list(folder.iterdir()) == []
+    assert verify_file(src, dst).passed
 
 
 @limits_file_sizes
@@ -843,7 +890,7 @@ def test_an_os_error_names_the_file_it_is_about(
     # it: here, reading the BB.bin fails inside convert-bbbin, whose other failures are
     # its output's.
     src, dst = tmp_path / "BB.bin", tmp_path / "BB.nc"
-    write_bbbin(src, ["S000000", "S000001"], nt=20)
+    write_bbbin(src, 2, 20, names=["S000000", "S000001"])
 
     def fail_to_read(path: Path) -> xr.Dataset:
         raise OSError(errno.EIO, "Input/output error", str(path))
@@ -851,7 +898,7 @@ def test_an_os_error_names_the_file_it_is_about(
     monkeypatch.setattr(bbbin, "read_bbbin", fail_to_read)
     reason = assert_stopped(run("convert-bbbin", src, dst), EXIT_FAILED, src)
     assert "Input/output error" in reason
-    assert [p.name for p in tmp_path.iterdir()] == ["BB.bin"]
+    assert names_in(tmp_path) == ["BB.bin"]
 
 
 def test_importing_the_command_line_leaves_logging_alone(tmp_path: Path) -> None:
@@ -890,7 +937,7 @@ def test_a_command_will_not_write_over_its_source(
         original = write(standard_dataset(2, nt=50), tmp_path / "original.nc")
         assert_exit(run("compress", original, src), EXIT_OK)
     else:
-        write_bbbin(src, ["S000000", "S000001"], nt=20)
+        write_bbbin(src, 2, 20, names=["S000000", "S000001"])
     before = src.read_bytes()
     result = run(command, src, dst, "--overwrite")
     assert "overwrite" in assert_stopped(result, EXIT_REFUSED, dst)

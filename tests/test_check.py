@@ -1,3 +1,5 @@
+import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -5,7 +7,6 @@ import h5py
 import numpy as np
 import pyflac
 import pytest
-import xarray as xr
 
 from waveform_compression_tools import files
 from waveform_compression_tools.codec import (
@@ -40,10 +41,29 @@ from helpers import (
     StandardDataset,
     contents,
     nothing_left,
+    read,
     refused_input,
+    stream_of,
     with_a_flipped_byte,
+    with_stream,
     write,
 )
+
+
+def change_as_written(
+    monkeypatch: pytest.MonkeyPatch, name: str, change: Callable[[np.ndarray], None]
+) -> None:
+    # Every write to the group's dataset `name` is changed by `change`, in a copy, as
+    # storage that didn't keep what it was given would change it.
+    setitem = h5py.Dataset.__setitem__
+
+    def changed(dataset: h5py.Dataset, key: object, value: np.ndarray) -> None:
+        if dataset.name == f"/{GROUP}/{name}":
+            value = value.copy()
+            change(value)
+        setitem(dataset, key, value)
+
+    monkeypatch.setattr(h5py.Dataset, "__setitem__", changed)
 
 
 def test_compress_checks_and_reports(
@@ -71,17 +91,19 @@ def test_compress_checks_and_reports(
     assert compress_file(src, tmp_path / "zeros.out.nc").max_relative_error == 0.0
 
 
-# Damage to one trace's stream, done after the encoder knows the gains, and the error the
-# failed check is raised from. libFLAC finds a flipped byte. A cut between frames decodes
-# without an error, so only a count of the samples finds it. A stream cut to nothing
-# holds no frames at all. A trace of zeros given another trace's stream decodes, but not
-# to zeros, which only the one-step rule sees: the setting's bound sees a peak of 0. A
-# byte flipped as it is written leaves the encoder's streams as they should be, so the
-# pass finds it, raised from libFLAC's error, only by decoding what the file holds.
+# Damage to one trace's stream, done after the encoder knows the gains, and what the
+# decoder's ValueError, which the failed check is raised from, is raised from in turn:
+# libFLAC's own error, or nothing. libFLAC finds a flipped byte. A cut between frames
+# decodes without an error, so only a count of the samples finds it. A stream cut to
+# nothing holds no frames at all. A trace of zeros given another trace's stream decodes,
+# but not to zeros, which only the one-step rule sees: the setting's bound sees a peak
+# of 0, and nothing fails to decode. A byte flipped as it is written leaves the
+# encoder's streams as they should be, so the pass finds it, raised from libFLAC's
+# error, only by decoding what the file holds.
 STREAM_DAMAGE = {
     "a flipped byte": pyflac.DecoderProcessException,
-    "a cut between frames": ValueError,
-    "a cut to nothing": ValueError,
+    "a cut between frames": None,
+    "a cut to nothing": None,
     "a trace of zeros given another's stream": None,
     "a byte flipped as it is written": pyflac.DecoderProcessException,
 }
@@ -98,44 +120,39 @@ def test_a_corrupted_stream_fails_the_check_and_leaves_nothing(
         encoded = encode_block(waveform, bits, level)
         if damage == "a flipped byte":
             return with_a_flipped_byte(encoded)
-        streams, nbytes = list(encoded.streams), encoded.nbytes.copy()
-        # Component 1 of station 2, in encode_block's (component, station) order.
-        c, s = 1, 2
-        k = c * waveform.shape[1] + s
+        # Component 1 of station 2's stream is replaced.
         if damage == "a cut between frames":
             # The trace's first frame of 4,096 samples, as a stream of its own.
-            q = quantise(waveform[c, s, :4096], encoded.gains[c, s])
-            streams[k] = encode_stream(q, level)
-        elif damage == "a cut to nothing":
-            streams[k] = b""
-        else:
-            streams[k] = streams[k - 1]  # Component 1 of station 1's.
-        nbytes[c, s] = len(streams[k])
-        return EncodedBlock(streams, nbytes, encoded.gains)
+            q = quantise(waveform[1, 2, :4096], encoded.gains[1, 2])
+            return with_stream(encoded, encode_stream(q, level))
+        if damage == "a cut to nothing":
+            return with_stream(encoded, b"")
+        # A trace of zeros given component 1 of station 1's.
+        return with_stream(encoded, stream_of(encoded, 1, 1))
 
-    setitem = h5py.Dataset.__setitem__
-
-    def write_a_flipped_byte(
-        dataset: h5py.Dataset, key: object, value: np.ndarray
-    ) -> None:
-        if dataset.name == f"/{GROUP}/compressed":
-            value = value.copy()
-            value[value.size // 2] ^= 0xFF
-        setitem(dataset, key, value)
+    def flip_the_middle_byte(value: np.ndarray) -> None:
+        value[value.size // 2] ^= 0xFF
 
     ds = standard_dataset(3, nt=5_000)
     if damage == "a trace of zeros given another's stream":
         ds["waveform"][1, 2] = 0.0
     src, dst = write(ds, tmp_path / "in.nc"), tmp_path / "out.nc"
     if damage == "a byte flipped as it is written":
-        monkeypatch.setattr(h5py.Dataset, "__setitem__", write_a_flipped_byte)
+        change_as_written(monkeypatch, "compressed", flip_the_middle_byte)
     else:
         monkeypatch.setattr(files, "encode_block", encode_then_damage)
     with pytest.raises(CheckFailed) as failure:
         compress_file(src, dst)
-    # Raised from the decoder's own error, if there was one.
-    cause, expected = failure.value.__cause__, STREAM_DAMAGE[damage]
-    assert isinstance(cause, expected) if expected else cause is None
+    # Raised from the decoder's error, which names the trace, if there was one.
+    cause, flac = failure.value.__cause__, STREAM_DAMAGE[damage]
+    if damage == "a trace of zeros given another's stream":
+        assert cause is None
+    else:
+        assert isinstance(cause, ValueError)
+        # The encoder's damage is to component 1 of station 2; the write's is to the
+        # middle byte of all the streams.
+        assert re.match(r"component \d, station \d: ", str(cause)), cause
+        assert isinstance(cause.__cause__, flac) if flac else cause.__cause__ is None
     assert nothing_left(dst)
 
 
@@ -187,8 +204,7 @@ def test_a_wrong_gain_fails_the_check(
     if encoder == "gains of 1":
         # Every sample is within one step of its own gain, so only the setting's bound
         # finds it.
-        with xr.open_dataset(src, engine="h5netcdf") as orig:
-            original = orig["waveform"].values
+        original = read(src)["waveform"].values
         decoded = decompress_file(dst)["waveform"].values
         assert within_one_step(original, decoded, np.ones((3, 3)))
 
@@ -207,21 +223,15 @@ def test_an_altered_exact_station_fails_the_check(
     if change == "a zero's sign":
         ds["waveform"][2, 1, 150] = -0.0
     src, dst = write(ds, tmp_path / "in.nc"), tmp_path / "out.nc"
-    setitem = h5py.Dataset.__setitem__
 
-    def write_a_changed_copy(
-        dataset: h5py.Dataset, key: object, value: np.ndarray
-    ) -> None:
-        if dataset.name == f"/{GROUP}/exact_waveform":
-            value = value.copy()
-            # The copies are of the one real station.
-            if change == "one ulp up":
-                value[2, 0, 150] = np.nextafter(value[2, 0, 150], np.float32(np.inf))
-            else:
-                value[2, 0, 150] = 0.0
-        setitem(dataset, key, value)
+    def change_the_copy(value: np.ndarray) -> None:
+        # The copies are of the one real station.
+        if change == "one ulp up":
+            value[2, 0, 150] = np.nextafter(value[2, 0, 150], np.float32(np.inf))
+        else:
+            value[2, 0, 150] = 0.0
 
-    monkeypatch.setattr(h5py.Dataset, "__setitem__", write_a_changed_copy)
+    change_as_written(monkeypatch, "exact_waveform", change_the_copy)
     with pytest.raises(CheckFailed):
         compress_file(src, dst)
     assert nothing_left(dst)
@@ -321,6 +331,7 @@ REFUSALS = {
     "station names of bytes that aren't ASCII": (NotStandardLayout, True, "ASCII"),
     "no stations": (NotStandardLayout, True, "no stations"),
     "an attribute JSON can't hold": (NotStandardLayout, True, "JSON"),
+    "a _FillValue JSON can't hold": (NotStandardLayout, True, "JSON"),
     "an attribute whose type can't be kept": (NotStandardLayout, True, "pair"),
     "conflicting fill values": (NotStandardLayout, True, "differ"),
     "a vector missing_value": (NotStandardLayout, True, "missing_value"),
@@ -353,14 +364,19 @@ def test_refusals_raise_refused_and_write_nothing(
     refusal, before_the_pass, message = REFUSALS[case]
     assert issubclass(refusal, Refused) and issubclass(refusal, ValueError)
     src, dst, overwrite = refused_input(case, tmp_path, standard_dataset)
+    # A refusal names the file it is about: the destination's own, and the input's
+    # every other, whichever step finds it.
+    about = dst if refusal in (SameFile, OutputExists) else src
     before = contents(tmp_path)
     if before_the_pass:
-        with pytest.raises(refusal, match=message):
+        with pytest.raises(refusal, match=message) as refused:
             check_compressible(src, dst, overwrite)
+        assert str(refused.value.filename) == str(about)
     else:
         check_compressible(src, dst, overwrite)
-    with pytest.raises(refusal, match=message):
+    with pytest.raises(refusal, match=message) as refused:
         compress_file(src, dst, block_stations=2, overwrite=overwrite)
+    assert str(refused.value.filename) == str(about)
     # Nothing is written: the input and whatever was at the destination are as they
     # were, and no partial file is left.
     assert contents(tmp_path) == before
@@ -384,5 +400,6 @@ def test_verify_refuses_an_original_that_compress_refuses(
     standard = write(standard_dataset(3, nt=100), tmp_path / "standard.nc")
     compressed = tmp_path / "standard.flac.nc"
     compress_file(standard, compressed)
-    with pytest.raises(NotStandardLayout, match=REFUSALS[case][2]):
+    with pytest.raises(NotStandardLayout, match=REFUSALS[case][2]) as refused:
         verify_file(original, compressed)
+    assert refused.value.filename == original

@@ -36,12 +36,13 @@ def pack(
     return compressed, starts.reshape(shape), nbytes.reshape(shape)
 
 
-def round_trip(w: np.ndarray, bits: int) -> np.ndarray:
-    """Encode a block, lay its streams end to end, and decode it."""
+def round_trip(w: np.ndarray, bits: int) -> tuple[np.ndarray, np.ndarray]:
+    """Encode a block, lay its streams end to end, and decode it, with its gains."""
     block = encode_block(w, bits)
     compressed, starts, nbytes = pack(block.streams, block.gains.shape)
     offsets = np.zeros_like(block.gains)
-    return decode_block(compressed, starts, nbytes, block.gains, offsets, w.shape[2])
+    decoded = decode_block(compressed, starts, nbytes, block.gains, offsets, w.shape[2])
+    return decoded, block.gains
 
 
 def random_walks(shape: tuple[int, int, int], seed: int = 0) -> np.ndarray:
@@ -96,8 +97,8 @@ def test_real_traces_round_trip_within_one_step(
     real_traces: RealTraces, bits: int
 ) -> None:
     w = real_traces("bb")
-    back = round_trip(w, bits)
-    assert within_one_step(w, back, encode_block(w, bits).gains)
+    back, gains = round_trip(w, bits)
+    assert within_one_step(w, back, gains)
     assert max_relative_error(w, back).max() <= RELATIVE_ERROR_LIMIT[bits]
 
 
@@ -107,9 +108,9 @@ def test_round_trip_at_any_length_within_one_step(bits: int, nt: int) -> None:
     # Long traces make streams over 8 KiB, which libFLAC's wrapper refuses if it is
     # handed a numpy slice instead of bytes.
     w = random_walks((3, 2, nt), seed=nt)
-    back = round_trip(w, bits)
+    back, gains = round_trip(w, bits)
     assert back.dtype == np.float32 and back.shape == w.shape
-    assert within_one_step(w, back, encode_block(w, bits).gains)
+    assert within_one_step(w, back, gains)
     assert max_relative_error(w, back).max() <= RELATIVE_ERROR_LIMIT[bits]
 
 
@@ -118,7 +119,7 @@ def test_hard_traces_come_back_within_one_step(bits: int) -> None:
     # Each station holds one of the hard traces, in all three of its components.
     traces = hard_traces(nt=100)
     block = np.stack([np.stack(list(traces.values()))] * 3)
-    ok = within_one_step_of_the_setting(block, round_trip(block, bits), bits)
+    ok = within_one_step_of_the_setting(block, round_trip(block, bits)[0], bits)
     assert ok.all(), [name for name, good in zip(traces, ok.all(axis=0)) if not good]
 
 
@@ -134,7 +135,7 @@ def test_any_finite_block_comes_back_within_one_step(
     block: np.ndarray, bits: int
 ) -> None:
     # Any finite float32, subnormals included, at any setting.
-    assert within_one_step_of_the_setting(block, round_trip(block, bits), bits).all()
+    assert within_one_step_of_the_setting(block, round_trip(block, bits)[0], bits).all()
 
 
 @pytest.mark.parametrize("off", [1.0, -0.5, 1e-30])
@@ -160,3 +161,20 @@ def test_within_one_step_fails_with_a_gain_that_is_not_finite_and_positive(
     gains = encode_block(original).gains.copy()
     gains[2, 1] = bad
     assert not within_one_step(original, original.copy(), gains)
+
+
+def test_a_block_decodes_into_the_array_given() -> None:
+    # Into a slice of a larger array, such as a whole waveform, in place.
+    w = random_walks((3, 4, 300), seed=1)
+    block = encode_block(w, 24)
+    compressed, starts, nbytes = pack(block.streams, block.gains.shape)
+    offsets = np.zeros_like(block.gains)
+    args = (compressed, starts, nbytes, block.gains, offsets, 300)
+    whole = np.zeros((3, 10, 300), np.float32)
+    out = decode_block(*args, out=whole[:, 5:9])
+    assert np.shares_memory(out, whole)
+    np.testing.assert_array_equal(whole[:, 5:9], decode_block(*args))
+    assert not whole[:, :5].any() and not whole[:, 9:].any()
+    for wrong in (np.zeros((3, 4, 299), np.float32), np.zeros((3, 4, 300))):
+        with pytest.raises(ValueError, match="out must be float32 of shape"):
+            decode_block(*args, out=wrong)

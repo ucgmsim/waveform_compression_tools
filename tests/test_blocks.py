@@ -27,9 +27,10 @@ def test_blocks_start_and_end_on_chunk_boundaries(
 ) -> None:
     # 3 components x 64 samples x 4 bytes = 768 bytes a station: 60 stations a block.
     monkeypatch.setattr(files, "BLOCK_BYTES", 60 * 768)
-    src = tmp_path / "in.nc"
-    standard_dataset(260, nt=64).to_netcdf(
-        src, engine="h5netcdf", encoding={"waveform": {"chunksizes": (1, 50, 64)}}
+    src = write(
+        standard_dataset(260, nt=64),
+        tmp_path / "in.nc",
+        encoding={"waveform": {"chunksizes": (1, 50, 64)}},
     )
     seen: list[list[tuple[int, int]]] = []
     real_blocks = files._blocks

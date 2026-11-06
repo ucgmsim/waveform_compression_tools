@@ -1,6 +1,7 @@
 """What several test files share: plain functions, where conftest.py has the fixtures."""
 
 import os
+import struct
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
@@ -92,9 +93,64 @@ def build_standard_dataset(
     )
 
 
-def write(ds: xr.Dataset, path: Path) -> Path:
-    ds.to_netcdf(path, engine="h5netcdf")
+def write(ds: xr.Dataset, path: Path, **options: Any) -> Path:
+    ds.to_netcdf(path, engine="h5netcdf", **options)
     return path
+
+
+def read(path: str | Path) -> xr.Dataset:
+    # The whole of a netCDF file, loaded, and the file closed.
+    return xr.load_dataset(path, engine="h5netcdf")
+
+
+def names_in(folder: Path) -> list[str]:
+    return sorted(path.name for path in folder.iterdir())
+
+
+# What write_bbbin writes in the header. Every number but dt is exact in float32.
+DURATION, DT, START_SEC = 123.5, 0.005, -1.0
+LF_DIR = "/runs/fault1/rel01/LF"
+LF_VM = "/models/fault1/vm"
+HF_FILE = "/runs/fault1/rel01/HF/Acc/HF.bin"
+
+
+def write_bbbin(
+    path: Path,
+    nstat: int,
+    nt: int,
+    endian: str = "<",
+    names: Sequence[str] | None = None,
+) -> np.ndarray:
+    # conftest.py's make_bbbin fixture gives this, and says what it writes.
+    names = [f"STA{i}" for i in range(nstat)] if names is None else names
+    assert len(names) == nstat
+    rng = np.random.default_rng(0)
+    # Random walks of a few hundredths of a g, like an acceleration record.
+    data = (0.01 * np.cumsum(rng.normal(size=(nstat, nt, 3)), axis=1)).astype(
+        np.float32
+    )
+    header = struct.pack(f"{endian}2i3f", nstat, nt, DURATION, DT, START_SEC)
+    header += b"".join(s.encode().ljust(256, b"\0") for s in (LF_DIR, LF_VM, HF_FILE))
+    records = b"".join(
+        struct.pack(
+            f"{endian}ff8s3i4f",
+            170.5 + i,
+            -40.5 + i,
+            name.encode(),
+            11 + i,
+            22 + i,
+            33 + i,
+            44.5 + i,
+            555.5 + i,
+            666.5 + i,
+            777.5 + i,
+        )
+        for i, name in enumerate(names)
+    )
+    path.write_bytes(
+        header.ljust(0x500, b"\0") + records + data.astype(f"{endian}f4").tobytes()
+    )
+    return data
 
 
 def partial_of(path: Path) -> Path:
@@ -123,14 +179,27 @@ def write_and_compress(
     return src, dst
 
 
+def stream_of(encoded: EncodedBlock, c: int, s: int) -> bytes:
+    # Component c of station s's stream, in encode_block's (component, station) order.
+    return encoded.streams[c * encoded.gains.shape[1] + s]
+
+
+def with_stream(
+    encoded: EncodedBlock, stream: bytes, c: int = 1, s: int = 2
+) -> EncodedBlock:
+    # A block's streams, with component c of station s's stream, and its size, replaced.
+    streams = list(encoded.streams)
+    streams[c * encoded.gains.shape[1] + s] = stream
+    nbytes = encoded.nbytes.copy()
+    nbytes[c, s] = len(stream)
+    return EncodedBlock(streams, nbytes, encoded.gains)
+
+
 def with_a_flipped_byte(encoded: EncodedBlock, c: int = 1, s: int = 2) -> EncodedBlock:
     # A block's streams, with the middle byte of component c of station s flipped.
-    streams = list(encoded.streams)
-    k = c * encoded.gains.shape[1] + s  # In encode_block's (component, station) order.
-    stream = bytearray(streams[k])
+    stream = bytearray(stream_of(encoded, c, s))
     stream[len(stream) // 2] ^= 0xFF
-    streams[k] = bytes(stream)
-    return EncodedBlock(streams, encoded.nbytes, encoded.gains)
+    return with_stream(encoded, bytes(stream), c, s)
 
 
 # The non-finite values of refused_input's cases.
@@ -193,6 +262,10 @@ def refused_input(
     elif case == "an attribute JSON can't hold":
         with h5py.File(src, "r+") as f:
             f["waveform"].attrs["gain"] = np.complex128(1 + 2j)
+    elif case == "a _FillValue JSON can't hold":
+        # One value, so that only its JSON can refuse it.
+        with h5py.File(src, "r+") as f:
+            f["waveform"].attrs["_FillValue"] = np.complex64(1 + 2j)
     elif case == "an attribute whose type can't be kept":
         with h5py.File(src, "r+") as f:
             pair = np.zeros((), np.dtype([("a", "<i4"), ("b", "<f4")]))

@@ -58,6 +58,17 @@ app = typer.Typer(
     rich_markup_mode=None,
 )
 
+# The destination of decompress and convert-bbbin, and their --overwrite.
+_NetcdfDst = Annotated[
+    Path,
+    typer.Argument(
+        metavar="DST", dir_okay=False, help="Where to write the netCDF file."
+    ),
+]
+_Overwrite = Annotated[
+    bool, typer.Option("--overwrite", help="Replace a file already at DST.")
+]
+
 
 @app.callback()
 def _quiet_pyflac() -> None:
@@ -87,13 +98,11 @@ def _reason(error: Exception) -> str:
     Returns
     -------
     str
-        The error's message, which is never empty. libFLAC's errors as it decodes say
-        that a stream is damaged, and those as it encodes that a trace couldn't be
-        encoded. An unexpected error, or one without a message, is named by its type.
+        The error's message, which is never empty. libFLAC's errors as it encodes say
+        that a trace couldn't be encoded. An unexpected error, or one without a
+        message, is named by its type.
     """
     message = str(error)
-    if isinstance(error, pyflac.DecoderProcessException):
-        return f"a FLAC stream is damaged ({message})"
     if isinstance(error, _ENCODING):
         return f"a trace couldn't be encoded ({message})"
     if isinstance(error, _EXPECTED) and message:
@@ -196,38 +205,16 @@ def _about(path: Path) -> Generator[None]:
         raise _Stop(path if named is None else Path(named), error) from error
 
 
-def _hash(path: Path, seconds: dict[str, float]) -> str:
-    """Hash a file's content, and count the time it takes.
-
-    Parameters
-    ----------
-    path : Path
-        The file.
-    seconds : dict[str, float]
-        The run's timings: the time is added to ``"hash"``.
-
-    Returns
-    -------
-    str
-        The file's content hash (see `waveform_compression_tools.content_hash`).
-    """
-    start = time.perf_counter()
-    try:
-        return content_hash(path)
-    finally:
-        seconds["hash"] += time.perf_counter() - start
-
-
 def _write_compress_record(
     path: Path,
     *,
     src: Path,
+    dst: Path,
     bits: int,
     start: float,
     hash_s: float,
     input_hash: str | None,
     result: files.CompressResult | None,
-    output: tuple[Path, int, str] | None,
     stop: _Stop | None,
 ) -> None:
     """Write the record of a compress run, or exit if it can't be written.
@@ -238,6 +225,8 @@ def _write_compress_record(
         Where the record goes.
     src : Path
         The input.
+    dst : Path
+        Where the compressed file goes.
     bits : int
         The setting asked for.
     start : float
@@ -247,9 +236,7 @@ def _write_compress_record(
     input_hash : str or None
         The input's content hash, if the run got as far as hashing it.
     result : CompressResult or None
-        What compressing made, if the run got that far.
-    output : tuple[Path, int, str] or None
-        The compressed file's path, size and content hash, if the run succeeded.
+        What compressing made, if the run succeeded.
     stop : _Stop or None
         Why the run stopped short, if it did.
 
@@ -266,7 +253,7 @@ def _write_compress_record(
             input_hash=input_hash,
             bits=bits,
             result=result,
-            output=output,
+            output_path=dst,
             failure=None if stop is None else (stop.status, stop.reason),
             hash_s=hash_s,
             total_s=total_s,
@@ -453,47 +440,45 @@ def compress(
     start = time.perf_counter()
     if record is not None:
         # The record is a destination too, checked before the input is read. One that
-        # would be written over the input or the output is a usage error. Refusing it
-        # writes no record, so an earlier one, which may say that DST is complete, stays
-        # as it was.
+        # would be written over the input or the output is a usage error. Refusing it,
+        # or finding no folder for it, writes no record, so an earlier one, which may
+        # say that DST is complete, stays as it was.
         try:
             with _about(record):
-                destinations.refuse_overwriting(record, src, dst, overwrite=overwrite)
+                destinations.check_destination(record, src, dst, overwrite=overwrite)
         except _Stop as stop:
             if isinstance(stop.__cause__, SameFile):
                 raise typer.BadParameter(
                     stop.reason, param_hint="'--record'"
                 ) from stop.__cause__
             stop.exit()
-    seconds = {"hash": 0.0}
+    hash_s = 0.0
     input_hash: str | None = None
-    result: files.CompressResult | None = None
     try:
         with _about(src):
             files.check_compressible(src, dst, overwrite)
-        # Before the input is hashed, so that a mistyped folder costs no hash. DST's is
-        # checked by check_compressible.
-        if record is not None:
-            with _about(record):
-                destinations.require_folder(record)
-        with _about(src):
-            input_hash = _hash(src, seconds)
-        with _about(src):
+            # Only the record uses the hash. It comes after the checks, so that a
+            # refused input or a mistyped folder costs no hash.
+            if record is not None:
+                hashing = time.perf_counter()
+                try:
+                    input_hash = content_hash(src)
+                finally:
+                    hash_s = time.perf_counter() - hashing
             result = files.compress_file(
                 src, dst, bits, level, check=not no_check, overwrite=overwrite
             )
     except _Stop as stop:
-        # Unless it is the record's own folder that is missing.
-        if record is not None and stop.path != record:
+        if record is not None:
             _write_compress_record(
                 record,
                 src=src,
+                dst=dst,
                 bits=bits,
                 start=start,
-                hash_s=seconds["hash"],
+                hash_s=hash_s,
                 input_hash=input_hash,
-                result=result,
-                output=None,
+                result=None,
                 stop=stop,
             )
         stop.exit()
@@ -501,12 +486,12 @@ def compress(
         _write_compress_record(
             record,
             src=src,
+            dst=dst,
             bits=bits,
             start=start,
-            hash_s=seconds["hash"],
+            hash_s=hash_s,
             input_hash=input_hash,
             result=result,
-            output=(dst, result.bytes_out, result.output_hash),
             stop=None,
         )
     typer.echo(
@@ -533,16 +518,8 @@ def decompress(
             help="The compressed file, written by compress.",
         ),
     ],
-    dst: Annotated[
-        Path,
-        typer.Argument(
-            metavar="DST", dir_okay=False, help="Where to write the netCDF file."
-        ),
-    ],
-    overwrite: Annotated[
-        bool,
-        typer.Option("--overwrite", help="Replace a file already at DST."),
-    ] = False,
+    dst: _NetcdfDst,
+    overwrite: _Overwrite = False,
 ) -> None:
     """Decompress a file written by compress.
 
@@ -552,9 +529,9 @@ def decompress(
     every other sample is within one quantisation step of the original.
 
     The whole waveform is decoded into memory, so this command suits files whose
-    waveform fits there: it needs 4 bytes for each sample, plus a block of 128 MiB
-    and some working space. The file appears at DST only when it is complete. A file
-    already at DST is replaced only with --overwrite.
+    waveform fits there: it needs 4 bytes for each sample, and some working space.
+    The file appears at DST only when it is complete. A file already at DST is
+    replaced only with --overwrite.
 
     The command exits with status 0 when the file is decompressed, 1 when the run
     fails, as for a damaged file, 2 for a usage error, and 3 when SRC is refused, as a
@@ -578,8 +555,7 @@ def decompress(
     """
     try:
         with _about(dst):
-            destinations.refuse_overwriting(dst, src, overwrite=overwrite)
-            destinations.require_folder(dst)
+            destinations.check_destination(dst, src, overwrite=overwrite)
         with _about(src):
             ds = files.decompress_file(src)
         with _about(dst):
@@ -665,16 +641,8 @@ def convert_bbbin(
             metavar="SRC", exists=True, dir_okay=False, help="The BB.bin file."
         ),
     ],
-    dst: Annotated[
-        Path,
-        typer.Argument(
-            metavar="DST", dir_okay=False, help="Where to write the netCDF file."
-        ),
-    ],
-    overwrite: Annotated[
-        bool,
-        typer.Option("--overwrite", help="Replace a file already at DST."),
-    ] = False,
+    dst: _NetcdfDst,
+    overwrite: _Overwrite = False,
 ) -> None:
     """Convert a BB.bin file to a netCDF file.
 

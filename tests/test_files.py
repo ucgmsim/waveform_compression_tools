@@ -6,7 +6,9 @@ import struct
 import subprocess
 import textwrap
 import warnings
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import h5py
 import numpy as np
@@ -24,7 +26,7 @@ from waveform_compression_tools.codec import (
     within_one_step,
 )
 from waveform_compression_tools.content_hash import content_hash
-from waveform_compression_tools.destinations import refuse_overwriting, write_netcdf
+from waveform_compression_tools.destinations import check_destination, write_netcdf
 from waveform_compression_tools.errors import (
     NotStandardLayout,
     OutputExists,
@@ -48,8 +50,10 @@ from helpers import (
     StandardDataset,
     limit_file_sizes,
     limits_file_sizes,
+    names_in,
     nothing_left,
     partial_of,
+    read,
     run_python,
     within_one_step_of_the_setting,
     write,
@@ -65,8 +69,7 @@ def bit_identical(a: np.ndarray, b: np.ndarray) -> bool:
 def assert_attrs_come_back(src: Path, dst: Path) -> None:
     # Each of the waveform's attributes comes back as it was, in its own type.
     back = decompress_file(dst)["waveform"].attrs
-    with xr.open_dataset(src, engine="h5netcdf") as orig:
-        expected = dict(orig["waveform"].attrs)
+    expected = dict(read(src)["waveform"].attrs)
     assert back.keys() == expected.keys()
     for name, value in expected.items():
         np.testing.assert_array_equal(back[name], value)
@@ -149,15 +152,12 @@ def test_round_trip_every_station(
     res = compress_file(src, dst, bits=bits, block_stations=344)
     assert res.n_traces == 3 * n_station
     assert dst.exists() and not partial_of(dst).exists()
-    back = decompress_file(dst)
-    with xr.open_dataset(src, engine="h5netcdf") as orig:
-        assert back["waveform"].dims == STANDARD_DIMS
-        assert back["waveform"].dtype == np.float32
-        assert back["waveform"].attrs == {"units": "g"}
-        xr.testing.assert_identical(
-            back.drop_vars("waveform"), orig.drop_vars("waveform")
-        )
-        original, decoded = orig["waveform"].values, back["waveform"].values
+    back, orig = decompress_file(dst), read(src)
+    assert back["waveform"].dims == STANDARD_DIMS
+    assert back["waveform"].dtype == np.float32
+    assert back["waveform"].attrs == {"units": "g"}
+    xr.testing.assert_identical(back.drop_vars("waveform"), orig.drop_vars("waveform"))
+    original, decoded = orig["waveform"].values, back["waveform"].values
     assert within_one_step_of_the_setting(original, decoded, bits).all()
     check = verify_file(src, dst, block_stations=344)
     assert check.passed
@@ -175,14 +175,13 @@ def test_every_path_can_be_a_string(tmp_path: Path, make_bbbin: MakeBbbin) -> No
     make_bbbin(Path(bb), nstat=3, nt=200, endian="<", names=names)
     assert read_bbbin(bb)["waveform"].shape == (3, 3, 200)
     convert_bbbin(bb, nc)
-    refuse_overwriting(packed, nc)
+    check_destination(packed, nc)
     check_compressible(nc, packed)
     assert compress_file(nc, packed, bits=24).n_exact == 1
     assert is_compressed(packed)
     assert verify_file(nc, packed).passed
     write_netcdf(decompress_file(packed), back)
-    with xr.open_dataset(back, engine="h5netcdf") as got:
-        assert got["waveform"].shape == (3, 3, 200)
+    assert read(back)["waveform"].shape == (3, 3, 200)
     assert content_hash(packed) == content_hash(Path(packed))
     write_record({"status": "ok"}, rec)
     assert json.loads(Path(rec).read_text()) == {"status": "ok"}
@@ -196,8 +195,7 @@ def test_decompress_to_writes_the_decompressed_file_safely(
     _, packed = write_and_compress(standard_dataset(3, nt=100, real=(1,)), tmp_path)
     back = tmp_path / "back.nc"
     decompress_to(packed, back)
-    with xr.open_dataset(back, engine="h5netcdf") as written:
-        xr.testing.assert_identical(written, decompress_file(packed))
+    xr.testing.assert_identical(read(back), decompress_file(packed))
     assert not partial_of(back).exists()
     before = back.read_bytes()
     with pytest.raises(OutputExists):
@@ -247,19 +245,28 @@ def test_a_missing_destination_folder_is_refused_before_any_work(
     assert not nowhere.exists()
 
 
+@pytest.mark.parametrize("call", [check_compressible, compress_file])
+def test_the_destination_folder_is_checked_before_the_input_is_refused(
+    tmp_path: Path, standard_dataset: StandardDataset, call: Callable[..., object]
+) -> None:
+    # Every station real, so the input would be refused, but the destination is
+    # checked first, its folder included.
+    src = write(standard_dataset(3, nt=100, real=(0, 1, 2)), tmp_path / "in.nc")
+    with pytest.raises(FileNotFoundError, match="there is no folder"):
+        call(src, tmp_path / "nowhere" / "out.nc")
+
+
 def test_a_file_whose_components_are_x_y_z_comes_back_with_its_labels(
     tmp_path: Path, standard_dataset: StandardDataset
 ) -> None:
     # Some files label their components x, y and z, not 000, 090 and ver.
     original = standard_dataset(5, nt=1001).assign_coords(component=["x", "y", "z"])
-    src, dst = write(original, tmp_path / "realisation.hf"), tmp_path / "out.hf"
-    compress_file(src, dst, bits=24)
+    src, dst = write_and_compress(original, tmp_path, bits=24)
     back = decompress_file(dst)
     assert list(back["component"].values) == ["x", "y", "z"]
-    with xr.open_dataset(src, engine="h5netcdf") as orig:
-        xr.testing.assert_identical(
-            back.drop_vars("waveform"), orig.drop_vars("waveform")
-        )
+    xr.testing.assert_identical(
+        back.drop_vars("waveform"), read(src).drop_vars("waveform")
+    )
     assert verify_file(src, dst).passed
 
 
@@ -402,20 +409,64 @@ def test_a_full_disk_stops_compress_at_its_block_and_hdf5_carries_on(
     assert (error_number, filename) == (errno.EFBIG, "out.nc")
     assert json.loads(first_failure) == [encoded] and encoded < 20
     assert carried_on == "HDF5 carries on"
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["again.h5", "in.nc"]
+    assert names_in(tmp_path) == ["again.h5", "in.nc"]
 
 
-def test_a_stream_that_decodes_short_is_named_by_its_station_in_the_file(
-    tmp_path: Path, standard_dataset: StandardDataset
+@pytest.mark.parametrize("call", ["verify_file", "decompress_file"])
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        ("cut to nothing", "the stream decodes to 0 samples"),
+        ("a flipped byte", "a FLAC stream is damaged"),
+    ],
+)
+def test_a_bad_stream_is_named_by_its_station_in_the_file(
+    tmp_path: Path,
+    standard_dataset: StandardDataset,
+    monkeypatch: pytest.MonkeyPatch,
+    call: str,
+    damage: str,
+    message: str,
 ) -> None:
     # In blocks of 2 stations, station 3 is the second of the second block: the message
-    # counts it from the file's first station, not its block's.
+    # counts it from the file's first station, not its block's. libFLAC's own error,
+    # for a stream it can't decode, is a ValueError's cause, not raised as it is.
     src, dst = write_and_compress(standard_dataset(5, nt=100), tmp_path)
     with h5py.File(dst, "r+") as f:
-        f[GROUP]["stream_bytes"][1, 3] = 0  # Station 3's second stream, cut to nothing.
-    message = "component 1, station 3: the stream decodes to 0 samples"
-    with pytest.raises(ValueError, match=message):
-        verify_file(src, dst, block_stations=2)
+        g = f[GROUP]
+        if damage == "cut to nothing":
+            g["stream_bytes"][1, 3] = 0  # Station 3's second stream.
+        else:
+            start, size = int(g["stream_starts"][1, 3]), int(g["stream_bytes"][1, 3])
+            g["compressed"][start + size // 2] ^= 0xFF
+    monkeypatch.setattr(files, "BLOCK_BYTES", 2 * 3 * 100 * 4)  # For decompress_file.
+    with pytest.raises(ValueError, match=f"component 1, station 3: {message}") as bad:
+        if call == "verify_file":
+            verify_file(src, dst, block_stations=2)
+        else:
+            decompress_file(dst)
+    assert type(bad.value) is ValueError
+
+
+def test_decompress_decodes_each_block_into_the_waveform(
+    tmp_path: Path, standard_dataset: StandardDataset, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Each block is decoded straight into the waveform it gives back, so no block is
+    # held besides it.
+    _, dst = write_and_compress(standard_dataset(5, nt=100, real=(1,)), tmp_path)
+    monkeypatch.setattr(files, "BLOCK_BYTES", 2 * 3 * 100 * 4)  # Blocks of 2 stations.
+    outs: list[np.ndarray | None] = []
+    decode = files.decode_block
+
+    def decode_and_keep(*args: Any, **kwargs: Any) -> np.ndarray:
+        outs.append(kwargs.get("out"))
+        return decode(*args, **kwargs)
+
+    monkeypatch.setattr(files, "decode_block", decode_and_keep)
+    waveform = decompress_file(dst)["waveform"].values
+    assert len(outs) == 3
+    for out in outs:
+        assert out is not None and np.shares_memory(out, waveform)
 
 
 def test_a_small_file_has_chunks_no_larger_than_its_waveform(
@@ -504,10 +555,8 @@ def test_verify_refuses_a_file_compressed_from_another_shape(
     # Both files are cut from one dataset, so the stations they share hold the same
     # traces: comparing the original's stations alone would pass the first case.
     ds = standard_dataset(5, nt=400)
-    src = write(ds.isel(compressed), tmp_path / "in.nc")
+    _, dst = write_and_compress(ds.isel(compressed), tmp_path)
     other = write(ds.isel(original), tmp_path / "other.nc")
-    dst = tmp_path / "out.nc"
-    compress_file(src, dst)
     with pytest.raises(ValueError, match="decodes to a waveform of shape"):
         verify_file(other, dst)
 
@@ -519,9 +568,7 @@ def test_the_fill_value_survives_compression(
     ds = standard_dataset(2, nt=50)
     ds["waveform"].encoding["_FillValue"] = fill
     src, dst = write_and_compress(ds, tmp_path)
-    back = decompress_file(dst)
-    back.to_netcdf(tmp_path / "back.nc", engine="h5netcdf")
-    with h5py.File(tmp_path / "back.nc", "r") as f:
+    with h5py.File(write(decompress_file(dst), tmp_path / "back.nc"), "r") as f:
         if fill is None:
             assert "_FillValue" not in f["waveform"].attrs
         else:
@@ -614,8 +661,9 @@ def test_a_non_finite_attribute_without_a_type_is_refused() -> None:
     for value in (float("nan"), [1.0, float("-inf")]):
         with pytest.raises(NotStandardLayout, match="'unset'"):
             files._attrs_json({"units": "g", "unset": value})
-    typed = files._attrs_json({"unset": np.float64(np.nan)})
+    typed, types = files._attrs_json({"unset": np.float64(np.nan)})
     assert json.loads(typed, parse_constant=pytest.fail) == {"unset": "NaN"}
+    assert types == {"unset": "float64"}
 
 
 def test_every_kind_of_encoding_value_is_strict_json() -> None:
@@ -651,10 +699,8 @@ def test_an_unlimited_time_dimension_is_no_trouble(
 ) -> None:
     # Without a time coordinate, nothing in the compressed file's root group has a
     # time dimension, so it can't be declared unlimited there.
-    src, dst = tmp_path / "in.nc", tmp_path / "out.nc"
-    standard_dataset(2, nt=50).to_netcdf(
-        src, engine="h5netcdf", unlimited_dims=["time"]
-    )
+    src = write(standard_dataset(2, nt=50), tmp_path / "in.nc", unlimited_dims=["time"])
+    dst = tmp_path / "out.nc"
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         compress_file(src, dst)
@@ -778,8 +824,7 @@ def test_station_names_come_back_exactly(
     ds = standard_dataset(len(names), nt=50).assign_coords(station=np.array(names))
     src, dst = write_and_compress(ds, tmp_path)
     back = decompress_file(dst)["station"]
-    with xr.open_dataset(src, engine="h5netcdf") as orig:
-        assert back.dtype == orig["station"].dtype
+    assert back.dtype == read(src)["station"].dtype
     assert back.values.tolist() == names  # Each name, and whether it is text or bytes.
     # A name is a grid's if it is 7 characters long without its padding.
     texts = [
@@ -969,16 +1014,6 @@ def test_verify_checks_the_flac_streams_of_real_stations_too(
     assert not verify_file(src, dst).passed
 
 
-def test_a_finite_fill_value_far_from_the_data_round_trips(
-    tmp_path: Path, standard_dataset: StandardDataset
-) -> None:
-    ds = standard_dataset(2, nt=50)
-    ds["waveform"].encoding["_FillValue"] = np.float32(-1e6)
-    src, dst = write_and_compress(ds, tmp_path, bits=8)
-    assert verify_file(src, dst).passed
-    assert decompress_file(dst)["waveform"].encoding["_FillValue"] == np.float32(-1e6)
-
-
 @pytest.mark.parametrize("fill", [-1e6, np.nan])
 def test_an_equal_fill_value_and_missing_value_round_trip(
     tmp_path: Path, standard_dataset: StandardDataset, fill: float
@@ -991,8 +1026,7 @@ def test_an_equal_fill_value_and_missing_value_round_trip(
     with h5py.File(src, "r+") as f:
         f["waveform"].attrs["missing_value"] = np.float32(fill)
     compress_file(src, dst, bits=8)
-    decompress_file(dst).to_netcdf(tmp_path / "back.nc", engine="h5netcdf")
-    with h5py.File(tmp_path / "back.nc", "r") as f:
+    with h5py.File(write(decompress_file(dst), tmp_path / "back.nc"), "r") as f:
         for name in ("_FillValue", "missing_value"):
             np.testing.assert_array_equal(f["waveform"].attrs[name], np.float32(fill))
             assert f["waveform"].attrs[name].dtype == np.float32

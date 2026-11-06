@@ -16,12 +16,14 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from waveform_compression_tools import destinations
-from waveform_compression_tools.destinations import HDF5Output, write_netcdf
+from waveform_compression_tools.destinations import HDF5Output, write_netcdf, writing
 
 from helpers import (
     StandardDataset,
     limit_file_sizes,
     limits_file_sizes,
+    names_in,
+    read,
     run_python,
     write,
 )
@@ -322,8 +324,7 @@ def test_a_signal_as_hdf5_closes_the_file_waits_then_stops_the_run(
     ran = run_python(code, number, writer, cwd=tmp_path)
     assert ran.returncode == 0, ran.stderr
     assert ran.stdout.splitlines() == [stopped, "HDF5 carries on", "True"]
-    names = sorted(p.name for p in tmp_path.iterdir())
-    assert names == ["again.h5", "counted.nc", "in.nc"]
+    assert names_in(tmp_path) == ["again.h5", "counted.nc", "in.nc"]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="a signal ends Windows' processes")
@@ -360,5 +361,19 @@ def test_a_file_written_off_the_main_thread_leaves_ctrl_c_alone(
     with ThreadPoolExecutor(1) as pool:
         pool.submit(write_netcdf, ds, tmp_path / "out.nc").result()
     assert signal.getsignal(signal.SIGINT) is handler
-    with xr.open_dataset(tmp_path / "out.nc", engine="h5netcdf") as written:
-        xr.testing.assert_identical(written, ds)
+    xr.testing.assert_identical(read(tmp_path / "out.nc"), ds)
+
+
+def test_an_error_about_a_partial_file_names_its_destination(tmp_path: Path) -> None:
+    # The partial file is the destination to anyone writing it, so an OSError that names
+    # the partial file, or names none, names the destination; one about another file
+    # keeps its own. Nothing is left either way.
+    dst, other = tmp_path / "out.json", tmp_path / "in.nc"
+    for named, expected in [("partial", dst), (None, dst), (other, other)]:
+        with pytest.raises(OSError) as failure, writing(dst) as partial:
+            partial.write_text("{")
+            filename = partial if named == "partial" else named
+            raise OSError(errno.EIO, "Input/output error", filename)
+        assert str(failure.value.filename) == str(expected)
+        assert failure.value.errno == errno.EIO
+        assert names_in(tmp_path) == []

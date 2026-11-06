@@ -26,7 +26,7 @@ import numpy as np
 import xarray as xr
 
 from .codec import STANDARD_COMPONENTS, STANDARD_DIMS
-from .destinations import refuse_overwriting, require_folder, write_netcdf
+from .destinations import check_destination, write_netcdf
 from .errors import NotBBBin
 
 # The size of a file's header, and of each station's record that follows it.
@@ -213,12 +213,12 @@ def convert_bbbin(
 ) -> None:
     """Convert a BB.bin file to a netCDF file in the standard layout.
 
-    The destination is checked first (see
-    `waveform_compression_tools.destinations.refuse_overwriting`), and its folder. The
-    dataset that `read_bbbin` gives is then written by xarray with the h5netcdf engine
-    to `dst` with ``.partial`` added, and renamed to `dst` when it is complete. If
-    anything goes wrong, the partial file is deleted and the exception raised again; a
-    file already at `dst` is then as it was. As in `read_bbbin`, the whole file is read into memory.
+    The destination and its folder are checked first (see
+    `waveform_compression_tools.destinations.check_destination`). The dataset that
+    `read_bbbin` gives is then written by xarray with the h5netcdf engine to `dst` with
+    ``.partial`` added, and renamed to `dst` when it is complete. If anything goes
+    wrong, the partial file is deleted and the exception raised again; a file already
+    at `dst` is then as it was. As in `read_bbbin`, the whole file is read into memory.
 
     Parameters
     ----------
@@ -241,6 +241,5 @@ def convert_bbbin(
     NotBBBin
         If `src` is not a BB.bin file (see `read_bbbin`). Nothing is written.
     """
-    refuse_overwriting(dst, src, overwrite=overwrite)
-    require_folder(dst)
+    check_destination(dst, src, overwrite=overwrite)
     write_netcdf(read_bbbin(src), dst)

@@ -52,42 +52,23 @@ def _partial_name(dst: str | os.PathLike[str]) -> Path:
     return Path(f"{Path(dst)}.partial")
 
 
-def fresh_partial(dst: str | os.PathLike[str]) -> Path:
-    """Clear the name a file for `dst` is written under, and return it.
-
-    That name is `dst` with ``.partial`` added. Whatever is there is removed: a partial
-    file left by a run that was killed, or a link, whose target stays as it was.
-
-    Parameters
-    ----------
-    dst : str or os.PathLike
-        Where the file is to go.
-
-    Returns
-    -------
-    Path
-        `dst` with ``.partial`` added, with nothing there now.
-    """
-    partial = _partial_name(dst)
-    if os.path.lexists(partial):
-        partial.unlink()  # A link itself, never its target.
-    return partial
-
-
 @contextmanager
 def writing(dst: str | os.PathLike[str]) -> Generator[Path]:
     """Have a file written under a partial name, and put at `dst` only when it is whole.
 
-    The name is cleared first (see `fresh_partial`). If the block ends normally, the file
-    is renamed to `dst`, replacing a file already there. If anything goes wrong, the
-    partial file is deleted and the exception raised again; a file already at `dst` is
-    then as it was.
+    The name, `dst` with ``.partial`` added, is cleared first: whatever is there is
+    removed, a partial file left by a run that was killed or a link, whose target stays
+    as it was. If the block ends normally, the file is renamed to `dst`, replacing a
+    file already there. If anything goes wrong, the partial file is deleted and the
+    exception raised again; a file already at `dst` is then as it was. An `OSError` in
+    any of this, the block's included, that names no file or the partial file names
+    `dst` (see `naming`).
 
     Parameters
     ----------
     dst : str or os.PathLike
         Where the file is to go. A caller that may not replace a file there checks
-        first (see `refuse_overwriting`).
+        first (see `check_destination`).
 
     Yields
     ------
@@ -95,13 +76,16 @@ def writing(dst: str | os.PathLike[str]) -> Generator[Path]:
         The name to write the file under: `dst` with ``.partial`` added.
     """
     dst = Path(dst)
-    partial = fresh_partial(dst)
-    try:
-        yield partial
-        os.replace(partial, dst)
-    except BaseException:
-        partial.unlink(missing_ok=True)
-        raise
+    partial = _partial_name(dst)
+    with naming(dst):
+        if os.path.lexists(partial):
+            partial.unlink()  # A link itself, never its target.
+        try:
+            yield partial
+            os.replace(partial, dst)
+        except BaseException:
+            partial.unlink(missing_ok=True)
+            raise
 
 
 def named_file(error: Exception) -> str | None:
@@ -127,7 +111,8 @@ def naming(path: str | os.PathLike[str]) -> Generator[None]:
 
     h5py's errors name no file, and nor does one that a write through an `HDF5Output`
     meets, so an error from reading or writing one doesn't say which it was. And the
-    partial file that `path` is written as (see `writing`) is `path` to anyone using it.
+    partial file that `path` is written as is `path` to anyone using it: `writing` names
+    `path` this way.
     Such an error that has an error number and its words is raised again as an `OSError`
     with the same number and words, and `path` as its file, caused by the first. Any
     other is raised as it is, since a file name would take its words.
@@ -195,7 +180,7 @@ class HDF5Output(io.RawIOBase):
     ----------
     path : str or os.PathLike
         Where to write the file. Nothing may be there already, so no link is written
-        through (see `fresh_partial`).
+        through (see `writing`).
 
     Attributes
     ----------
@@ -492,7 +477,7 @@ class _NoFolderError(FileNotFoundError):
         return str(self.strerror)
 
 
-def require_folder(dst: str | os.PathLike[str]) -> None:
+def _require_folder(dst: str | os.PathLike[str]) -> None:
     """Fail unless the folder that a file is to be written in exists.
 
     Parameters
@@ -515,17 +500,19 @@ def require_folder(dst: str | os.PathLike[str]) -> None:
         )
 
 
-def refuse_overwriting(
+def check_destination(
     dst: str | os.PathLike[str],
     *sources: str | os.PathLike[str],
     overwrite: bool = False,
 ) -> None:
-    """Refuse to write `dst` where that would destroy a source, or replace a file unasked.
+    """Check a destination before any work: refuse it, or fail if it has no folder.
 
     A file is written to `dst` with ``.partial`` added, once whatever is at that name
     is removed, and then renamed to `dst`. Either would destroy a source that is `dst`,
     or `dst` with ``.partial`` added. The checks are made in that order, for each
-    source in turn, and then that of a file already at `dst`.
+    source in turn, and then that of a file already at `dst`. Last, the folder `dst`
+    is to be written in has to exist, so that a mistyped folder is found before any
+    work is done.
 
     Parameters
     ----------
@@ -544,6 +531,9 @@ def refuse_overwriting(
     OutputExists
         If something is at `dst` already, a broken link included, and `overwrite` is
         false.
+    FileNotFoundError
+        If there is no folder at ``dst``'s parent. Its ``filename`` is `dst`, and its
+        message says which folder is missing.
     """
     dst = Path(dst)
     partial = _partial_name(dst)
@@ -562,6 +552,7 @@ def refuse_overwriting(
             "overwrite=True)",
             dst,
         )
+    _require_folder(dst)
 
 
 def write_netcdf(ds: xr.Dataset, dst: str | os.PathLike[str]) -> None:
@@ -577,12 +568,12 @@ def write_netcdf(ds: xr.Dataset, dst: str | os.PathLike[str]) -> None:
         The dataset to write.
     dst : str or os.PathLike
         Where to write the file. A file already there is replaced (see
-        `refuse_overwriting`, which a caller makes first).
+        `check_destination`, which a caller makes first).
 
     Raises
     ------
     OSError
         If the file can't be written, as on a full disk, naming `dst`.
     """
-    with writing(dst) as partial, naming(dst), HDF5Output(partial) as out:
+    with writing(dst) as partial, HDF5Output(partial) as out:
         ds.to_netcdf(out, engine="h5netcdf")

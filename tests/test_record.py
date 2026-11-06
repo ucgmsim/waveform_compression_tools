@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from waveform_compression_tools import __version__, record
+from waveform_compression_tools import __version__, destinations
 from waveform_compression_tools.content_hash import content_hash
 from waveform_compression_tools.files import CompressResult
 from waveform_compression_tools.record import make_record, write_record
@@ -64,7 +64,7 @@ def good(folder: Path, **changes: Any) -> dict:
         "input_hash": None,
         "bits": 16,
         "result": a_result(),
-        "output": (Path("out/a.nc"), 10, "ab" * 32),
+        "output_path": Path("out/a.nc"),
         "failure": None,
         "hash_s": 0.75,
         "total_s": 6.0,
@@ -101,7 +101,7 @@ def test_a_record_has_exactly_the_schema(tmp_path: Path) -> None:
     assert json.loads(json.dumps(rec, allow_nan=False)) == rec
     unchecked = good(tmp_path, result=a_result(max_relative_error=None, check_s=0.0))
     assert (unchecked["checked"], unchecked["max_relative_error"]) == (False, None)
-    refused = good(tmp_path, result=None, output=None, failure=("refused", "no"))
+    refused = good(tmp_path, result=None, failure=("refused", "no"))
     assert (refused["status"], refused["reason"]) == ("refused", "no")
     assert refused["output"] is None and refused["checked"] is False
     assert (refused["n_traces"], refused["n_exact_stations"]) == (None, None)
@@ -131,7 +131,7 @@ def test_write_record_is_atomic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     def boom(src: Any, dst: Any) -> None:
         raise OSError("disk")
 
-    monkeypatch.setattr(record.os, "replace", boom)
+    monkeypatch.setattr(destinations.os, "replace", boom)
     with pytest.raises(OSError):
         write_record(good(tmp_path, bits=8), path)
     assert path.read_text() == text

@@ -19,7 +19,7 @@ from waveform_compression_tools.files import (
     verify_file,
 )
 
-from helpers import MakeBbbin
+from helpers import MakeBbbin, names_in, read
 
 
 # Shapes with one station, one sample, or both, where a dimension could be lost.
@@ -116,7 +116,7 @@ def test_text_that_is_not_ascii_is_refused(
         read_bbbin(path)
     with pytest.raises(NotBBBin, match="ASCII"):
         convert_bbbin(path, tmp_path / "BB.nc")
-    assert [p.name for p in tmp_path.iterdir()] == ["BB.bin"]
+    assert names_in(tmp_path) == ["BB.bin"]
 
 
 def header_saying(nstat: int, nt: int, size: int) -> bytes:
@@ -186,15 +186,13 @@ def test_convert_bbbin_writes_a_netcdf_file(
     nc = tmp_path / "BB.nc"
     convert_bbbin(tmp_path / "BB.bin", nc)
     # The BB.bin and the converted file, and no partial file.
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["BB.bin", "BB.nc"]
+    assert names_in(tmp_path) == ["BB.bin", "BB.nc"]
     assert h5py.is_hdf5(nc)
-    with xr.open_dataset(nc, engine="h5netcdf") as written:
-        for dataset in (ds, written):
-            check_standard(dataset)
-            assert all(
-                variable.dtype.isnative for variable in dataset.variables.values()
-            )
-        xr.testing.assert_identical(written, ds)
+    written = read(nc)
+    for dataset in (ds, written):
+        check_standard(dataset)
+        assert all(variable.dtype.isnative for variable in dataset.variables.values())
+    xr.testing.assert_identical(written, ds)
 
 
 def test_converted_file_compresses(tmp_path: Path, make_bbbin: MakeBbbin) -> None:

@@ -85,10 +85,10 @@ waveform-compression-tools compress realisation.nc realisation.flac.nc --bits 24
 
 `compress` works in this order. A problem at any step ends the run there, and the record still says why, except in the cases listed under [The record](#the-record):
 
-1. With `--record`, a file already at PATH is refused, unless `--overwrite` is given. This refusal writes no record, so the earlier one stays as it was.
-2. The refusals that need no samples: DST is SRC, a file is at DST already, or SRC isn't an HDF5 file, is compressed already, holds an HDF5 group besides its root, isn't in the standard layout, or has only real stations. Only metadata and station names are read.
-3. DST's folder, and the record's, have to exist.
-4. SRC is hashed.
+1. With `--record`, a file already at PATH is refused, unless `--overwrite` is given, and PATH's folder has to exist. Neither writes a record, so an earlier one stays as it was.
+2. DST is refused if it is SRC, or if a file is at DST already, and DST's folder has to exist.
+3. The refusals of SRC that need no samples: SRC isn't an HDF5 file, is compressed already, holds an HDF5 group besides its root, isn't in the standard layout, or has only real stations. Only metadata and station names are read.
+4. With `--record`, SRC is hashed.
 5. SRC is read, encoded, written and checked, a block of stations at a time. Two refusals need the samples, so they come here: a trace that holds a NaN or an infinity, and a finite fill value within one step of a trace's range.
 6. DST is hashed, under its `.partial` name, and then renamed into place.
 7. The record is written.
@@ -136,7 +136,7 @@ The record's keys, in order:
 | `reason` | string | why the file was refused or the run failed: the library's whole message, which may start with the file's path, though the error line drops that start. `""` when `status` is `"ok"`. | never |
 | `input.path` | string | SRC, as given | never |
 | `input.bytes` | integer | SRC's size in bytes | never |
-| `input.content_hash` | string | SRC's content hash (see below) | when the run stopped before hashing SRC: a refusal at step 2, or no folder for DST |
+| `input.content_hash` | string | SRC's content hash (see below) | when the run stopped before hashing SRC, at step 2 or 3 |
 | `output` | object | `path`, `bytes` and `content_hash`, as for `input`, of DST | when `status` isn't `"ok"` |
 | `bits` | integer | the setting asked for | never |
 | `format_version` | integer | the format version written, 1 | never |
@@ -195,7 +195,7 @@ Every command exits with one of these statuses. They are published, and are the 
 
 The refusals, by command:
 
-- `compress`: DST is SRC; a file is at DST, or at the record's PATH, and `--overwrite` isn't given; SRC isn't an HDF5 file, is compressed already, or holds an HDF5 group besides its root; SRC isn't in the standard layout, which includes having no `station` coordinate, a station name that is bytes but not ASCII, no stations, a waveform attribute that JSON can't hold or whose type can't be kept, a `_FillValue` or `missing_value` that isn't one value, a `_FillValue` and a `missing_value` that differ, and a finite fill value within one step of a trace's range; every station is real; a trace holds a NaN or an infinity.
+- `compress`: DST is SRC; a file is at DST, or at the record's PATH, and `--overwrite` isn't given; SRC isn't an HDF5 file, is compressed already, or holds an HDF5 group besides its root; SRC isn't in the standard layout, which includes having no `station` coordinate, a station name that is bytes but not ASCII, no stations, a waveform attribute that JSON can't hold or whose type can't be kept, a `_FillValue` or `missing_value` that isn't one value or that JSON can't hold, a `_FillValue` and a `missing_value` that differ, and a finite fill value within one step of a trace's range; every station is real; a trace holds a NaN or an infinity.
 - `decompress`: SRC isn't an HDF5 file, isn't compressed, or is in another format version or has a setting outside 8 to 32; DST is SRC; a file is at DST, and `--overwrite` isn't given.
 - `verify`: ORIGINAL isn't an HDF5 file, or isn't in the standard layout; COMPRESSED isn't an HDF5 file, isn't compressed, or is in another format version or has a setting outside 8 to 32.
 - `convert-bbbin`: SRC can't be a BB.bin file (it is shorter than a header, its size doesn't fit its header, or it holds text that isn't ASCII); DST is SRC; a file is at DST, and `--overwrite` isn't given.
@@ -258,7 +258,7 @@ convert_bbbin(Path("BB.bin"), Path("bb.nc"))  # the same, written to a netCDF fi
 
 A path can be given as a string or as a `pathlib.Path` object.
 
-- `compress_file(src, dst, bits=32, level=5, block_stations=None, check=True, overwrite=False)` returns a `CompressResult`: `bytes_in` and `bytes_out`, `n_traces`, `n_exact` (the real stations), `bits`, `max_relative_error` (None without the check), `output_hash` (the output's content hash), the wall time spent reading, encoding, writing, checking and hashing, from `read_s` to `hash_s`, and the CPU time of the first four, from `read_cpu_s` to `check_cpu_s`. It first makes the refusals of `check_compressible(src, dst, overwrite)`, those that need no samples, and checks that DST's folder exists; `check_compressible` can be called on its own.
+- `compress_file(src, dst, bits=32, level=5, block_stations=None, check=True, overwrite=False)` returns a `CompressResult`: `bytes_in` and `bytes_out`, `n_traces`, `n_exact` (the real stations), `bits`, `max_relative_error` (None without the check), `output_hash` (the output's content hash), the wall time spent reading, encoding, writing, checking and hashing, from `read_s` to `hash_s`, and the CPU time of the first four, from `read_cpu_s` to `check_cpu_s`. It first makes the checks of `check_compressible(src, dst, overwrite)`: DST's, its folder included, and then the refusals of SRC that need no samples; `check_compressible` can be called on its own.
 - `verify_file(original, compressed, block_stations=None)` returns a `VerifyResult`: `passed`, `max_relative_error`, `n_exact` and `verify_s`. A file that doesn't agree gives `passed=False`; it doesn't raise.
 - `decompress_file(path)` returns the original dataset, loaded into memory, and `decompress_to(src, dst, overwrite=False)` writes it to a netCDF file, through a `.partial`.
 - `read_bbbin(path)` reads a BB.bin file into a dataset in the standard layout, and `convert_bbbin(src, dst, overwrite=False)` writes that dataset to a netCDF file, through a `.partial`.
@@ -288,7 +288,7 @@ A refusal raises `Refused`, or one of its subclasses, from `waveform_compression
 
 A refusal and a failed check name the file they are about as their `filename`, as an `OSError` does, where it is known.
 
-Anything else is a failure of the run: `OSError` for a file that can't be read or written, `ValueError` for a bad argument (such as `bits` outside 8 to 32) or a damaged compressed file, and pyflac's exceptions when libFLAC can't encode a trace or decode a stream.
+Anything else is a failure of the run: `OSError` for a file that can't be read or written; `ValueError` for a bad argument (such as `bits` outside 8 to 32) or a damaged compressed file, whose message names the trace that doesn't decode, and whose cause is libFLAC's own error where libFLAC found the damage; and pyflac's exceptions when libFLAC can't encode a trace.
 
 ## The file format
 
@@ -346,7 +346,7 @@ trace = (q.astype(np.float64) / gain + offset).astype(np.float32)
 ## Limits in 1.0.0
 
 - A file that holds an HDF5 group besides its root is refused: xarray reads only the root group, so its compressed file would go without the group.
-- `decompress` and `decompress_file` load the whole waveform into memory: 4 bytes a sample, plus a block of 128 MiB and some working space. A file whose waveform doesn't fit in memory can be compressed and verified, but not yet decompressed. A later release is to decompress a block at a time.
+- `decompress` and `decompress_file` load the whole waveform into memory: 4 bytes a sample, and some working space. A file whose waveform doesn't fit in memory can be compressed and verified, but not yet decompressed. A later release is to decompress a block at a time.
 - The streams are stored in chunks of 4 MiB, or of the waveform's own size if that is smaller, and a compressed file holds whole chunks. So a file whose waveform is smaller than 4 MiB isn't made any smaller, and can come out larger; a bigger file holds up to 4 MiB more than its streams need.
 
 ## Developing

@@ -7,10 +7,13 @@ check, `CheckFailed`, says that the compressed output didn't come back as it sho
 is deleted, so nothing appears at the destination either.
 
 Each names the file it is about as its `filename`, where that is known, as an `OSError`
-does; its message is the same either way.
+does; its message is the same either way. A function that knows which file a step is
+about, but not the step itself, names it with `about`.
 """
 
 import os
+from collections.abc import Generator
+from contextlib import contextmanager
 
 
 class Refused(ValueError):  # noqa: N818
@@ -104,3 +107,27 @@ class CheckFailed(RuntimeError):  # noqa: N818
         """Keep the message, and the file it is about."""
         super().__init__(message)
         self.filename = filename
+
+
+@contextmanager
+def about(path: str | os.PathLike[str]) -> Generator[None]:
+    """Have a refusal or a failed check in a block that names no file name `path`.
+
+    One that names a file already keeps it.
+
+    Parameters
+    ----------
+    path : str or os.PathLike
+        The file the block's refusals and failed checks are about.
+
+    Yields
+    ------
+    None
+        Nothing; the block runs.
+    """
+    try:
+        yield
+    except (Refused, CheckFailed) as error:
+        if error.filename is None:
+            error.filename = path
+        raise

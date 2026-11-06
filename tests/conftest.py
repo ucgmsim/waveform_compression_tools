@@ -1,18 +1,16 @@
-import struct
-from collections.abc import Sequence
 from pathlib import Path
 
 import h5py
 import numpy as np
 import pytest
 
-from helpers import MakeBbbin, RealTraces, StandardDataset, build_standard_dataset
-
-# What make_bbbin writes in the header. Every number but dt is exact in float32.
-DURATION, DT, START_SEC = 123.5, 0.005, -1.0
-LF_DIR = "/runs/fault1/rel01/LF"
-LF_VM = "/models/fault1/vm"
-HF_FILE = "/runs/fault1/rel01/HF/Acc/HF.bin"
+from helpers import (
+    MakeBbbin,
+    RealTraces,
+    StandardDataset,
+    build_standard_dataset,
+    write_bbbin,
+)
 
 
 @pytest.fixture
@@ -37,12 +35,13 @@ def standard_dataset() -> StandardDataset:
 def make_bbbin() -> MakeBbbin:
     """Return a function that writes a legacy BB.bin file.
 
-    ``make_bbbin(path, nstat, nt, endian, names=None)`` writes a BB.bin file in the
-    byte order `endian` (``"<"`` or ``">"``, for everything in it) and returns its
+    ``make_bbbin(path, nstat, nt, endian="<", names=None)`` writes a BB.bin file in
+    the byte order `endian` (``"<"`` or ``">"``, for everything in it) and returns its
     data: float32 of shape (nstat, nt, 3), with the components in the file's order,
     090, 000 and ver. The stations are named STA0, STA1, ... unless `names` says
     otherwise; those names are 4 characters long, like a real station's. The header
-    holds `DURATION`, `DT`, `START_SEC`, `LF_DIR`, `LF_VM` and `HF_FILE`.
+    holds helpers.py's `DURATION`, `DT`, `START_SEC`, `LF_DIR`, `LF_VM` and
+    `HF_FILE`.
 
     The records are packed with struct, a description of the layout that is
     independent of the reader's. Each number in a record has a value of its own, and
@@ -50,46 +49,7 @@ def make_bbbin() -> MakeBbbin:
     shows.
     """
 
-    def write(
-        path: Path,
-        nstat: int,
-        nt: int,
-        endian: str,
-        names: Sequence[str] | None = None,
-    ) -> np.ndarray:
-        names = [f"STA{i}" for i in range(nstat)] if names is None else names
-        assert len(names) == nstat
-        rng = np.random.default_rng(0)
-        # Random walks of a few hundredths of a g, like an acceleration record.
-        data = (0.01 * np.cumsum(rng.normal(size=(nstat, nt, 3)), axis=1)).astype(
-            np.float32
-        )
-        header = struct.pack(f"{endian}2i3f", nstat, nt, DURATION, DT, START_SEC)
-        header += b"".join(
-            s.encode().ljust(256, b"\0") for s in (LF_DIR, LF_VM, HF_FILE)
-        )
-        records = b"".join(
-            struct.pack(
-                f"{endian}ff8s3i4f",
-                170.5 + i,
-                -40.5 + i,
-                name.encode(),
-                11 + i,
-                22 + i,
-                33 + i,
-                44.5 + i,
-                555.5 + i,
-                666.5 + i,
-                777.5 + i,
-            )
-            for i, name in enumerate(names)
-        )
-        path.write_bytes(
-            header.ljust(0x500, b"\0") + records + data.astype(f"{endian}f4").tobytes()
-        )
-        return data
-
-    return write
+    return write_bbbin
 
 
 REAL_TRACES = Path(__file__).parent / "real_traces"

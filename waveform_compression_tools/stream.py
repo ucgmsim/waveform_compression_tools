@@ -23,8 +23,8 @@ import pyflac
 from pyflac import decoder as pyflac_decoder
 
 
-def encode_stream(q: np.ndarray, level: int = 5, blocksize: int = 4096) -> bytes:
-    """Encode one trace as a single mono FLAC stream.
+def encode_stream(q: np.ndarray, level: int = 5) -> bytes:
+    """Encode one trace as a single mono FLAC stream, in frames of 4,096 samples.
 
     Parameters
     ----------
@@ -34,9 +34,6 @@ def encode_stream(q: np.ndarray, level: int = 5, blocksize: int = 4096) -> bytes
         integers and flatten a 2-D array without a word.
     level : int, default 5
         The FLAC compression level, from 0 (fastest) to 8 (slowest).
-    blocksize : int, default 4096
-        The number of samples in each FLAC frame. The stream's sample-rate field
-        is 44100, which allows at most 4608.
 
     Returns
     -------
@@ -61,7 +58,9 @@ def encode_stream(q: np.ndarray, level: int = 5, blocksize: int = 4096) -> bytes
     encoder = pyflac.StreamEncoder(
         sample_rate=44100,  # Meaningless for a trace, but a stream has to carry one.
         compression_level=level,
-        blocksize=blocksize,
+        # The format's frames are 4,096 samples; a sample rate of 44100 allows 4608 at
+        # most.
+        blocksize=4096,
         write_callback=lambda buf, nbytes, nsamp, frame: chunks.append(bytes(buf)),
     )
     encoder.process(q.reshape(-1, 1))

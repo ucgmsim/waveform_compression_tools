@@ -15,10 +15,10 @@ package handles. `max_relative_error` and `within_one_step` compare a decoded bl
 with the original.
 """
 
-import os
 from dataclasses import dataclass
 
 import numpy as np
+import pyflac
 import xarray as xr
 
 from .errors import NotStandardLayout
@@ -35,7 +35,7 @@ STANDARD_COMPONENTS = ("000", "090", "ver")
 STEP_SLACK = 1e-9
 
 
-def check_standard(ds: xr.Dataset, path: str | os.PathLike[str] | None = None) -> None:
+def check_standard(ds: xr.Dataset) -> None:
     """Check that a dataset holds its waveform in the layout this package handles.
 
     The layout is a data variable ``waveform`` of float32 with the dimensions
@@ -48,8 +48,6 @@ def check_standard(ds: xr.Dataset, path: str | os.PathLike[str] | None = None) -
     ----------
     ds : xr.Dataset
         The dataset to check. The waveform itself is not read.
-    path : str or os.PathLike, optional
-        The file the dataset is read from, which a refusal names as its ``filename``.
 
     Raises
     ------
@@ -58,15 +56,14 @@ def check_standard(ds: xr.Dataset, path: str | os.PathLike[str] | None = None) -
     """
     if "waveform" not in ds.data_vars:
         raise NotStandardLayout(
-            f"no data variable 'waveform' (the data variables are {list(ds.data_vars)})",
-            path,
+            f"no data variable 'waveform' (the data variables are {list(ds.data_vars)})"
         )
     waveform = ds["waveform"]
     if waveform.dtype != np.float32:
-        raise NotStandardLayout(f"'waveform' is {waveform.dtype}, not float32", path)
+        raise NotStandardLayout(f"'waveform' is {waveform.dtype}, not float32")
     if waveform.dims != STANDARD_DIMS:
         raise NotStandardLayout(
-            f"'waveform' has dimensions {waveform.dims}, not {STANDARD_DIMS}", path
+            f"'waveform' has dimensions {waveform.dims}, not {STANDARD_DIMS}"
         )
 
 
@@ -147,6 +144,7 @@ def decode_block(
     offsets: np.ndarray,
     nt: int,
     first_station: int = 0,
+    out: np.ndarray | None = None,
 ) -> np.ndarray:
     """Decode a block of stations.
 
@@ -167,21 +165,23 @@ def decode_block(
     first_station : int, default 0
         The block's first station in its file, from which an error's message counts
         the stations.
+    out : np.ndarray, optional
+        A float32 array of shape (3, n, nt) to decode into, such as a slice of a
+        whole waveform. By default a new one is made.
 
     Returns
     -------
     np.ndarray
-        The block, as a float32 array of shape (3, n, nt).
+        The block, as a float32 array of shape (3, n, nt): `out`, if it is given.
 
     Raises
     ------
     ValueError
-        If `starts`, `nbytes`, `gains` and `offsets` do not all have the same shape.
-        If a stream decodes to some other number of samples than `nt`, as one that
-        was cut short does, or cut to nothing. The message names the stream's
-        component and station, counting the stations from `first_station`.
-    pyflac.DecoderProcessException
-        If a stream is damaged.
+        If `starts`, `nbytes`, `gains` and `offsets` do not all have the same shape,
+        or `out` isn't float32 of the block's shape. If a stream is damaged, so that
+        libFLAC can't decode it, or decodes to some other number of samples than
+        `nt`, as one that was cut short does, or cut to nothing. The message names the
+        stream's component and station, counting the stations from `first_station`.
     """
     shapes = [a.shape for a in (starts, nbytes, gains, offsets)]
     if len(set(shapes)) != 1:
@@ -189,15 +189,28 @@ def decode_block(
             "starts, nbytes, gains and offsets must have the same shape, got "
             f"{shapes[0]}, {shapes[1]}, {shapes[2]} and {shapes[3]}"
         )
-    block = np.empty((*starts.shape, nt), dtype=np.float32)
+    shape = (*starts.shape, nt)
+    if out is None:
+        block = np.empty(shape, dtype=np.float32)
+    elif out.dtype != np.float32 or out.shape != shape:
+        raise ValueError(
+            f"out must be float32 of shape {shape}, got {out.dtype} of shape "
+            f"{out.shape}"
+        )
+    else:
+        block = out
     for c, s in np.ndindex(*starts.shape):
         start, size = int(starts[c, s]), int(nbytes[c, s])
-        # The decoder needs bytes: it fails on a numpy slice of more than about 8 KB.
-        q = decode_stream(compressed[start : start + size].tobytes())
+        trace = f"component {c}, station {s + first_station}"
+        try:
+            # The decoder needs bytes: it fails on a numpy slice of more than about
+            # 8 KB.
+            q = decode_stream(compressed[start : start + size].tobytes())
+        except (pyflac.DecoderInitException, pyflac.DecoderProcessException) as e:
+            raise ValueError(f"{trace}: a FLAC stream is damaged ({e})") from e
         if q.size != nt:
             raise ValueError(
-                f"component {c}, station {s + first_station}: the stream decodes to "
-                f"{q.size} samples, expected {nt}"
+                f"{trace}: the stream decodes to {q.size} samples, expected {nt}"
             )
         block[c, s] = dequantise(q, gains[c, s], offsets[c, s])
     return block

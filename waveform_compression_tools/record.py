@@ -18,7 +18,7 @@ def make_record(
     input_hash: str | None,
     bits: int,
     result: CompressResult | None,
-    output: tuple[Path, int, str] | None,
+    output_path: Path,
     failure: tuple[str, str] | None,
     hash_s: float,
     total_s: float,
@@ -35,10 +35,10 @@ def make_record(
         The quantisation setting asked for.
     result : CompressResult or None
         What compressing made, if it finished: the record's check, its largest error,
-        the numbers of traces and of real stations, and the time spent compressing,
-        checking and hashing the output come from it.
-    output : tuple[Path, int, str] or None
-        The compressed file's path, size and content hash, if the run succeeded.
+        the numbers of traces and of real stations, the output's size and content hash,
+        and the time spent compressing, checking and hashing the output come from it.
+    output_path : Path
+        Where the compressed file goes, recorded as given if compressing finished.
     failure : tuple[str, str] or None
         Why the run stopped short, if it did: ``"refused"`` or ``"failed"``, and the
         reason.
@@ -71,8 +71,12 @@ def make_record(
             "content_hash": input_hash,
         },
         "output": None
-        if output is None
-        else {"path": str(output[0]), "bytes": output[1], "content_hash": output[2]},
+        if result is None
+        else {
+            "path": str(output_path),
+            "bytes": result.bytes_out,
+            "content_hash": result.output_hash,
+        },
         "bits": bits,
         "format_version": _FORMAT_VERSION,
         "checked": result is not None and result.max_relative_error is not None,
