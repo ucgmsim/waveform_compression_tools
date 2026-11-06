@@ -273,6 +273,7 @@ REFUSALS = {
     "a float64 waveform": ("src", False, "float32"),  # NotStandardLayout
     "an attribute JSON can't hold": ("src", False, "JSON"),  # NotStandardLayout
     "a _FillValue JSON can't hold": ("src", False, "JSON"),  # NotStandardLayout
+    "a _FillValue of text": ("src", False, "not a number"),  # NotStandardLayout
     "every station real": ("src", False, "real"),  # AllStationsReal
     "a NaN": ("src", True, "non-finite"),  # NonFiniteSamples
     "a fill value inside the data": ("src", True, "fill value"),  # NotStandardLayout

@@ -266,6 +266,10 @@ def refused_input(
         # One value, so that only its JSON can refuse it.
         with h5py.File(src, "r+") as f:
             f["waveform"].attrs["_FillValue"] = np.complex64(1 + 2j)
+    elif case == "a _FillValue of text":
+        # JSON holds text, so only the check of the fill value itself can refuse it.
+        with h5py.File(src, "r+") as f:
+            f["waveform"].attrs["_FillValue"] = "-999"
     elif case == "an attribute whose type can't be kept":
         with h5py.File(src, "r+") as f:
             pair = np.zeros((), np.dtype([("a", "<i4"), ("b", "<f4")]))

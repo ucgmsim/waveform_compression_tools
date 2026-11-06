@@ -562,10 +562,12 @@ def _encoding_back(text: str) -> dict:
 def _refuse_unkeepable_fill_values(encoding: dict, src: Path) -> None:
     """Refuse a waveform whose ``_FillValue`` and ``missing_value`` couldn't be kept.
 
-    Each has to be one value. If both are there, they have to be the same, a NaN the
-    same as a NaN, as the check compares them (see `_comparable_fills`): xarray can't write a dataset whose two
-    differ, so the file would compress and verify, but the dataset it decompresses to
-    couldn't be written to a file.
+    Each has to be one value, and a number, as a float32 waveform's fill value is: a
+    complex one is left for its JSON to refuse. If both are there, they have to be the
+    same, a NaN the same as a NaN, as the check compares them (see
+    `_comparable_fills`): xarray can't write a dataset whose two differ, so the file
+    would compress and verify, but the dataset it decompresses to couldn't be written
+    to a file.
 
     Parameters
     ----------
@@ -577,7 +579,8 @@ def _refuse_unkeepable_fill_values(encoding: dict, src: Path) -> None:
     Raises
     ------
     NotStandardLayout
-        If either holds more values than one, or none, or both are there and differ.
+        If either holds more values than one, or none, or isn't a number, or both are
+        there and differ.
     """
     given = {
         name: encoding[name] for name in _FILL_NAMES if encoding.get(name) is not None
@@ -587,6 +590,12 @@ def _refuse_unkeepable_fill_values(encoding: dict, src: Path) -> None:
             raise NotStandardLayout(
                 f"{src} has a {name} of {np.size(value)} values, not one, which a "
                 "compressed file can't keep",
+                src,
+            )
+        if np.asarray(value).dtype.kind not in "iufc":  # As text or bytes would be.
+            raise NotStandardLayout(
+                f"{src} has a {name} of {value!r}, which is not a number, as the fill "
+                "value of a float32 waveform has to be",
                 src,
             )
     if len(given) == 2:
