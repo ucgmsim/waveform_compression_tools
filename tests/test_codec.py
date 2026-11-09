@@ -84,8 +84,9 @@ def hard_traces(nt: int) -> dict[str, np.ndarray]:
 def test_real_trace_sizes_match_the_reference(
     real_traces: RealTraces, name: str, bits: int
 ) -> None:
-    # The only check of compressed size: a change that made files bigger, such as to
-    # pyflac or to the encoder's settings, fails here and nowhere else.
+    # The only check of the streams' size: a change that made them bigger, such as to
+    # pyflac or to the encoder's settings, fails here and nowhere else. test_files
+    # checks what a compressed file holds besides them.
     block = encode_block(real_traces(name), bits)
     assert sum(map(len, block.streams)) == pytest.approx(
         REAL_TRACE_FLAC_BYTES[name][bits], rel=0.01

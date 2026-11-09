@@ -38,6 +38,7 @@ from waveform_compression_tools.quantise import full_scale, quantise
 from waveform_compression_tools.stream import encode_stream
 
 from helpers import (
+    RealTraces,
     StandardDataset,
     contents,
     limit_file_sizes,
@@ -48,6 +49,7 @@ from helpers import (
     read,
     refused_input,
     run_python,
+    standard_dataset_of,
     with_a_flipped_byte,
     write,
     write_bbbin,
@@ -180,11 +182,17 @@ def test_compress_then_verify(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("options", "bits", "checked"),
+    ("options", "bits", "level", "checked"),
     [
-        pytest.param([], 32, True, id="the default"),
-        pytest.param(["--bits", "8"], 8, True, id="8 bits"),
-        pytest.param(["--bits", "24", "--no-check"], 24, False, id="24 bits unchecked"),
+        pytest.param([], 32, 5, True, id="the default"),
+        pytest.param(["--bits", "8", "--level", "0"], 8, 0, True, id="8 bits"),
+        pytest.param(
+            ["--bits", "24", "--level", "8", "--no-check"],
+            24,
+            8,
+            False,
+            id="24 bits unchecked",
+        ),
     ],
 )
 def test_compress_ok_writes_a_record(
@@ -193,6 +201,7 @@ def test_compress_ok_writes_a_record(
     monkeypatch: pytest.MonkeyPatch,
     options: list[str],
     bits: int,
+    level: int,
     checked: bool,
 ) -> None:
     src = write(standard_dataset(4, nt=300, real=(1,)), tmp_path / "in.nc")
@@ -232,10 +241,12 @@ def test_compress_ok_writes_a_record(
         "bytes": sizes[1],
         "content_hash": content_hash(dst),
     }
-    # The setting given, or 32, reaches the file and the record.
+    # The setting given, or 32, reaches the file and the record, and the level given,
+    # or 5, the record.
     with h5py.File(dst, "r") as f:
         assert int(f[GROUP].attrs["bits"]) == bits
     assert record["bits"] == compressed.bits == bits
+    assert record["level"] == level
     # Four stations of three traces, one of them real.
     assert (record["n_traces"], record["n_exact_stations"]) == (12, 1)
     # The check's largest error is the file's, as verify finds it, within the bound the
@@ -258,6 +269,21 @@ def test_compress_ok_writes_a_record(
     )
     assert seconds["check"] == compressed.check_s
     assert seconds["hash"] + seconds["compress"] + seconds["check"] <= seconds["total"]
+
+
+def test_a_higher_level_makes_a_smaller_file_that_decompresses_the_same(
+    tmp_path: Path, real_traces: RealTraces
+) -> None:
+    # These traces' streams at 24 bits are about 1.3 times smaller at level 8 than at 0.
+    src = write(standard_dataset_of(real_traces("hf")), tmp_path / "in.nc")
+    sizes, back = {}, {}
+    for level in (0, 8):
+        dst, out = tmp_path / f"{level}.nc", tmp_path / f"{level}.back.nc"
+        assert_exit(run("compress", src, dst, "--bits", 24, "--level", level), EXIT_OK)
+        assert_exit(run("decompress", dst, out), EXIT_OK)
+        sizes[level], back[level] = dst.stat().st_size, read(out)
+    assert sizes[8] < sizes[0]
+    xr.testing.assert_identical(back[0], back[8])
 
 
 # Each refusal of compress, as helpers.refused_input writes it, one for each Refused
@@ -309,11 +335,12 @@ def test_each_refusal_exits_3_with_one_line_and_a_record(
         "content_hash": content_hash(src) if after_the_hash else None,
     }
     assert record["output"] is None
-    assert (record["bits"], record["checked"], record["max_relative_error"]) == (
-        32,
-        False,
-        None,
-    )
+    assert (
+        record["bits"],
+        record["level"],
+        record["checked"],
+        record["max_relative_error"],
+    ) == (32, 5, False, None)
     assert (record["n_traces"], record["n_exact_stations"]) == (None, None)
     assert (record["seconds"]["hash"] > 0) is after_the_hash
 

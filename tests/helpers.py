@@ -93,6 +93,13 @@ def build_standard_dataset(
     )
 
 
+def standard_dataset_of(waveform: np.ndarray) -> xr.Dataset:
+    # The dataset of build_standard_dataset, holding these traces instead of its own.
+    ds = build_standard_dataset(waveform.shape[1], waveform.shape[2])
+    ds["waveform"].values = waveform
+    return ds
+
+
 def write(ds: xr.Dataset, path: Path, **options: Any) -> Path:
     ds.to_netcdf(path, engine="h5netcdf", **options)
     return path
@@ -177,6 +184,12 @@ def write_and_compress(
     src, dst = write(ds, folder / "in.nc"), folder / "out.nc"
     compress_file(src, dst, **options)
     return src, dst
+
+
+def rewrite(group: h5py.Group, name: str, data: np.ndarray) -> None:
+    # Replaces a dataset in a group, whatever its shape or type.
+    del group[name]
+    group.create_dataset(name, data=data)
 
 
 def stream_of(encoded: EncodedBlock, c: int, s: int) -> bytes:

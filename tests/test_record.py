@@ -63,6 +63,7 @@ def good(folder: Path, **changes: Any) -> dict:
         "input_path": src,
         "input_hash": None,
         "bits": 16,
+        "level": 8,
         "result": a_result(),
         "output_path": Path("out/a.nc"),
         "failure": None,
@@ -77,10 +78,12 @@ def test_a_record_has_exactly_the_schema(tmp_path: Path) -> None:
     rec = good(tmp_path)
     assert list(rec) == [
         "record_version", "tool", "tool_version", "status", "reason", "input",
-        "output", "bits", "format_version", "checked", "max_relative_error",
-        "n_traces", "n_exact_stations", "seconds", "finished_at",
+        "output", "bits", "level", "format_version", "checked",
+        "max_relative_error", "n_traces", "n_exact_stations", "seconds",
+        "finished_at",
     ]  # fmt: skip
-    assert rec["record_version"] == 1
+    assert rec["record_version"] == 2
+    assert (rec["bits"], rec["level"]) == (16, 8)
     assert rec["tool"] == "waveform_compression_tools"
     assert rec["tool_version"] == __version__
     assert (rec["status"], rec["reason"]) == ("ok", "")

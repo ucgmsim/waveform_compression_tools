@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.0
+
+The file format is unchanged, at version 1: 1.0.0 reads the files that 1.1.0 writes, and 1.1.0 reads 1.0.0's.
+
+- **A small file is made smaller too.** 1.0.0 kept the streams in chunks of 4 MiB, or of the waveform's size if that was smaller, and HDF5 keeps every chunk whole, however little of it is filled. So a file whose waveform was under 4 MiB came out no smaller, and a bigger one held up to 4 MiB more than its streams needed. Now the streams of a file compressed in one block, which holds up to about 128 MiB of waveform, are kept in exactly their size: the 2.6 MiB of LF traces in `tests/real_traces` come out 9.3× smaller at 24 bits, where 1.0.0 left them a little larger. A file compressed in more blocks keeps its streams in chunks of 1 MiB, or of the first block's streams if those are smaller, and so holds less than 1 MiB more than they need.
+- **The record names the FLAC level,** as `level`, after `bits`, so `record_version` is 2.
+
 ## 1.0.0
 
 The first release: the FLAC codec for float32 waveforms in netCDF files, as a package of its own. The file format is unchanged: the group `_flac_compressed_waveform`, at format version 1.

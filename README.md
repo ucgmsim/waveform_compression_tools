@@ -31,7 +31,7 @@ The setting, `--bits` on the command line or `bits` in Python, is from 8 to 32, 
 - A lower setting makes smaller files: the streams hold 32-bit integers at every setting, and a lower setting makes the integers smaller.
 - How much smaller depends on the waveforms. The factors above are for synthetic random walks like the tests' (300 stations of 39,629 samples, each trace the cumulative sum of unit normal steps), in which every step is new noise; on them, each bit fewer took about one bit off each sample in the streams. To choose, compress a typical file at the settings you are weighing, and compare the factors that `compress` prints.
 
-`--level`, from 0 (fastest) to 8 (smallest) and 5 by default, is FLAC's compression level. It changes only the size of the streams and the time taken, never the samples, and the file doesn't record it.
+`--level`, from 0 (fastest) to 8 (smallest) and 5 by default, is FLAC's compression level. It changes only the size of the streams and the time taken, never the samples. The compressed file doesn't record it; the record does (see [The record](#the-record)).
 
 ### Real stations stay exact
 
@@ -44,14 +44,14 @@ A file whose stations are all real isn't compressed, so that it stays exact as i
 There is no PyPI release. Install from a release tag, with pip:
 
 ```bash
-pip install "waveform_compression_tools @ git+https://github.com/ucgmsim/waveform_compression_tools@v1.0.0"
+pip install "waveform_compression_tools @ git+https://github.com/ucgmsim/waveform_compression_tools@v1.1.0"
 ```
 
 or with uv:
 
 ```bash
-uv pip install "waveform_compression_tools @ git+https://github.com/ucgmsim/waveform_compression_tools@v1.0.0"
-uv add git+https://github.com/ucgmsim/waveform_compression_tools --tag v1.0.0  # as a dependency of a uv project
+uv pip install "waveform_compression_tools @ git+https://github.com/ucgmsim/waveform_compression_tools@v1.1.0"
+uv add git+https://github.com/ucgmsim/waveform_compression_tools --tag v1.1.0  # as a dependency of a uv project
 ```
 
 It needs Python 3.11 or newer, and git, to fetch the tag. pyflac 3.0.0, which the package pins, is published only as source, so installing it compiles two small extension modules: the machine needs a C compiler and Python's headers. pyflac brings its own libFLAC, so no FLAC library needs to be installed.
@@ -129,7 +129,7 @@ The record's keys, in order:
 
 | Key | Type | Holds | Null |
 |---|---|---|---|
-| `record_version` | integer | 1 | never |
+| `record_version` | integer | 2 | never |
 | `tool` | string | `"waveform_compression_tools"` | never |
 | `tool_version` | string | the package's version | never |
 | `status` | string | `"ok"`, `"refused"` or `"failed"` | never |
@@ -139,6 +139,7 @@ The record's keys, in order:
 | `input.content_hash` | string | SRC's content hash (see below) | when the run stopped before hashing SRC, at step 2 or 3 |
 | `output` | object | `path`, `bytes` and `content_hash`, as for `input`, of DST | when `status` isn't `"ok"` |
 | `bits` | integer | the setting asked for | never |
+| `level` | integer | the FLAC compression level asked for | never |
 | `format_version` | integer | the format version written, 1 | never |
 | `checked` | boolean | whether compression finished with its check, which passed | never; false with `--no-check`, or when compression didn't finish |
 | `max_relative_error` | float | the largest error the check found, as a fraction of a trace's peak, with the exact copies in place, as `verify` measures it | with `--no-check`, or when compression didn't finish |
@@ -158,7 +159,7 @@ A content hash is computed as Dropbox's is: each 4 MiB block of the file is hash
 waveform-compression-tools decompress realisation.flac.nc back.nc
 ```
 
-Writes the netCDF file that SRC was made from: every variable, coordinate and attribute of the original, and its waveform as float32 with the dimensions (component, station, time), with its attributes in their types, and its `_FillValue` and `missing_value`. The real stations' traces are exactly as they were; every other sample is within one step of the original. The whole waveform is decoded into memory first (see [Limits in 1.0.0](#limits-in-100)).
+Writes the netCDF file that SRC was made from: every variable, coordinate and attribute of the original, and its waveform as float32 with the dimensions (component, station, time), with its attributes in their types, and its `_FillValue` and `missing_value`. The real stations' traces are exactly as they were; every other sample is within one step of the original. The whole waveform is decoded into memory first (see [Limits in 1.1.0](#limits-in-110)).
 
 ### verify
 
@@ -343,11 +344,11 @@ q = decode_flac(stream)  # any FLAC decoder, to int32 samples
 trace = (q.astype(np.float64) / gain + offset).astype(np.float32)
 ```
 
-## Limits in 1.0.0
+## Limits in 1.1.0
 
 - A file that holds an HDF5 group besides its root is refused: xarray reads only the root group, so its compressed file would go without the group.
 - `decompress` and `decompress_file` load the whole waveform into memory: 4 bytes a sample, and some working space. A file whose waveform doesn't fit in memory can be compressed and verified, but not yet decompressed. A later release is to decompress a block at a time.
-- The streams are stored in chunks of 4 MiB, or of the waveform's own size if that is smaller, and a compressed file holds whole chunks. So a file whose waveform is smaller than 4 MiB isn't made any smaller, and can come out larger; a bigger file holds up to 4 MiB more than its streams need.
+- A file compressed in more than one block (see [Blocks and memory](#blocks-and-memory)) holds up to 1 MiB more than its streams need. They grow a block at a time, in chunks of 1 MiB, or of the first block's streams if those are smaller, and HDF5 keeps every chunk whole, however little of it is filled. A file compressed in one block keeps its streams in exactly their size.
 
 ## Developing
 
@@ -368,4 +369,4 @@ uv run deptry .
 uvx npdlint check --extend-exclude "**/__init__.py"
 ```
 
-`lefthook.yml` runs the shared CI checks as git hooks, once `uvx lefthook install` has set them up. pyflac is pinned to 3.0.0 because `stream.py` decodes through its internals: run the tests again before moving the pin. A few tests compress the real traces in `tests/real_traces/` and compare their sizes with those an independent implementation measured: they are the only check that a change hasn't made the files bigger.
+`lefthook.yml` runs the shared CI checks as git hooks, once `uvx lefthook install` has set them up. pyflac is pinned to 3.0.0 because `stream.py` decodes through its internals: run the tests again before moving the pin. A few tests compress the real traces in `tests/real_traces/` and compare their sizes with those an independent implementation measured: they are the only check that a change hasn't made the streams bigger. Others check that a compressed file holds little besides its streams.

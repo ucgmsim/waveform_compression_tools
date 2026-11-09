@@ -211,11 +211,11 @@ def _write_compress_record(
     src: Path,
     dst: Path,
     bits: int,
+    level: int,
     start: float,
     hash_s: float,
     input_hash: str | None,
-    result: files.CompressResult | None,
-    stop: _Stop | None,
+    outcome: files.CompressResult | _Stop,
 ) -> None:
     """Write the record of a compress run, or exit if it can't be written.
 
@@ -229,16 +229,16 @@ def _write_compress_record(
         Where the compressed file goes.
     bits : int
         The setting asked for.
+    level : int
+        The FLAC compression level asked for.
     start : float
         When the command started, by `time.perf_counter`.
     hash_s : float
         The time spent hashing the input, in seconds.
     input_hash : str or None
         The input's content hash, if the run got as far as hashing it.
-    result : CompressResult or None
-        What compressing made, if the run succeeded.
-    stop : _Stop or None
-        Why the run stopped short, if it did.
+    outcome : CompressResult or _Stop
+        What compressing made, or why the run stopped short.
 
     Raises
     ------
@@ -247,14 +247,19 @@ def _write_compress_record(
         compressed file stays where it is.
     """
     total_s = time.perf_counter() - start
+    if isinstance(outcome, _Stop):
+        result, failure = None, (outcome.status, outcome.reason)
+    else:
+        result, failure = outcome, None
     try:
         record = make_record(
             input_path=src,
             input_hash=input_hash,
             bits=bits,
+            level=level,
             result=result,
             output_path=dst,
-            failure=None if stop is None else (stop.status, stop.reason),
+            failure=failure,
             hash_s=hash_s,
             total_s=total_s,
         )
@@ -454,6 +459,7 @@ def compress(
             stop.exit()
     hash_s = 0.0
     input_hash: str | None = None
+    outcome: files.CompressResult | _Stop
     try:
         with _about(src):
             files.check_compressible(src, dst, overwrite)
@@ -465,45 +471,35 @@ def compress(
                     input_hash = content_hash(src)
                 finally:
                     hash_s = time.perf_counter() - hashing
-            result = files.compress_file(
+            outcome = files.compress_file(
                 src, dst, bits, level, check=not no_check, overwrite=overwrite
             )
     except _Stop as stop:
-        if record is not None:
-            _write_compress_record(
-                record,
-                src=src,
-                dst=dst,
-                bits=bits,
-                start=start,
-                hash_s=hash_s,
-                input_hash=input_hash,
-                result=None,
-                stop=stop,
-            )
-        stop.exit()
+        outcome = stop
     if record is not None:
         _write_compress_record(
             record,
             src=src,
             dst=dst,
             bits=bits,
+            level=level,
             start=start,
             hash_s=hash_s,
             input_hash=input_hash,
-            result=result,
-            stop=None,
+            outcome=outcome,
         )
+    if isinstance(outcome, _Stop):
+        outcome.exit()
     typer.echo(
-        f"compressed {src} to {dst} at {result.bits} bits: "
-        f"{_count(result.n_traces, 'trace')}, "
-        f"{_count(result.n_exact, 'real station')} also kept exactly"
+        f"compressed {src} to {dst} at {outcome.bits} bits: "
+        f"{_count(outcome.n_traces, 'trace')}, "
+        f"{_count(outcome.n_exact, 'real station')} also kept exactly"
     )
     typer.echo(
-        f"{_size(result.bytes_in)} -> {_size(result.bytes_out)}, "
-        f"{_factor(result.bytes_in, result.bytes_out)} "
-        f"(read {result.read_s:.1f} s, encode {result.encode_s:.1f} s, "
-        f"write {result.write_s:.1f} s, check {result.check_s:.1f} s)"
+        f"{_size(outcome.bytes_in)} -> {_size(outcome.bytes_out)}, "
+        f"{_factor(outcome.bytes_in, outcome.bytes_out)} "
+        f"(read {outcome.read_s:.1f} s, encode {outcome.encode_s:.1f} s, "
+        f"write {outcome.write_s:.1f} s, check {outcome.check_s:.1f} s)"
     )
 
 

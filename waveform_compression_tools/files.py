@@ -93,10 +93,9 @@ ENCODER = f"waveform_compression_tools {__version__}"
 
 # The version of the layout described above. A reader refuses any other.
 _FORMAT_VERSION = 1
-# The compressed bytes are stored in chunks of this size, so that their dataset can
-# grow a block at a time, or of the waveform's own size if that is smaller, so that a
-# small file doesn't take 4 MiB.
-_CHUNK_BYTES = 4 * 2**20
+# The most bytes in a chunk of the streams of a file of more than one block, which grow
+# a block at a time (see _new_group).
+_CHUNK_BYTES = 2**20
 # The waveform's encoding that a compressed file keeps.
 _FILL_NAMES = ("_FillValue", "missing_value")
 
@@ -1010,9 +1009,6 @@ def compress_file(
             )
             out.raise_pending()
             with h5py.File(out, "r+") as f:
-                group, written = _new_group(
-                    f, waveform, exact, bits, kept["waveform_encoding"]
-                )
                 stream_crcs = np.zeros((n_component, n_station), np.uint32)
                 exact_crcs = np.zeros((n_component, exact.size), np.uint32)
                 worst = 0.0
@@ -1024,6 +1020,16 @@ def compress_file(
                     _refuse_fill_in_range(block, fills, bits, src)
                     encoded = encode_block(block, bits, level)
                     stopwatch.lap("encode")
+                    if s0 == 0:  # The first block, whose streams the group is made for.
+                        group, written = _new_group(
+                            f,
+                            waveform,
+                            exact,
+                            bits,
+                            kept["waveform_encoding"],
+                            first_bytes=int(encoded.nbytes.sum()),
+                            one_block=len(blocks) == 1,
+                        )
                     _append_streams(written, encoded, s0, s1)
                     # The streams are in the file now, and the check reads them back.
                     del encoded
@@ -1238,13 +1244,19 @@ def _new_group(
     exact: np.ndarray,
     bits: int,
     waveform_encoding: str,
+    first_bytes: int,
+    one_block: bool,
 ) -> tuple[h5py.Group, _Streams]:
     """Make the compressed waveform's group, with its two datasets that a pass fills.
 
-    ``compressed`` is made empty, to grow a block at a time, and then
-    ``exact_waveform``, in that order. The arrays of where each stream starts, its
-    length, gain and offset are made in memory, as zeros, to be written once the pass
-    is done.
+    The group is made once the first block is encoded, so that ``compressed`` fits the
+    streams: HDF5 keeps each chunk of a dataset whole, however little of it is filled.
+    In a file of one block, ``compressed`` is made contiguous, of exactly the size of
+    its streams. Otherwise it is made empty, to grow a block at a time, in chunks of
+    `_CHUNK_BYTES`, or of the first block's streams if they are smaller, so that it
+    keeps less than a chunk unused. Then ``exact_waveform`` is made.
+    The arrays of where each stream starts, its length, gain and offset are made in
+    memory, as zeros, to be written once the pass is done.
 
     Parameters
     ----------
@@ -1259,6 +1271,10 @@ def _new_group(
     waveform_encoding : str
         The waveform's ``_FillValue`` and ``missing_value``, as `_encoding_json` wrote
         them.
+    first_bytes : int
+        The bytes of the first block's streams.
+    one_block : bool
+        Whether the first block holds every station.
 
     Returns
     -------
@@ -1269,10 +1285,18 @@ def _new_group(
     """
     n_component, n_station, nt = waveform.shape
     group = f.create_group(GROUP)
-    chunk = min(_CHUNK_BYTES, max(1, 4 * n_component * n_station * nt))
-    compressed = group.create_dataset(
-        "compressed", shape=(0,), maxshape=(None,), dtype=np.uint8, chunks=(chunk,)
-    )
+    if one_block:
+        compressed = group.create_dataset(
+            "compressed", shape=(first_bytes,), dtype=np.uint8
+        )
+    else:
+        compressed = group.create_dataset(
+            "compressed",
+            shape=(0,),
+            maxshape=(None,),
+            dtype=np.uint8,
+            chunks=(max(1, min(_CHUNK_BYTES, first_bytes)),),
+        )
     exact_waveform = group.create_dataset(
         "exact_waveform", shape=(n_component, exact.size, nt), dtype=np.float32
     )
@@ -1296,6 +1320,9 @@ def _new_group(
 def _append_streams(written: _Streams, encoded: EncodedBlock, s0: int, s1: int) -> None:
     """Write a block's streams after those already written, and record where they are.
 
+    ``compressed`` grows to hold them, unless it was made their size (see
+    `_new_group`).
+
     Parameters
     ----------
     written : _Streams
@@ -1308,14 +1335,16 @@ def _append_streams(written: _Streams, encoded: EncodedBlock, s0: int, s1: int) 
     s1 : int
         The station after its last.
     """
-    end = written.compressed.shape[0]
+    end = int(written.nbytes[:, :s0].sum())  # The earlier blocks' streams.
     sizes = encoded.nbytes.ravel()
     block_starts = end + np.cumsum(sizes) - sizes
     written.starts[:, s0:s1] = block_starts.reshape(encoded.nbytes.shape)
     written.nbytes[:, s0:s1] = encoded.nbytes
     written.gains[:, s0:s1] = encoded.gains
-    written.compressed.resize((end + int(sizes.sum()),))
-    written.compressed[end:] = np.concatenate(
+    stop = end + int(sizes.sum())
+    if written.compressed.shape[0] < stop:
+        written.compressed.resize((stop,))
+    written.compressed[end:stop] = np.concatenate(
         [np.frombuffer(stream, np.uint8) for stream in encoded.streams]
     )
 

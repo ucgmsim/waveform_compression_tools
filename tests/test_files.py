@@ -47,6 +47,7 @@ from waveform_compression_tools.stream import encode_stream
 
 from helpers import (
     MakeBbbin,
+    RealTraces,
     StandardDataset,
     limit_file_sizes,
     limits_file_sizes,
@@ -54,7 +55,9 @@ from helpers import (
     nothing_left,
     partial_of,
     read,
+    rewrite,
     run_python,
+    standard_dataset_of,
     within_one_step_of_the_setting,
     write,
     write_and_compress,
@@ -76,12 +79,6 @@ def assert_attrs_come_back(src: Path, dst: Path) -> None:
         assert type(back[name]) is type(value), name
         if isinstance(value, np.ndarray | np.generic):
             assert back[name].dtype == value.dtype, name
-
-
-def rewrite(group: h5py.Group, name: str, data: np.ndarray) -> None:
-    # Replaces a dataset in a group, whatever its shape or type.
-    del group[name]
-    group.create_dataset(name, data=data)
 
 
 def streaminfo(stream: bytes) -> dict[str, int]:
@@ -469,15 +466,47 @@ def test_decompress_decodes_each_block_into_the_waveform(
         assert out is not None and np.shares_memory(out, waveform)
 
 
-def test_a_small_file_has_chunks_no_larger_than_its_waveform(
-    tmp_path: Path, standard_dataset: StandardDataset
-) -> None:
-    # Chunks of 4 MiB would make every compressed file take at least that much.
-    src, dst = write_and_compress(standard_dataset(3, nt=100), tmp_path)
+def unused_bytes(dst: Path) -> tuple[int, int]:
+    # The bytes of a compressed file's streams, and the bytes HDF5 keeps for them but
+    # doesn't use: a chunk is kept whole, however little of it is filled.
     with h5py.File(dst, "r") as f:
-        (chunk,) = f[GROUP]["compressed"].chunks
-    assert chunk <= 3 * 3 * 100 * 4  # The waveform's bytes, as float32.
-    assert verify_file(src, dst).passed
+        compressed = f[GROUP]["compressed"]
+        streams = compressed.shape[0]
+        return streams, compressed.id.get_storage_size() - streams
+
+
+def test_a_file_in_one_block_keeps_no_byte_unused(
+    tmp_path: Path, real_traces: RealTraces
+) -> None:
+    # The streams of a file in one block are kept in exactly their size. Kept in a
+    # bigger chunk, which HDF5 keeps whole, they would leave a file of a few MiB little
+    # smaller than its original, and these traces' streams, 1.26 MB at 32 bits, would
+    # leave most of a second 1 MiB chunk unused.
+    waveform = real_traces("bb")
+    src, dst = write_and_compress(standard_dataset_of(waveform), tmp_path)
+    streams, unused = unused_bytes(dst)
+    assert unused == 0
+    # Besides its streams, the file holds little more than the original does besides
+    # its waveform: the group's other datasets and attributes.
+    rest = src.stat().st_size - waveform.nbytes
+    assert dst.stat().st_size - streams < rest + 16 * 2**10
+
+
+# A file is written in blocks of 2 stations, or of 9. These traces' streams at 32 bits
+# take 1.26 MB, of which the first 2 stations' take 0.25 MB and the first 9's 1.14 MB,
+# more than the chunks' 1 MiB.
+@pytest.mark.parametrize("block_stations", [2, 9])
+def test_a_file_in_blocks_keeps_less_than_a_chunk_unused(
+    tmp_path: Path, real_traces: RealTraces, block_stations: int
+) -> None:
+    waveform = real_traces("bb")
+    _, dst = write_and_compress(
+        standard_dataset_of(waveform), tmp_path, block_stations=block_stations
+    )
+    with h5py.File(dst, "r") as f:
+        first = int(f[GROUP]["stream_bytes"][:, :block_stations].sum())
+    _, unused = unused_bytes(dst)
+    assert unused < min(2**20, first)
 
 
 def test_verify_fails_a_trace_that_decodes_a_few_steps_off(
@@ -1001,11 +1030,11 @@ def test_verify_checks_the_flac_streams_of_real_stations_too(
             stream = np.frombuffer(
                 encode_stream(quantise(original[0, 1], gain)), np.uint8
             )
-            end = g["compressed"].shape[0]
-            g["compressed"].resize((end + stream.size,))
-            g["compressed"][end:] = stream
-            g["stream_starts"][0, 1], g["stream_bytes"][0, 1] = end, stream.size
-            g["stream_gains"][0, 1] = gain
+            # In the place of the 32-bit stream, which is longer.
+            start = int(g["stream_starts"][0, 1])
+            assert stream.size < g["stream_bytes"][0, 1]
+            g["compressed"][start : start + stream.size] = stream
+            g["stream_bytes"][0, 1], g["stream_gains"][0, 1] = stream.size, gain
         else:
             for name in ("stream_starts", "stream_bytes"):
                 g[name][0, 1] = g[name][0, 0]

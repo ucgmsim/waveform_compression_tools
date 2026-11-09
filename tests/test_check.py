@@ -43,6 +43,7 @@ from helpers import (
     nothing_left,
     read,
     refused_input,
+    rewrite,
     stream_of,
     with_a_flipped_byte,
     with_stream,
@@ -287,7 +288,7 @@ def test_damage_after_the_pass_fails_the_structure_check(
             elif damage == "another exact station":
                 g["exact_stations"][0] = 2
             elif damage == "a byte more of streams":
-                g["compressed"].resize((g["compressed"].shape[0] + 1,))
+                rewrite(g, "compressed", np.append(g["compressed"][...], np.uint8(0)))
             elif damage == "another trace length":
                 g["stream_starts"].attrs["stream_size"] = 399
             elif damage == "a finer setting claimed":
