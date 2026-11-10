@@ -5,7 +5,7 @@ stations, in cm/s^2. This is the layout in which the simulation's HF.bin writer 
 them, and in which qcore's former HFSeis reader read them, but for the names: that
 reader cut them to 7 characters, where the writer wrote 8. Every number in the file is
 in one byte order, the writer's, which `read_hfbin` tells from the file's size, as
-`waveform_compression_tools.bbbin` does for BB.bin:
+for a BB.bin (see `waveform_compression_tools.legacy`):
 
 - a header of 0x200 bytes: 16 int32, ``nstat`` (the number of stations), ``nt`` (of
   samples), ``seed``, ``siteamp``, ``pdur_model``, ``nrayset``, ``rayset1`` to
@@ -34,7 +34,7 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 
-from .bbbin import _SAMPLE_BYTES, _layout, _standard_waveform
+from . import legacy
 from .codec import STANDARD_COMPONENTS, STANDARD_DIMS
 from .destinations import check_destination, write_netcdf
 from .errors import IncompleteHFBin, NotHFBin
@@ -167,7 +167,7 @@ def read_hfbin(path: str | os.PathLike[str]) -> xr.Dataset:
     with path.open("rb") as f:
         size = os.fstat(f.fileno()).st_size
         head = f.read(_HEAD_BYTES)
-        layout = _layout(head, size, _HEAD_BYTES, _STATION_BYTES)
+        layout = legacy.layout(head, size, _HEAD_BYTES, _STATION_BYTES)
         if layout is None:
             raise NotHFBin(f"not an HF.bin file: {path} ({size} bytes)", path)
         endian, nstat, nt = layout
@@ -192,8 +192,8 @@ def read_hfbin(path: str | os.PathLike[str]) -> xr.Dataset:
                 path,
             )
         # Only a file that can be converted has its traces read.
-        samples = f.read(nstat * nt * _SAMPLE_BYTES)
-    waveform = _standard_waveform(samples, endian, nstat, nt)
+        samples = f.read(nstat * nt * legacy.SAMPLE_BYTES)
+    waveform = legacy.standard_waveform(samples, endian, nstat, nt)
     ints = np.frombuffer(head, f"{endian}i4", count=len(_INT_FIELDS))
     floats = np.frombuffer(
         head, f"{endian}f4", count=len(_FLOAT_FIELDS), offset=_FLOATS_AT
