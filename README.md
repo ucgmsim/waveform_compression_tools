@@ -214,8 +214,8 @@ Every command exits with one of these statuses. They are published, and are the 
 | Status | Constant | Means |
 |---|---|---|
 | 0 | `EXIT_OK` | The command did its work. For `compress`, the output is in place, and checked unless `--no-check` was given; for `verify`, the file passed. |
-| 1 | `EXIT_FAILED` | The run went wrong: a failed check (`compress`'s own, or a file that doesn't agree with its original in `verify`); a damaged compressed file; a compressed file whose waveform has another shape than its original's; an error from libFLAC; a file that can't be read or written, including a missing, unreadable or cut-short input, a missing destination or record folder, and a full disk or quota; an output that can't be hashed; a record that can't be written; or anything unexpected. |
-| 2 | `EXIT_USAGE` | Typer refused the arguments: a missing input, a folder where a file is named, `--bits` outside 8 to 32, `--level` outside 0 to 8, an unknown option, or a `--record` that is SRC or DST, or whose `.partial` is. Typer prints its own message, of a few lines. |
+| 1 | `EXIT_FAILED` | The run went wrong: a failed check (`compress`'s own, or a file that doesn't agree with its original in `verify`); a damaged compressed file; a compressed file whose waveform has another shape than its original's; an error from libFLAC; a file that can't be read or written, including a cut-short input, a missing destination or record folder, and a full disk or quota; an output that can't be hashed; a record that can't be written; or anything unexpected. |
+| 2 | `EXIT_USAGE` | Typer refused the arguments: a missing or unreadable input, a folder where a file is named, `--bits` outside 8 to 32, `--level` outside 0 to 8, an unknown option, or a `--record` that is SRC or DST, or whose `.partial` is. Typer prints its own message, of a few lines. |
 | 3 | `EXIT_REFUSED` | An input can't be used as it is, or a destination is taken (see below). |
 
 The refusals, by command:
@@ -406,7 +406,7 @@ trace = (q.astype(np.float64) / gain + offset).astype(np.float32)
 
 - A file that holds an HDF5 group besides its root is refused: xarray reads only the root group, so its compressed file would go without the group.
 - `decompress_file` holds the whole waveform in memory: 4 bytes a sample, and some working space. For a file whose waveform doesn't fit there, `decompress` and `decompress_to` write it to a netCDF file a block at a time, and `open_dataset` reads only the part that is selected (see [Reading a few stations](#reading-a-few-stations)).
-- A time coordinate in CF units, such as `seconds since 2020-01-01`, that holds fractions of a second as floats may not compress. xarray decodes such times and encodes them again, and a fraction can come back as a slightly different float. Then compress's check fails, with `CheckFailed`, and nothing is written. Times held as integers, or as whole seconds, compress.
+- A time coordinate in CF units, such as `seconds since 2020-01-01`, that holds fractions of a second as floats may not compress. xarray decodes such times and encodes them again, and a fraction can come back as a slightly different float. Then compress's check fails, with `CheckFailed`, and nothing is written. With `--no-check` (`check=False`), the file is written with those times changed, and `decompress` gives them back changed. `verify` fails it, with a line that says its variables, coordinates or attributes differ, though its largest error is as small as ever. Times held as integers, or as whole seconds, compress.
 - A file compressed in more than one block (see [Blocks and memory](#blocks-and-memory)) holds up to 1 MiB more than its streams need. They grow a block at a time, in chunks of 1 MiB, or of the first block's streams if those are smaller, and HDF5 keeps every chunk whole, however little of it is filled. A file compressed in one block keeps its streams in exactly their size.
 
 ## Developing
