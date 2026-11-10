@@ -5,8 +5,8 @@
 - ``compress SRC DST``: `waveform_compression_tools.files.compress_file`, which checks
   the file it writes, with a JSON record of the run if asked (see
   `waveform_compression_tools.record`);
-- ``decompress SRC DST``: `waveform_compression_tools.files.decompress_file`, written
-  to a netCDF file;
+- ``decompress SRC DST``: `waveform_compression_tools.files.decompress_to`, which
+  writes a netCDF file a block of stations at a time;
 - ``verify ORIGINAL COMPRESSED``: `waveform_compression_tools.files.verify_file`;
 - ``convert-bbbin SRC DST``: `waveform_compression_tools.bbbin.convert_bbbin`;
 - ``convert-hfbin SRC DST``: `waveform_compression_tools.hfbin.convert_hfbin`.
@@ -180,7 +180,8 @@ def _about(path: Path) -> Generator[None]:
     """Turn any error in a block into a `_Stop` that names the file it is about.
 
     An error that says which file it is about, as an `OSError`, a refusal or a failed
-    check does, names that file instead.
+    check does, names that file instead, and a `_Stop` from a step within the block,
+    about another file, is raised as it is.
 
     Parameters
     ----------
@@ -200,6 +201,8 @@ def _about(path: Path) -> Generator[None]:
     """
     try:
         yield
+    except _Stop:
+        raise
     # Every error becomes one line, never a traceback.
     except Exception as error:
         named = destinations.named_file(error)
@@ -525,10 +528,9 @@ def decompress(
     (component, station, time). The real stations' traces are exactly as they were;
     every other sample is within one quantisation step of the original.
 
-    The whole waveform is decoded into memory, so this command suits files whose
-    waveform fits there: it needs 4 bytes for each sample, and some working space.
-    The file appears at DST only when it is complete. A file already at DST is
-    replaced only with --overwrite.
+    The waveform is decoded and written a block of stations at a time, so memory
+    holds one block, however big the file is. The file appears at DST only when it is
+    complete. A file already at DST is replaced only with --overwrite.
 
     The command exits with status 0 when the file is decompressed, 1 when the run
     fails, as for a damaged file, 2 for a usage error, and 3 when SRC is refused, as a
@@ -551,15 +553,11 @@ def decompress(
         is SRC or is there already, and with `EXIT_FAILED` if the run fails.
     """
     try:
-        with _about(dst):
-            destinations.check_destination(dst, src, overwrite=overwrite)
-        with _about(src):
-            ds = files.decompress_file(src)
-        with _about(dst):
-            destinations.write_netcdf(ds, dst)
+        # Each step names its own file: DST as the destination is checked and written,
+        # and SRC as it is read, a block at a time, as DST is written.
+        n_component, n_station, nt = files._decompress_to(src, dst, overwrite, _about)
     except _Stop as stop:
         stop.exit()
-    n_component, n_station, nt = ds["waveform"].shape
     typer.echo(
         f"decompressed {src} to {dst}: "
         f"{_count(n_component * n_station, 'trace')} of {nt} samples, "

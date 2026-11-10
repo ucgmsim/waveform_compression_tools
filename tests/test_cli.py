@@ -824,6 +824,34 @@ def test_a_damaged_file_fails_the_check(
     assert contents(tmp_path) == before  # Nothing at DST, nor anywhere else.
 
 
+def test_a_damaged_stream_found_as_dst_is_written_names_src(
+    tmp_path: Path, standard_dataset: StandardDataset, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # decompress writes each block as it decodes it, so a damaged stream of a later
+    # block is found partway through the write. The line names SRC all the same, and
+    # DST is left as it was.
+    _, packed = compressed_file(standard_dataset(5, nt=100), tmp_path)
+    with h5py.File(packed, "r+") as f:
+        f[GROUP]["stream_bytes"][1, 3] = 0  # Station 3 is in the second block.
+    monkeypatch.setattr(files, "BLOCK_BYTES", 2 * 3 * 100 * 4)  # Blocks of 2 stations.
+    back = tmp_path / "back.nc"
+    back.write_bytes(b"an earlier file")
+    decode = files.decode_block
+    begun: list[bool] = []
+
+    def watched(*args: Any, **kwargs: Any) -> np.ndarray:
+        begun.append(partial_of(back).exists())  # Whether the write had begun.
+        return decode(*args, **kwargs)
+
+    monkeypatch.setattr(files, "decode_block", watched)
+    reason = assert_stopped(
+        run("decompress", packed, back, "--overwrite"), EXIT_FAILED, packed
+    )
+    assert "component 1, station 3: the stream decodes to 0 samples" in reason
+    assert begun == [True, True]
+    assert back.read_bytes() == b"an earlier file" and not partial_of(back).exists()
+
+
 # What each command's line gives when its write fails, or None where the failure is an
 # interruption, which isn't caught. The unexpected error's message is of two lines, as
 # some of xarray's are, which the line joins into one.
