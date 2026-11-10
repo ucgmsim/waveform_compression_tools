@@ -129,14 +129,37 @@ class _CompressedFile:
         self._manager.close()
 
 
+def _chosen(key: int | slice | np.ndarray, n: int) -> np.ndarray:
+    """Give the indices that an outer key chooses along a dimension.
+
+    Parameters
+    ----------
+    key : int, slice or np.ndarray
+        The key: an index, a slice or an array of indices.
+    n : int
+        The dimension's length.
+
+    Returns
+    -------
+    np.ndarray
+        The indices chosen, as an array of one dimension. It is no longer than the key
+        chooses.
+    """
+    return np.arange(*key.indices(n)) if isinstance(key, slice) else np.atleast_1d(key)
+
+
 def _read_traces(
-    streams: _Streams, components: np.ndarray, stations: np.ndarray, times: np.ndarray
+    streams: _Streams,
+    components: np.ndarray,
+    stations: np.ndarray,
+    times: slice | np.ndarray,
 ) -> np.ndarray:
     """Read some traces as `decompress_file` gives them, reading only what they need.
 
     The traces are every chosen component of every chosen station, each cut to the
     chosen samples. Each is decoded on its own (see `_Streams.trace`), and cut as soon
-    as it is decoded, so memory holds the cut traces and one whole one.
+    as it is decoded, so memory holds the cut traces and one whole one. When no sample
+    is chosen, nothing is decoded.
 
     Parameters
     ----------
@@ -146,8 +169,9 @@ def _read_traces(
         The components, as indices.
     stations : np.ndarray
         The stations, as indices.
-    times : np.ndarray
-        The samples of each trace, as indices.
+    times : slice or np.ndarray
+        The samples of each trace, as a slice, which cuts a trace without copying it,
+        or as indices.
 
     Returns
     -------
@@ -160,7 +184,10 @@ def _read_traces(
         If a stream is damaged, or decodes to the wrong number of samples (see
         `waveform_compression_tools.codec.decode_trace`).
     """
-    traces = np.empty((components.size, stations.size, times.size), np.float32)
+    n_time = len(range(streams.nt)[times]) if isinstance(times, slice) else times.size
+    traces = np.empty((components.size, stations.size, n_time), np.float32)
+    if traces.size == 0:
+        return traces
     for (i, c), (j, s) in itertools.product(enumerate(components), enumerate(stations)):
         traces[i, j] = streams.trace(int(c), int(s))[times]
     return traces
@@ -233,10 +260,17 @@ class _LazyWaveform(BackendArray):
         ValueError
             If the file has been closed, or a stream doesn't decode.
         """
-        chosen = [np.arange(n)[k] for n, k in zip(self.shape, key, strict=True)]
+        components, stations, times = key
+        n_component, n_station, _ = self.shape
         with self.file.reading() as streams:
-            traces = _read_traces(streams, *map(np.atleast_1d, chosen))
-        return traces.reshape([n for indices in chosen for n in np.shape(indices)])
+            traces = _read_traces(
+                streams,
+                _chosen(components, n_component),
+                _chosen(stations, n_station),
+                times if isinstance(times, slice) else np.atleast_1d(times),
+            )
+        # An integer drops its dimension, as it does in numpy.
+        return traces[tuple(0 if isinstance(k, int) else slice(None) for k in key)]
 
 
 def _open(

@@ -80,6 +80,19 @@ def record_reads(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, Any]]:
     return reads
 
 
+def record_decodes(monkeypatch: pytest.MonkeyPatch) -> list[bytes]:
+    # Each stream decoded from now on.
+    decoded: list[bytes] = []
+    decode = codec.decode_stream
+
+    def spy(stream: bytes) -> np.ndarray:
+        decoded.append(bytes(stream))
+        return decode(stream)
+
+    monkeypatch.setattr(codec, "decode_stream", spy)
+    return decoded
+
+
 SELECTIONS: dict[str, Callable[[xr.Dataset], xr.Dataset]] = {
     "everything": lambda ds: ds,
     "stations by name": lambda ds: ds.sel(station=["S000010", "R003", "S000005"]),
@@ -99,6 +112,9 @@ SELECTIONS: dict[str, Callable[[xr.Dataset], xr.Dataset]] = {
     "no stations": lambda ds: ds.isel(station=[]),
     "a component by name": lambda ds: ds.sel(component="090"),
     "components by index": lambda ds: ds.isel(component=[2, 0]),
+    "a chain": lambda ds: (
+        ds.isel(station=slice(2, 11)).isel(station=[6, 0, 1]).sel(component="ver")
+    ),
     "a time range": lambda ds: ds.sel(time=slice(0.2, 0.9)),
     "a sample": lambda ds: ds.isel(time=150),
     "all three": lambda ds: ds.isel(
@@ -139,15 +155,7 @@ def test_only_the_selected_traces_are_read_and_decoded(
         stream_bytes[starts[c, s] : starts[c, s] + nbytes[c, s]].tobytes()
         for c, s in selected
     )
-    decoded: list[bytes] = []
-    decode = codec.decode_stream
-
-    def spy_decode(blob: bytes) -> np.ndarray:
-        decoded.append(bytes(blob))
-        return decode(blob)
-
-    monkeypatch.setattr(codec, "decode_stream", spy_decode)
-    reads = record_reads(monkeypatch)
+    decoded, reads = record_decodes(monkeypatch), record_reads(monkeypatch)
     names = {f"/{GROUP}/compressed", f"/{GROUP}/exact_waveform"}
     with open_dataset(compressed) as ds:
         repr(ds)
@@ -249,7 +257,17 @@ def test_a_damaged_stream_fails_its_own_trace_alone(
     assert bit_identical(got, want.values)
 
 
-# A file of a few stations, and one of four times as many. A station's waveform is 3
+def test_choosing_no_samples_decodes_nothing(
+    compressed: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    decoded = record_decodes(monkeypatch)
+    with open_dataset(compressed) as ds:
+        got = ds["waveform"].isel(time=[]).values
+    assert got.shape == (3, N_STATION, 0) and decoded == []
+
+
+# A file of a few stations, and one of four times as many, each in blocks of 64
+# stations, with every 50th station real and a _FillValue. A station's waveform is 3
 # traces of 1,000 float32 samples, 12 kB.
 FEW, MANY, NT_MEMORY = 100, 400, 1_000
 
@@ -259,14 +277,16 @@ def few_and_many(tmp_path_factory: pytest.TempPathFactory) -> dict[int, Path]:
     folder = tmp_path_factory.mktemp("sizes")
     paths = {}
     for n_station in (FEW, MANY):
-        ds = build_standard_dataset(n_station, NT_MEMORY)
+        ds = build_standard_dataset(n_station, NT_MEMORY, real=range(0, n_station, 50))
+        ds["waveform"].encoding["_FillValue"] = np.float32(-999.0)
         src, paths[n_station] = folder / "in.nc", folder / f"out{n_station}.nc"
-        compress_file(write(ds, src), paths[n_station], bits=8)
+        compress_file(write(ds, src), paths[n_station], bits=8, block_stations=64)
         src.unlink()
     return paths
 
 
 def peak_reading_three_stations(path: Path) -> int:
+    # Station 50 is real.
     tracemalloc.start()
     try:
         with open_dataset(path) as ds:
