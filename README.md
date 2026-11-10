@@ -14,7 +14,7 @@ A Python package, `waveform_compression_tools`, and a command, `waveform-compres
 
 An input has to be in the standard layout: a float32 data variable `waveform` with exactly the dimensions (component, station, time), a `station` coordinate that names the stations, and no HDF5 group besides the root. The components can be named anything, such as `x`, `y`, `z` or `000`, `090`, `ver`.
 
-`compress` and `verify` work a block of stations at a time, so their memory doesn't grow with the file. On a synthetic file of 36.4 GiB, `compress` peaked at 0.74 GB of resident memory, and `verify` at 0.76 GB.
+`compress`, `verify` and `decompress` work a block of stations at a time, so their memory doesn't grow with the file. On a synthetic file of 36.4 GiB, `compress` peaked at 0.74 GB of resident memory, and `verify` at 0.76 GB. `decompress` peaked at 0.34 GB on a file of 3.5 GiB, and at 0.35 GB on one of 10.6 GiB.
 
 ### Choosing a setting
 
@@ -161,7 +161,7 @@ A content hash is computed as Dropbox's is: each 4 MiB block of the file is hash
 waveform-compression-tools decompress realisation.flac.nc back.nc
 ```
 
-Writes the netCDF file that SRC was made from: every variable, coordinate and attribute of the original, and its waveform as float32 with the dimensions (component, station, time), with its attributes in their types, and its `_FillValue` and `missing_value`. The real stations' traces are exactly as they were; every other sample is within one step of the original. The whole waveform is decoded into memory first (see [Limits in 1.1.0](#limits-in-110)).
+Writes the netCDF file that SRC was made from: every variable, coordinate and attribute of the original, and its waveform as float32 with the dimensions (component, station, time), with its attributes in their types, and its `_FillValue` and `missing_value`. The real stations' traces are exactly as they were; every other sample is within one step of the original. The waveform is decoded and written a block of stations at a time (see [Blocks and memory](#blocks-and-memory)), so a file of any size can be decompressed.
 
 ### verify
 
@@ -228,7 +228,7 @@ The refusals, by command:
 
 A refusal writes nothing but `compress`'s record, and leaves a file already at the destination as it was. A file that isn't HDF5 at all is refused, while an HDF5 file that is damaged or cut short is a failure: it may be the right kind of file, and the run went wrong.
 
-An interruption (Ctrl-C) is left to Typer, which ends the run with its own status; `compress` writes no record then. While a file is written, a Ctrl-C waits until it is safe to act on, so that HDF5 never takes it for a failed write: for `compress`, until the end of the block of stations, and for `decompress`, `convert-bbbin` and `convert-hfbin`, until the file is written, which is then deleted. Pressed again while it waits, Ctrl-C ends the run at once, leaving `DST.partial`.
+An interruption (Ctrl-C) is left to Typer, which ends the run with its own status; `compress` writes no record then. While a file is written, a Ctrl-C waits until it is safe to act on, so that HDF5 never takes it for a failed write: for `compress` and `decompress`, until the end of the block of stations, and for `convert-bbbin` and `convert-hfbin`, until the file is written, which is then deleted. Pressed again while it waits, Ctrl-C ends the run at once, leaving `DST.partial`.
 
 ### The error line
 
@@ -249,7 +249,7 @@ An unexpected error's reason starts with its type, such as `RuntimeError: …`. 
 ### Destinations, partial files and reruns
 
 - Every command that writes a file writes it to the destination with `.partial` added, and renames it when it is complete, so a file appears at its destination complete or not at all. A run that fails deletes its partial file.
-- A write that fails partway, on a full disk or past a quota, fails the run with the system's reason, naming the output, as `waveform-compression-tools: out.nc: [Errno 28] No space left on device: 'out.nc'`, and `compress` stops at the end of the block of stations it was writing. HDF5 writes each output through a file object that never tells it a write failed, a workaround for an HDF5 bug: its own error would hide the system's, and HDF5 2.0.0 to 2.2.0 can crash Python afterwards.
+- A write that fails partway, on a full disk or past a quota, fails the run with the system's reason, naming the output, as `waveform-compression-tools: out.nc: [Errno 28] No space left on device: 'out.nc'`, and `compress` and `decompress` stop at the end of the block of stations they were writing. HDF5 writes each output through a file object that never tells it a write failed, a workaround for an HDF5 bug: its own error would hide the system's, and HDF5 2.0.0 to 2.2.0 can crash Python afterwards.
 - A run that is killed, by a time limit, the out-of-memory killer or SIGKILL, may leave `DST.partial` behind. The next run replaces it, and it is safe to delete.
 - A file already at DST, or at the record's PATH, is replaced only with `--overwrite` (`overwrite=True` in Python).
 - With `--overwrite`, the earlier output stays until the new file is checked, hashed and renamed into place, so a run that fails before then leaves it as it was. The input is untouched, so a rerun makes it again.
@@ -277,7 +277,7 @@ check = verify_file(src, dst)  # the original first
 print(check.passed, check.max_relative_error)
 
 ds = decompress_file(dst)  # an xarray Dataset, held in memory
-decompress_to(dst, Path("back.nc"))  # the same, written to a netCDF file
+decompress_to(dst, Path("back.nc"))  # the same, written a block at a time
 
 bb = read_bbbin(Path("BB.bin"))  # a Dataset in the standard layout
 convert_bbbin(Path("BB.bin"), Path("bb.nc"))  # the same, written to a netCDF file
@@ -289,7 +289,7 @@ A path can be given as a string or as a `pathlib.Path` object.
 
 - `compress_file(src, dst, bits=32, level=5, block_stations=None, check=True, overwrite=False)` returns a `CompressResult`: `bytes_in` and `bytes_out`, `n_traces`, `n_exact` (the real stations), `bits`, `max_relative_error` (None without the check), `output_hash` (the output's content hash), the wall time spent reading, encoding, writing, checking and hashing, from `read_s` to `hash_s`, and the CPU time of the first four, from `read_cpu_s` to `check_cpu_s`. It first makes the checks of `check_compressible(src, dst, overwrite)`: DST's, its folder included, and then the refusals of SRC that need no samples; `check_compressible` can be called on its own.
 - `verify_file(original, compressed, block_stations=None)` returns a `VerifyResult`: `passed`, `max_relative_error`, `n_exact` and `verify_s`. A file that doesn't agree gives `passed=False`; it doesn't raise.
-- `decompress_file(path)` returns the original dataset, loaded into memory, and `decompress_to(src, dst, overwrite=False)` writes it to a netCDF file, through a `.partial`.
+- `decompress_file(path)` returns the original dataset, loaded into memory. `decompress_to(src, dst, overwrite=False)` writes the same dataset to a netCDF file, through a `.partial`, a block of stations at a time, so its memory doesn't grow with the file.
 - `read_bbbin(path)` reads a BB.bin file into a dataset in the standard layout, and `convert_bbbin(src, dst, overwrite=False)` writes that dataset to a netCDF file, through a `.partial`.
 - `read_hfbin(path)` and `convert_hfbin(src, dst, overwrite=False)` do the same for an HF.bin file (see [convert-hfbin](#convert-hfbin)).
 - Every function that writes a file raises `FileNotFoundError`, naming the file, if there is no folder to write it in, before it reads its input.
@@ -403,7 +403,7 @@ trace = (q.astype(np.float64) / gain + offset).astype(np.float32)
 ## Limits in 1.1.0
 
 - A file that holds an HDF5 group besides its root is refused: xarray reads only the root group, so its compressed file would go without the group.
-- `decompress` and `decompress_file` load the whole waveform into memory: 4 bytes a sample, and some working space. A file whose waveform doesn't fit in memory can be compressed and verified, but not yet decompressed. A later release is to decompress a block at a time.
+- `decompress_file` loads the whole waveform into memory: 4 bytes a sample, and some working space. For a file whose waveform doesn't fit there, `decompress` and `decompress_to` write it to a netCDF file a block at a time.
 - A file compressed in more than one block (see [Blocks and memory](#blocks-and-memory)) holds up to 1 MiB more than its streams need. They grow a block at a time, in chunks of 1 MiB, or of the first block's streams if those are smaller, and HDF5 keeps every chunk whole, however little of it is filled. A file compressed in one block keeps its streams in exactly their size.
 
 ## Developing
