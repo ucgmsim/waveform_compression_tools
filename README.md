@@ -45,14 +45,14 @@ A file whose stations are all real isn't compressed, so that it stays exact as i
 There is no PyPI release. Install from a release tag, with pip:
 
 ```bash
-pip install "waveform_compression_tools @ git+https://github.com/ucgmsim/waveform_compression_tools@v1.1.0"
+pip install "waveform_compression_tools @ git+https://github.com/ucgmsim/waveform_compression_tools@v1.2.0"
 ```
 
 or with uv:
 
 ```bash
-uv pip install "waveform_compression_tools @ git+https://github.com/ucgmsim/waveform_compression_tools@v1.1.0"
-uv add git+https://github.com/ucgmsim/waveform_compression_tools --tag v1.1.0  # as a dependency of a uv project
+uv pip install "waveform_compression_tools @ git+https://github.com/ucgmsim/waveform_compression_tools@v1.2.0"
+uv add git+https://github.com/ucgmsim/waveform_compression_tools --tag v1.2.0  # as a dependency of a uv project
 ```
 
 It needs Python 3.11 or newer, and git, to fetch the tag. pyflac 3.0.0, which the package pins, is published only as source, so installing it compiles two small extension modules: the machine needs a C compiler and Python's headers. pyflac brings its own libFLAC, so no FLAC library needs to be installed.
