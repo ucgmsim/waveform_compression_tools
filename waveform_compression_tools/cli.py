@@ -26,7 +26,7 @@ with ``--overwrite``.
 
 import logging
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, NoReturn
@@ -630,6 +630,41 @@ def verify(
     )
 
 
+def _convert(
+    convert: Callable[[Path, Path, bool], None], src: Path, dst: Path, overwrite: bool
+) -> None:
+    """Convert a legacy file and say so, or exit with the error line.
+
+    Parameters
+    ----------
+    convert : Callable[[Path, Path, bool], None]
+        The converter, `waveform_compression_tools.bbbin.convert_bbbin` or
+        `waveform_compression_tools.hfbin.convert_hfbin`, which takes `src`, `dst` and
+        `overwrite`.
+    src : Path
+        The legacy file.
+    dst : Path
+        Where to write the netCDF file.
+    overwrite : bool
+        Whether to replace a file already at `dst`.
+
+    Raises
+    ------
+    typer.Exit
+        After the error line: with `EXIT_REFUSED` if `src` is refused, or if `dst` is
+        `src` or is there already, and with `EXIT_FAILED` if the run fails.
+    """
+    try:
+        with _about(dst):
+            convert(src, dst, overwrite)
+    except _Stop as stop:
+        stop.exit()
+    typer.echo(
+        f"converted {src} to {dst}: "
+        f"{_size(src.stat().st_size)} -> {_size(dst.stat().st_size)}"
+    )
+
+
 @app.command()
 def convert_bbbin(
     src: Annotated[
@@ -668,15 +703,7 @@ def convert_bbbin(
         With `EXIT_REFUSED` if SRC is not a BB.bin file, or if DST is SRC or is there
         already, and with `EXIT_FAILED` if the run fails.
     """
-    try:
-        with _about(dst):
-            bbbin.convert_bbbin(src, dst, overwrite)
-    except _Stop as stop:
-        stop.exit()
-    typer.echo(
-        f"converted {src} to {dst}: "
-        f"{_size(src.stat().st_size)} -> {_size(dst.stat().st_size)}"
-    )
+    _convert(bbbin.convert_bbbin, src, dst, overwrite)
 
 
 @app.command()
@@ -723,12 +750,4 @@ def convert_hfbin(
         With `EXIT_REFUSED` if SRC is not an HF.bin file or is unfinished, or if DST is
         SRC or is there already, and with `EXIT_FAILED` if the run fails.
     """
-    try:
-        with _about(dst):
-            hfbin.convert_hfbin(src, dst, overwrite)
-    except _Stop as stop:
-        stop.exit()
-    typer.echo(
-        f"converted {src} to {dst}: "
-        f"{_size(src.stat().st_size)} -> {_size(dst.stat().st_size)}"
-    )
+    _convert(hfbin.convert_hfbin, src, dst, overwrite)
