@@ -45,7 +45,7 @@ import os
 import time
 import zlib
 from collections.abc import Generator, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -831,10 +831,14 @@ def _compressible(
         `_check_dataset`).
     """
     check_destination(dst, src, overwrite=overwrite)
-    _refuse_unless_hdf5(src, NotStandardLayout)
-    _refuse_subgroups(src)
-    with xr.open_dataset(src, engine="h5netcdf") as ds:
-        exact, kept = _check_dataset(src, ds)
+    # h5py's errors name no file, so each read of src names it.
+    with naming(src):
+        _refuse_unless_hdf5(src, NotStandardLayout)
+        _refuse_subgroups(src)
+        ds = xr.open_dataset(src, engine="h5netcdf")
+    with ds:
+        with naming(src):
+            exact, kept = _check_dataset(src, ds)
         yield ds, exact, kept
 
 
@@ -1498,7 +1502,8 @@ def _open_streams(f: h5py.File, path: Path) -> _Streams:
         If the group is in a format version other than 1, or its ``bits`` is outside 8
         to 32, which no file can have.
     Damaged
-        If the group lacks an attribute or a dataset of the format, its
+        If the group lacks an attribute or a dataset of the format, has one that can't
+        be read as the format writes it, as JSON that doesn't parse, its
         ``stream_bytes``, ``stream_gains`` or ``stream_offsets`` differs in shape from
         its ``stream_starts``, its ``exact_stations`` are not stations of the file in
         increasing order, its ``exact_waveform`` is not float32 with each of their
@@ -1584,10 +1589,18 @@ def _open_streams(f: h5py.File, path: Path) -> _Streams:
             exact_stations=exact_stations,
             exact_waveform=exact_waveform,
         )
+    except (UnknownFormat, Damaged):
+        raise
     # h5py's error for an attribute or a dataset that isn't there names it.
     except KeyError as e:
         raise Damaged(
             f"{path}: {GROUP} lacks a part of its format ({e.args[0]})", path
+        ) from e
+    # A part that isn't as the format writes it, as JSON that doesn't parse, or the name
+    # of a type that numpy doesn't know.
+    except (ValueError, TypeError) as e:
+        raise Damaged(
+            f"{path}: {GROUP} has a part that can't be read ({e})", path
         ) from e
 
 
@@ -2061,16 +2074,21 @@ def decompress_file(path: str | os.PathLike[str]) -> xr.Dataset:
         If it lacks a part of the format, its parts disagree with each other, as when
         its streams don't fit its dimensions, or a stream is damaged or decodes to the
         wrong number of samples. It names `path`.
+    OSError
+        If `path` can't be read, as when it is cut short, naming it.
     """
     path = Path(path)
-    _refuse_unless_hdf5(path, NotCompressed)
-    with h5py.File(path, "r") as f, about(path):
-        streams = _open_streams(f, path)
-        waveform = np.empty(streams.shape, np.float32)
-        for s0, s1 in _station_blocks(streams.shape, None):
-            # Straight into place, so no block is held besides the waveform.
-            streams.decompressed(s0, s1, out=waveform[:, s0:s1])
-    return _original(path, streams, waveform)
+    # h5py's errors name no file, and a damaged stream's doesn't know it, so each read
+    # names the file.
+    with naming(path), about(path):
+        _refuse_unless_hdf5(path, NotCompressed)
+        with h5py.File(path, "r") as f:
+            streams = _open_streams(f, path)
+            waveform = np.empty(streams.shape, np.float32)
+            for s0, s1 in _station_blocks(streams.shape, None):
+                # Straight into place, so no block is held besides the waveform.
+                streams.decompressed(s0, s1, out=waveform[:, s0:s1])
+        return _original(path, streams, waveform)
 
 
 def _new_waveform(
@@ -2280,36 +2298,41 @@ def verify_file(
     ValueError
         If `compressed` decodes to a waveform of another shape than the original's, or
         if `block_stations` is less than 1.
+    OSError
+        If either file can't be read, as when it is cut short, naming it.
     """
     start = time.perf_counter()
     original, compressed = Path(original), Path(compressed)
-    _refuse_unless_hdf5(original, NotStandardLayout)
-    _refuse_unless_hdf5(compressed, NotCompressed)
     worst = np.float64(0.0)
-    with (
-        xr.open_dataset(original, engine="h5netcdf") as ds,
-        xr.open_dataset(compressed, engine="h5netcdf") as rest,
-        h5py.File(compressed, "r") as f,
-    ):
-        # A refusal of the original's layout, stations or fill values names it.
-        with about(original):
+    with ExitStack() as open_files:
+        # h5py's errors name no file, so each file is opened and read under its own
+        # name, and a refusal of the original's layout, stations or fill values names it.
+        # Everything but the waveform is small, and is read once, here.
+        with naming(original), about(original):
+            _refuse_unless_hdf5(original, NotStandardLayout)
+            ds = open_files.enter_context(xr.open_dataset(original, engine="h5netcdf"))
             check_standard(ds)
             real = _real_stations(ds)
+            original_rest = ds.drop_vars("waveform").load()
+        with naming(compressed):
+            _refuse_unless_hdf5(compressed, NotCompressed)
+            f = open_files.enter_context(h5py.File(compressed, "r"))
+            streams = _open_streams(f, compressed)
+            rest = xr.load_dataset(compressed, engine="h5netcdf")
         waveform = ds["waveform"]
-        streams = _open_streams(f, compressed)
         if streams.shape != waveform.shape:
             raise ValueError(
                 f"{compressed} decodes to a waveform of shape {streams.shape}, but the "
                 f"original {original} holds one of shape {waveform.shape}"
             )
         with about(original):
-            passed = _same_besides_samples(
-                ds.drop_vars("waveform"), waveform, real, rest, streams
-            )
+            passed = _same_besides_samples(original_rest, waveform, real, rest, streams)
         chunks = waveform.encoding.get("chunksizes")
         for s0, s1 in _station_blocks(waveform.shape, chunks, block_stations):
-            block = waveform[:, s0:s1, :].values
-            with about(compressed):  # A damaged stream doesn't know its file.
+            with naming(original):
+                block = waveform[:, s0:s1, :].values
+            # A damaged stream doesn't know its file.
+            with naming(compressed), about(compressed):
                 decoded = streams.decode(s0, s1)
             error, block_passed = _compare_block(streams, block, decoded, real, s0, s1)
             passed = passed and block_passed

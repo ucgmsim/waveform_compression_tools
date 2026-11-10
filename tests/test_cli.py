@@ -761,8 +761,9 @@ def test_decompress_gives_back_the_standard_layout(
 
 
 # Damage that decompressing and verifying both meet, to one trace's stream, to the
-# types of the waveform's attributes or to which streams the file holds, and a word of
-# the reason each gives.
+# waveform's attributes or their types, to which streams the file holds, or to the
+# file itself, and a word of the reason each gives. The errors of the last three name
+# no file of their own, and the line names the compressed file all the same.
 DAMAGE = {
     "a zeroed fLaC marker": "component 1, station 2: a FLAC stream is damaged (",
     "a flipped byte": "component 1, station 2: a FLAC stream is damaged (",
@@ -771,6 +772,9 @@ DAMAGE = {
     "a cut to nothing": "component 1, station 2: the stream decodes to 0 samples",
     "a type for an attribute that isn't there": "waveform_attr_types",
     "the streams of 2 stations of 3": "decodes to a waveform of shape (3, 2, 10000)",
+    "attributes that aren't JSON": "can't be read (Expecting property name",
+    "a type that numpy doesn't know": "data type 'int33' not understood",
+    "a file cut short, as by a download that stopped": "truncated file",
 }
 # Damage that only a check against the original can find.
 CHECK_DAMAGE = {
@@ -816,6 +820,10 @@ def test_a_damaged_file_fails_the_check(
             g["stream_bytes"][c, s] = 0
         elif damage == "a type for an attribute that isn't there":
             g.attrs["waveform_attr_types"] = json.dumps({"gain": "float32"})
+        elif damage == "attributes that aren't JSON":
+            g.attrs["waveform_attrs"] = "{not json"
+        elif damage == "a type that numpy doesn't know":
+            g.attrs["waveform_attr_types"] = json.dumps({"units": "int33"})
         elif damage == "the streams of 2 stations of 3":
             # The streams of a file of the first 2 stations, whole in themselves, in
             # place of these: the file's stations and its streams disagree.
@@ -826,6 +834,8 @@ def test_a_damaged_file_fails_the_check(
                 streams.copy(GROUP, f)
         elif damage == "a doubled gain":
             g["stream_gains"][c, s] *= 2
+    if damage == "a file cut short, as by a download that stopped":
+        os.truncate(packed, packed.stat().st_size // 2)
     original = src
     if damage == "an original of another shape":
         original = write(ds.isel(station=slice(0, 2)), tmp_path / "other.nc")

@@ -1037,28 +1037,42 @@ def test_a_file_that_is_not_compressed_is_not_said_to_be(
 
 @pytest.mark.parametrize("fault", ["missing", "cut short"])
 @pytest.mark.parametrize(
-    "call", ["check_compressible", "decompress_file", "verify_file"]
+    "call",
+    [
+        "check_compressible",
+        "decompress_file",
+        "open_dataset",
+        "verify_file",
+        "verify_file's original",
+    ],
 )
 def test_a_missing_or_cut_short_input_fails_rather_than_being_refused(
     tmp_path: Path, standard_dataset: StandardDataset, call: str, fault: str
 ) -> None:
     # Only a file that is there and isn't HDF5 is refused, as the wrong kind of file.
     # One that isn't there, or an HDF5 file cut short, which keeps its signature, may be
-    # the right kind: opening it fails, and that error is raised.
+    # the right kind: opening it fails, and that error is raised, naming the file. For a
+    # file cut short, h5py's own error names no file.
     original = write(standard_dataset(3, nt=100), tmp_path / "in.nc")
     packed = tmp_path / "in.flac.nc"
     compress_file(original, packed)
     bad = tmp_path / "bad.nc"
     if fault == "cut short":
-        whole = (original if call == "check_compressible" else packed).read_bytes()
+        an_original = call in ("check_compressible", "verify_file's original")
+        whole = (original if an_original else packed).read_bytes()
         bad.write_bytes(whole[: len(whole) // 2])
-    with pytest.raises(OSError):
+    with pytest.raises(OSError) as failed:
         if call == "check_compressible":
             files.check_compressible(bad, tmp_path / "out.nc")
         elif call == "decompress_file":
             decompress_file(bad)
-        else:
+        elif call == "open_dataset":
+            open_dataset(bad)
+        elif call == "verify_file":
             verify_file(original, bad)
+        else:
+            verify_file(bad, packed)
+    assert failed.value.filename == str(bad)
 
 
 @pytest.mark.parametrize(

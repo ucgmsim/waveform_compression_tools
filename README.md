@@ -343,11 +343,11 @@ A refusal raises `Refused`, or one of its subclasses, from `waveform_compression
 
 `CheckFailed`, a `RuntimeError`, means that the output of `compress_file` failed its check. The output is deleted, so nothing is left at the destination, and a file already there stays as it was.
 
-`Damaged`, a `ValueError`, means that a compressed file can't be read as it was written: a stream doesn't decode, or decodes to the wrong number of samples; the file lacks a part of the format; or its parts disagree, as when its streams don't fit its dimensions. `decompress_file`, `decompress_to`, `verify_file` and `open_dataset`'s reads raise it where they find the damage, which for `decompress_to` may be once it has begun to write: nothing is left at the destination then either, and a file already there stays as it was. For a damaged stream, the message names the trace, and libFLAC's own error, where libFLAC found the damage, is the cause. It isn't a refusal, so the command line exits with status 1 for it. Catch it, too, before `ValueError`.
+`Damaged`, a `ValueError`, means that a compressed file can't be read as it was written: a stream doesn't decode, or decodes to the wrong number of samples; the file lacks a part of the format, or has one that can't be read, as JSON that doesn't parse; or its parts disagree, as when its streams don't fit its dimensions. `decompress_file`, `decompress_to`, `verify_file` and `open_dataset`'s reads raise it where they find the damage, which for `decompress_to` may be once it has begun to write: nothing is left at the destination then either, and a file already there stays as it was. For a damaged stream, the message names the trace, and libFLAC's own error, where libFLAC found the damage, is the cause. It isn't a refusal, so the command line exits with status 1 for it. Catch it, too, before `ValueError`.
 
 A refusal, a failed check and `Damaged` name the file they are about as their `filename`, as an `OSError` does, where it is known.
 
-Anything else is a failure of the run: `OSError` for a file that can't be read or written; `ValueError` for a bad argument, such as `bits` outside 8 to 32, or an original and a compressed file of different shapes for `verify_file`; and pyflac's exceptions when libFLAC can't encode a trace.
+Anything else is a failure of the run: `OSError` for a file that can't be read or written, which names it as its `filename`, an HDF5 file cut short included, for which HDF5's own error names none; `ValueError` for a bad argument, such as `bits` outside 8 to 32, or an original and a compressed file of different shapes for `verify_file`; and pyflac's exceptions when libFLAC can't encode a trace.
 
 ## The file format
 

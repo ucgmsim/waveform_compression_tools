@@ -106,6 +106,24 @@ def named_file(error: Exception) -> str | None:
     return os.fsdecode(named) if isinstance(named, str | bytes | os.PathLike) else None
 
 
+class _NamedError(OSError):
+    """An error about a file, which it names, whose message is its words alone.
+
+    An `OSError` made with a file's name gives the name after its words, and with no
+    error number, it starts ``[Errno None]``. This one gives only its words.
+    """
+
+    def __str__(self) -> str:
+        """Give the words alone, without the error number or the file's name.
+
+        Returns
+        -------
+        str
+            The words.
+        """
+        return str(self.strerror)
+
+
 @contextmanager
 def naming(path: str | os.PathLike[str]) -> Generator[None]:
     """Have an `OSError` that names no file, or `path`'s partial file, name `path`.
@@ -115,8 +133,10 @@ def naming(path: str | os.PathLike[str]) -> Generator[None]:
     partial file that `path` is written as is `path` to anyone using it: `writing` names
     `path` this way.
     Such an error that has an error number and its words is raised again as an `OSError`
-    with the same number and words, and `path` as its file, caused by the first. Any
-    other is raised as it is, since a file name would take its words.
+    with the same number and words, and `path` as its file, caused by the first. One
+    without them, as h5py's are for what goes wrong inside HDF5, such as a file cut
+    short, is raised again with `path` as its file and its message as its words, which
+    is all it says, as before. An error that names another file is raised as it is.
 
     Parameters
     ----------
@@ -132,16 +152,16 @@ def naming(path: str | os.PathLike[str]) -> Generator[None]:
     ------
     OSError
         Of the type its number gives, as `PermissionError` for EACCES, naming `path`,
-        for an error of the block that names no file, or `path`'s partial file, and has
-        a number and its words.
+        for an error of the block that names no file, or `path`'s partial file.
     """
     partial = os.fspath(_partial_name(path))
     try:
         yield
     except OSError as error:
-        elsewhere = error.filename is not None and named_file(error) != partial
-        if elsewhere or error.errno is None or error.strerror is None:
+        if error.filename is not None and named_file(error) != partial:
             raise
+        if error.errno is None or error.strerror is None:
+            raise _NamedError(None, str(error), os.fspath(path)) from error
         raise OSError(error.errno, error.strerror, os.fspath(path)) from error
 
 
@@ -464,18 +484,8 @@ class HDF5Output(io.RawIOBase):
             self.raise_pending()
 
 
-class _NoFolderError(FileNotFoundError):
+class _NoFolderError(_NamedError, FileNotFoundError):
     """No folder to write a file in: it names the file, and its words are the reason."""
-
-    def __str__(self) -> str:
-        """Give the reason alone, without the error number or the file's name.
-
-        Returns
-        -------
-        str
-            The reason.
-        """
-        return str(self.strerror)
 
 
 def _require_folder(dst: str | os.PathLike[str]) -> None:

@@ -26,6 +26,7 @@ import xarray as xr
 from xarray.backends import BackendArray, CachingFileManager
 from xarray.core import indexing
 
+from .destinations import naming
 from .engine import FlacBackendEntrypoint
 from .errors import NotCompressed, about
 from .files import _open_streams, _original, _refuse_unless_hdf5, _Streams
@@ -131,10 +132,11 @@ class _CompressedFile:
 
     @contextmanager
     def reading(self) -> Generator[_Streams]:
-        """Have the file open while its streams are read, and name it in their damage.
+        """Have the file open while its streams are read, and name it in what goes wrong.
 
         A read may come long after the file was opened, with other files open, so a
-        damaged stream names the file it is in.
+        damaged stream names the file it is in, and so does an error of h5py's, which
+        names none.
 
         Yields
         ------
@@ -148,10 +150,16 @@ class _CompressedFile:
         Damaged
             If the file fails as `_OpenFile` does as it is opened again, or a stream read
             is damaged. It names the file.
+        OSError
+            If the file can't be read, as when it is cut short, naming it.
         """
         if self._closed:
             raise ValueError(f"{self.path} is closed, so its waveform can't be read")
-        with about(self.path), self._manager.acquire_context() as opened:
+        with (
+            naming(self.path),
+            about(self.path),
+            self._manager.acquire_context() as opened,
+        ):
             yield opened.streams
 
     def close(self) -> None:
@@ -292,6 +300,8 @@ class _LazyWaveform(BackendArray):
             If the file has been closed.
         Damaged
             If a stream doesn't decode, naming the file.
+        OSError
+            If the file can't be read, naming it.
         """
         components, stations, times = key
         n_component, n_station, _ = self.shape
@@ -326,14 +336,15 @@ def _open(
 
     Raises
     ------
-    NotCompressed, UnknownFormat, Damaged
+    NotCompressed, UnknownFormat, Damaged, OSError
         As `open_dataset` raises them.
     """
     path = Path(path)
     if isinstance(drop_variables, str):
         drop_variables = [drop_variables]
     drop = list(drop_variables or ())
-    _refuse_unless_hdf5(path, NotCompressed)
+    with naming(path):
+        _refuse_unless_hdf5(path, NotCompressed)
     file = _CompressedFile(path)
     try:
         # Opening the file checks it, as decompress_file does, before the rest is read.
@@ -391,5 +402,7 @@ def open_dataset(path: str | os.PathLike[str]) -> xr.Dataset:
     Damaged
         If it lacks a part of the format, or its parts don't agree with each other, as
         when its streams don't fit its dimensions, as for `decompress_file`.
+    OSError
+        If it can't be read, as when it is cut short, naming it.
     """
     return xr.open_dataset(path, engine=FlacBackendEntrypoint)
