@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.0
+
+- **An HF.bin converter,** `convert-hfbin`, and `read_hfbin` and `convert_hfbin` in Python, beside `convert-bbbin`: it brings a simulation's legacy HF.bin file of high-frequency waveforms into the standard layout, for `compress`, with its acceleration in cm/s² as stored and every field of its header as an attribute in its own type. A file that isn't an HF.bin is refused with `NotHFBin`, and one that its run left unfinished, in which a station's `vs` is 0, with `IncompleteHFBin`, whose error line says how many stations are unfinished; both exit with status 3.
+
 ## 1.1.0
 
 The file format is unchanged, at version 1: 1.0.0 reads the files that 1.1.0 writes, and 1.1.0 reads 1.0.0's.

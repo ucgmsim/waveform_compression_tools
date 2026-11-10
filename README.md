@@ -4,12 +4,13 @@ Compresses the float32 seismic waveforms in netCDF files to FLAC, one stream per
 
 ## What it is
 
-A Python package, `waveform_compression_tools`, and a command, `waveform-compression-tools`, with four subcommands:
+A Python package, `waveform_compression_tools`, and a command, `waveform-compression-tools`, with five subcommands:
 
 - `compress` writes a compressed copy of a netCDF file, and checks it as it is written;
 - `decompress` turns a compressed file back into an ordinary netCDF file;
 - `verify` checks a compressed file against its original;
-- `convert-bbbin` turns a BB.bin file, a legacy binary format of broadband seismograms, into a netCDF file that `compress` takes.
+- `convert-bbbin` turns a BB.bin file, a legacy binary format of broadband seismograms, into a netCDF file that `compress` takes;
+- `convert-hfbin` does the same for an HF.bin file, a legacy binary format of high-frequency seismograms.
 
 An input has to be in the standard layout: a float32 data variable `waveform` with exactly the dimensions (component, station, time), a `station` coordinate that names the stations, and no HDF5 group besides the root. The components can be named anything, such as `x`, `y`, `z` or `000`, `090`, `ver`.
 
@@ -65,6 +66,7 @@ waveform-compression-tools compress SRC DST [--bits 32] [--level 5] [--no-check]
 waveform-compression-tools decompress SRC DST [--overwrite]
 waveform-compression-tools verify ORIGINAL COMPRESSED
 waveform-compression-tools convert-bbbin SRC DST [--overwrite]
+waveform-compression-tools convert-hfbin SRC DST [--overwrite]
 ```
 
 Each command handles one file, and its `--help` says more.
@@ -183,6 +185,28 @@ waveform-compression-tools convert-bbbin BB.bin bb.nc
 
 A BB.bin file holds the broadband acceleration that a simulation recorded at its stations, in g: a header, a record for each station, then the traces. `convert-bbbin` writes it as a netCDF file in the standard layout, ready for `compress`: the waveform with the components `000`, `090`, `ver` in that order (the file holds 090, 000, ver), the station names, `latitude`, `longitude` and `time` coordinates, the stations' other fields as variables, and the header's values as attributes, with `source_format = "BB.bin"`. The whole BB.bin file is read into memory, which takes about twice its size at the peak.
 
+### convert-hfbin
+
+```bash
+waveform-compression-tools convert-hfbin HF.bin hf.nc
+```
+
+An HF.bin file holds the high-frequency acceleration that a simulation computed at its stations, in cm/s²: a header, a record for each station, then the traces. `convert-hfbin` writes it as a netCDF file in the standard layout, ready for `compress`, as `convert-bbbin` does for a BB.bin. Every value is kept as the file holds it, in its own type, so the acceleration stays in cm/s²:
+
+| In the HF.bin | In the netCDF file |
+|---|---|
+| the traces: float32 of shape (station, time, component), with the components in the order 090, 000, ver | `waveform`: float32 of dimensions (component, station, time), with the components `000`, `090`, `ver` in that order, and `units = "cm/s^2"` |
+| each station's name, 8 bytes padded with NULs | the `station` coordinate, as text without the NULs |
+| each station's `lon` and `lat` | the float32 coordinates `longitude` and `latitude`, along station |
+| each station's `e_dist` and `vs` | float32 variables of the same names, along station |
+| the header's 16 int32: `nstat`, `nt`, `seed`, `siteamp`, `pdur_model`, `nrayset`, `rayset1` to `rayset4`, `nbu`, `ift`, `nlskip`, `icflag`, `same_seed` and `site_specific_vm` | int32 attributes of the same names |
+| its 24 float32: `duration`, `dt`, `start_sec`, `sdrop`, `kappa`, `qfexp`, `fmax`, `flo`, `fhi`, `rvfac`, `rvfac_shal`, `rvfac_deep`, `czero`, `calpha`, `mom`, `rupv`, `vs_moho`, `vp_sig`, `vsh_sig`, `rho_sig`, `qs_sig`, `fa_sig1`, `fa_sig2` and `rv_sig1` | float32 attributes of the same names |
+| its two strings of 64 bytes, `stoch_file` and `velocity_model`, padded with NULs | text attributes of the same names, without the NULs |
+
+The file also has a `time` coordinate, in float64, `start_sec + dt * arange(nt)`, and the attribute `source_format = "HF.bin"`. The whole HF.bin file is read into memory, which takes about twice its size at the peak: converting a synthetic HF.bin of 0.36 GB peaked at 0.83 GB of resident memory.
+
+The writer of an HF.bin fills in each station's `vs` once that station is done, so a file in which any station's `vs` is 0 is unfinished. It is refused, and the error line says how many stations are unfinished, as `waveform-compression-tools: HF.bin: is incomplete, with 2 of its 120 stations unfinished: their vs is 0`. A run that stopped before it had written the last station's traces leaves a file shorter than its header says, and that is refused as not an HF.bin.
+
 ### Exit codes
 
 Every command exits with one of these statuses. They are published, and are the constants `EXIT_OK`, `EXIT_FAILED`, `EXIT_USAGE` and `EXIT_REFUSED` in `waveform_compression_tools.cli`.
@@ -200,10 +224,11 @@ The refusals, by command:
 - `decompress`: SRC isn't an HDF5 file, isn't compressed, or is in another format version or has a setting outside 8 to 32; DST is SRC; a file is at DST, and `--overwrite` isn't given.
 - `verify`: ORIGINAL isn't an HDF5 file, or isn't in the standard layout; COMPRESSED isn't an HDF5 file, isn't compressed, or is in another format version or has a setting outside 8 to 32.
 - `convert-bbbin`: SRC can't be a BB.bin file (it is shorter than a header, its size doesn't fit its header, or it holds text that isn't ASCII); DST is SRC; a file is at DST, and `--overwrite` isn't given.
+- `convert-hfbin`: SRC can't be an HF.bin file (it is shorter than a header, its size doesn't fit its header, or it holds text that isn't ASCII), or it is unfinished (a station's `vs` is 0); DST is SRC; a file is at DST, and `--overwrite` isn't given.
 
 A refusal writes nothing but `compress`'s record, and leaves a file already at the destination as it was. A file that isn't HDF5 at all is refused, while an HDF5 file that is damaged or cut short is a failure: it may be the right kind of file, and the run went wrong.
 
-An interruption (Ctrl-C) is left to Typer, which ends the run with its own status; `compress` writes no record then. While a file is written, a Ctrl-C waits until it is safe to act on, so that HDF5 never takes it for a failed write: for `compress`, until the end of the block of stations, and for `decompress` and `convert-bbbin`, until the file is written, which is then deleted. Pressed again while it waits, Ctrl-C ends the run at once, leaving `DST.partial`.
+An interruption (Ctrl-C) is left to Typer, which ends the run with its own status; `compress` writes no record then. While a file is written, a Ctrl-C waits until it is safe to act on, so that HDF5 never takes it for a failed write: for `compress`, until the end of the block of stations, and for `decompress`, `convert-bbbin` and `convert-hfbin`, until the file is written, which is then deleted. Pressed again while it waits, Ctrl-C ends the run at once, leaving `DST.partial`.
 
 ### The error line
 
@@ -242,6 +267,7 @@ from waveform_compression_tools.files import (
     decompress_to,
     verify_file,
 )
+from waveform_compression_tools.hfbin import convert_hfbin, read_hfbin
 
 src, dst = Path("realisation.nc"), Path("realisation.flac.nc")
 result = compress_file(src, dst, bits=24)  # checks dst as it writes it
@@ -255,6 +281,8 @@ decompress_to(dst, Path("back.nc"))  # the same, written to a netCDF file
 
 bb = read_bbbin(Path("BB.bin"))  # a Dataset in the standard layout
 convert_bbbin(Path("BB.bin"), Path("bb.nc"))  # the same, written to a netCDF file
+hf = read_hfbin(Path("HF.bin"))  # likewise for an HF.bin, in cm/s^2
+convert_hfbin(Path("HF.bin"), Path("hf.nc"))
 ```
 
 A path can be given as a string or as a `pathlib.Path` object.
@@ -263,6 +291,7 @@ A path can be given as a string or as a `pathlib.Path` object.
 - `verify_file(original, compressed, block_stations=None)` returns a `VerifyResult`: `passed`, `max_relative_error`, `n_exact` and `verify_s`. A file that doesn't agree gives `passed=False`; it doesn't raise.
 - `decompress_file(path)` returns the original dataset, loaded into memory, and `decompress_to(src, dst, overwrite=False)` writes it to a netCDF file, through a `.partial`.
 - `read_bbbin(path)` reads a BB.bin file into a dataset in the standard layout, and `convert_bbbin(src, dst, overwrite=False)` writes that dataset to a netCDF file, through a `.partial`.
+- `read_hfbin(path)` and `convert_hfbin(src, dst, overwrite=False)` do the same for an HF.bin file (see [convert-hfbin](#convert-hfbin)).
 - Every function that writes a file raises `FileNotFoundError`, naming the file, if there is no folder to write it in, before it reads its input.
 - `is_compressed(path)` says whether a file holds a compressed waveform.
 
@@ -284,6 +313,8 @@ A refusal raises `Refused`, or one of its subclasses, from `waveform_compression
 | `NotCompressed` | a file to decompress or verify isn't HDF5, or holds no compressed waveform |
 | `UnknownFormat` | a compressed file is in another format version, or has a setting outside 8 to 32 |
 | `NotBBBin` | a file can't be a BB.bin file |
+| `NotHFBin` | a file can't be an HF.bin file |
+| `IncompleteHFBin` | an HF.bin file is unfinished: a station's `vs` is 0 |
 
 `CheckFailed`, a `RuntimeError`, means that the output of `compress_file` failed its check. The output is deleted, so nothing is left at the destination, and a file already there stays as it was.
 
@@ -297,7 +328,7 @@ This section describes a compressed file well enough to decode it with any FLAC 
 
 A compressed file is the original netCDF-4 file without its data variable `waveform`, plus one HDF5 group, `_flac_compressed_waveform`, that holds the waveform. Every other variable, coordinate and attribute is as it was, written by xarray with the h5netcdf engine. xarray reads only the root group, so it doesn't see the waveform until `decompress_file` puts it back.
 
-The waveform is float32 with the dimensions (component, station, time), its components in the original file's order, which its `component` coordinate names: `000`, `090`, `ver` in a converted BB.bin file, and `x`, `y`, `z` in some other files. Each (component, station) pair is a trace of `nt` samples.
+The waveform is float32 with the dimensions (component, station, time), its components in the original file's order, which its `component` coordinate names: `000`, `090`, `ver` in a converted BB.bin or HF.bin file, and `x`, `y`, `z` in some other files. Each (component, station) pair is a trace of `nt` samples.
 
 | Dataset in the group | Type | Shape | Holds |
 |---|---|---|---|
