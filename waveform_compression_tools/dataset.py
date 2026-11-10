@@ -2,10 +2,10 @@
 
 `open_dataset` gives the dataset that `waveform_compression_tools.files.decompress_file`
 gives, but its waveform stays in the file until it is read. Selecting with ``isel`` or
-``sel`` reads nothing; reading a selection's values decodes only its traces. A real
-station's trace is its exact copy, read on its own, and any other trace is decoded
-from its FLAC stream, of which only its own bytes are read. A selection in time decodes
-whole traces, and then cuts them.
+``sel`` reads nothing; reading a selection's values decodes only its traces, each from
+its FLAC stream, of which only its own bytes are read. A real station's trace is then
+its exact copy, as in `decompress_file`. A selection in time decodes whole traces, and
+then cuts them.
 
 It is built on xarray's backend machinery, as xarray's own netCDF backends are: the
 waveform is a `xarray.backends.BackendArray`, which xarray indexes lazily, and the file
@@ -25,7 +25,6 @@ import xarray as xr
 from xarray.backends import BackendArray, BackendEntrypoint, CachingFileManager
 from xarray.core import indexing
 
-from .codec import STANDARD_DIMS, decode_trace
 from .errors import NotCompressed
 from .files import GROUP, _open_streams, _refuse_unless_hdf5, _Streams
 
@@ -111,9 +110,8 @@ def _read_traces(
     """Read some traces as `decompress_file` gives them, reading only what they need.
 
     The traces are every chosen component of every chosen station, each cut to the
-    chosen samples. A real station's trace is its exact copy, read on its own. Any other
-    trace is decoded from its FLAC stream, of which only its own bytes are read. Each
-    trace is cut as soon as it is read, so memory holds the cut traces and one whole one.
+    chosen samples. Each is decoded on its own (see `_Streams.trace`), and cut as soon
+    as it is decoded, so memory holds the cut traces and one whole one.
 
     Parameters
     ----------
@@ -138,17 +136,8 @@ def _read_traces(
         `waveform_compression_tools.codec.decode_trace`).
     """
     traces = np.empty((components.size, stations.size, times.size), np.float32)
-    real = np.isin(stations, streams.exact_stations)
-    copies = np.searchsorted(streams.exact_stations, stations)
     for (i, c), (j, s) in itertools.product(enumerate(components), enumerate(stations)):
-        if real[j]:
-            trace = streams.exact_waveform[c, copies[j]]
-        else:
-            start, size = int(streams.starts[c, s]), int(streams.nbytes[c, s])
-            stream = streams.compressed[start : start + size].tobytes()
-            gain, offset = streams.gains[c, s], streams.offsets[c, s]
-            trace = decode_trace(stream, gain, offset, streams.nt, c, s)
-        traces[i, j] = trace[times]
+        traces[i, j] = streams.trace(int(c), int(s))[times]
     return traces
 
 
@@ -227,9 +216,9 @@ def open_dataset(path: str | os.PathLike[str]) -> xr.Dataset:
     The dataset is the one `waveform_compression_tools.files.decompress_file` gives,
     except that its waveform is read from the file only as it is needed. Opening,
     printing and selecting read none of it. Reading a selection's values, with
-    ``.values``, ``.load()`` or a computation, decodes its traces then, and only those:
-    a real station's trace is its exact copy, and any other is decoded from its own
-    stream. A selection in time decodes whole traces and then cuts them. Each read
+    ``.values``, ``.load()`` or a computation, decodes its traces then, and only those,
+    each from its own stream; a real station's trace is then its exact copy. A
+    selection in time decodes whole traces and then cuts them. Each read
     decodes again, so ``.load()`` a selection to keep it. Every value read is bit for bit
     the one `decompress_file` gives.
 
@@ -264,9 +253,7 @@ def open_dataset(path: str | os.PathLike[str]) -> xr.Dataset:
     try:
         ds = xr.load_dataset(path, engine="h5netcdf")
         waveform = indexing.LazilyIndexedArray(_LazyWaveform(file))
-        ds["waveform"] = xr.Variable(
-            STANDARD_DIMS, waveform, file.streams.waveform_attrs, file.streams.encoding
-        )
+        ds["waveform"] = file.streams.variable(waveform)
     except BaseException:
         file.close()
         raise

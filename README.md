@@ -312,7 +312,7 @@ print(peaks.values, south["waveform"].shape)
 ```
 
 - Opening reads everything but the waveform: the coordinates and the other variables, and where each trace's stream is. Selecting with `sel` or `isel`, by name, index, slice, mask or coordinate, reads nothing.
-- Reading a selection's values, with `.values`, `.load()` or a computation, reads only its traces: a real station's exact copy, or any other trace's own stream, which is then decoded. A selection in time decodes whole traces, then cuts them.
+- Reading a selection's values, with `.values`, `.load()` or a computation, reads and decodes only its traces' own streams. A real station's trace is then its exact copy, as in `decompress_file`. A selection in time decodes whole traces, then cuts them.
 - Each read decodes again, so `.load()` a selection that is used more than once.
 - A selection of points, such as one component at each of several stations, decodes every chosen component at every chosen station.
 - Every value is bit for bit the one that `decompress_file` gives.

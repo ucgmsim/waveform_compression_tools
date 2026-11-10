@@ -103,15 +103,15 @@ def test_a_selection_comes_back_as_decompress_file_gives_it(
 def test_only_the_selected_traces_are_read_and_decoded(
     compressed: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Components 000 and ver of real station 3 and of stations 5 and 10. The real
-    # station's exact copies are read, and only the others' streams are read, once,
-    # and decoded.
+    # Components 000 and ver of real station 3 and of stations 5 and 10. Only their
+    # streams are read, once, and decoded, and the real station's exact copies are read
+    # too, as decompress_file decodes every stream before it puts the copies back.
     with h5py.File(compressed, "r") as f:
         group = f[GROUP]
         stream_bytes = group["compressed"][...]
         starts, nbytes = group["stream_starts"][...], group["stream_bytes"][...]
         exact_shape = group["exact_waveform"].shape
-    selected = [(c, s) for c in (0, 2) for s in (5, 10)]
+    selected = [(c, s) for c in (0, 2) for s in (3, 5, 10)]
     streams = sorted(
         stream_bytes[starts[c, s] : starts[c, s] + nbytes[c, s]].tobytes()
         for c, s in selected
@@ -179,21 +179,27 @@ def test_the_file_is_read_for_the_selected_streams_alone(compressed: Path) -> No
     assert streams <= read < streams + 1024
 
 
+# Station 3 is real: its trace is its exact copy, but its stream is decoded too.
+@pytest.mark.parametrize("station", [5, 3])
 def test_a_damaged_stream_fails_its_own_trace_alone(
-    compressed: Path, tmp_path: Path
+    compressed: Path, tmp_path: Path, station: int
 ) -> None:
-    # Component 1 of station 5. Its error names it as the file counts its traces, not
-    # as the selection does, and every other trace still comes back.
+    # Component 1 of the station is damaged, and fails as it does in decompress_file.
+    # The error names the trace as the file counts its traces, not as the selection
+    # does, and every other trace still comes back.
     path = Path(shutil.copy(compressed, tmp_path / "out.nc"))
     with h5py.File(path, "r+") as f:
         group = f[GROUP]
-        start, size = group["stream_starts"][1, 5], group["stream_bytes"][1, 5]
-        group["compressed"][start + size // 2] ^= 0xFF
+        start = group["stream_starts"][1, station]
+        group["compressed"][start + group["stream_bytes"][1, station] // 2] ^= 0xFF
+    with pytest.raises(ValueError, match=f"component 1, station {station}") as failed:
+        decompress_file(path)
     want = decompress_file(compressed)["waveform"].isel(component=[0, 2])
     with open_dataset(path) as ds:
-        with pytest.raises(ValueError, match="component 1, station 5"):
-            ds["waveform"].isel(component=[1], station=[4, 5]).load()
+        with pytest.raises(ValueError) as read:
+            ds["waveform"].isel(component=[1], station=[4, station]).load()
         got = ds["waveform"].isel(component=[0, 2]).values
+    assert str(read.value) == str(failed.value)
     assert bit_identical(got, want.values)
 
 

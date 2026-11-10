@@ -201,23 +201,31 @@ def decode_block(
         block = out
     for c, s in np.ndindex(*starts.shape):
         start, size = int(starts[c, s]), int(nbytes[c, s])
-        # The decoder needs bytes: it fails on a numpy slice of more than about 8 KB.
-        stream = compressed[start : start + size].tobytes()
         block[c, s] = decode_trace(
-            stream, gains[c, s], offsets[c, s], nt, c, s + first_station
+            compressed[start : start + size],
+            gains[c, s],
+            offsets[c, s],
+            nt,
+            c,
+            s + first_station,
         )
     return block
 
 
 def decode_trace(
-    stream: bytes, gain: float, offset: float, nt: int, component: int, station: int
+    stream: np.ndarray,
+    gain: float,
+    offset: float,
+    nt: int,
+    component: int,
+    station: int,
 ) -> np.ndarray:
     """Decode one trace from its FLAC stream.
 
     Parameters
     ----------
-    stream : bytes
-        The trace's stream.
+    stream : np.ndarray
+        The trace's stream, as uint8.
     gain : float
         The gain the trace was quantised with.
     offset : float
@@ -243,7 +251,8 @@ def decode_trace(
     """
     trace = f"component {component}, station {station}"
     try:
-        q = decode_stream(stream)
+        # The decoder needs bytes: it fails on a numpy slice of more than about 8 KB.
+        q = decode_stream(stream.tobytes())
     except (pyflac.DecoderInitException, pyflac.DecoderProcessException) as e:
         raise ValueError(f"{trace}: a FLAC stream is damaged ({e})") from e
     if q.size != nt:

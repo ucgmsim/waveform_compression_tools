@@ -52,6 +52,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 import xarray as xr
+from numpy.typing import ArrayLike
 
 from . import __version__
 from .codec import (
@@ -60,6 +61,7 @@ from .codec import (
     EncodedBlock,
     check_standard,
     decode_block,
+    decode_trace,
     encode_block,
     max_relative_error,
     within_one_step,
@@ -1237,6 +1239,56 @@ class _Streams:
         block[:, stations] = self.exact_waveform[:, here]
         return stations
 
+    def trace(self, c: int, s: int) -> np.ndarray:
+        """Decode one trace, as `decompress_file` gives it.
+
+        Its stream is decoded, of which only its own bytes are read. A real station's
+        trace is then its exact copy, as `put_back_exact` puts it back, so a damaged
+        stream fails here as it does in `decompress_file`, a real station's too.
+
+        Parameters
+        ----------
+        c : int
+            The trace's component.
+        s : int
+            The trace's station.
+
+        Returns
+        -------
+        np.ndarray
+            The trace, as float32 of shape (nt,).
+
+        Raises
+        ------
+        ValueError
+            If its stream is damaged, or decodes to the wrong number of samples (see
+            `waveform_compression_tools.codec.decode_trace`).
+        """
+        start = int(self.starts[c, s])
+        stream = self.compressed[start : start + int(self.nbytes[c, s])]
+        gain, offset = self.gains[c, s], self.offsets[c, s]
+        decoded = decode_trace(stream, gain, offset, self.nt, c, s)
+        here, _ = _in_block(self.exact_stations, s, s + 1)
+        if here.start == here.stop:  # Not a real station.
+            return decoded
+        return self.exact_waveform[c, here.start]
+
+    def variable(self, data: ArrayLike) -> xr.Variable:
+        """Make the waveform's variable, with its attributes and encoding put back.
+
+        Parameters
+        ----------
+        data : array_like
+            The waveform's samples, of shape (component, station, nt), or an array
+            that reads them as it is indexed.
+
+        Returns
+        -------
+        xr.Variable
+            The waveform, as `decompress_file` gives it.
+        """
+        return xr.Variable(STANDARD_DIMS, data, self.waveform_attrs, self.encoding)
+
 
 def _new_group(
     f: h5py.File,
@@ -1877,8 +1929,7 @@ def decompress_file(path: str | os.PathLike[str]) -> xr.Dataset:
             streams.decode(s0, s1, out=waveform[:, s0:s1])
             streams.put_back_exact(waveform[:, s0:s1], s0, s1)
     ds = xr.load_dataset(path, engine="h5netcdf")
-    ds["waveform"] = (STANDARD_DIMS, waveform, streams.waveform_attrs)
-    ds["waveform"].encoding.update(streams.encoding)
+    ds["waveform"] = streams.variable(waveform)
     return ds
 
 
