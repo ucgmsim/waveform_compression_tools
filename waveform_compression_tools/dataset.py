@@ -12,12 +12,12 @@ waveform is a `xarray.backends.BackendArray`, which xarray indexes lazily, and t
 is opened through xarray's `xarray.backends.CachingFileManager`. Nothing needs dask.
 """
 
-import dataclasses
 import itertools
 import os
 from collections.abc import Generator, Iterable
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Self
 
 import h5py
 import numpy as np
@@ -26,7 +26,52 @@ from xarray.backends import BackendArray, BackendEntrypoint, CachingFileManager
 from xarray.core import indexing
 
 from .errors import NotCompressed
-from .files import GROUP, _open_streams, _refuse_unless_hdf5, _Streams
+from .files import _open_streams, _refuse_unless_hdf5, _Streams
+
+
+class _OpenFile:
+    """A compressed file, open, with where its streams are read from it.
+
+    It is what a `_CompressedFile` opens through xarray's file manager, so where the
+    streams are is read each time the file is opened, and checked as
+    `waveform_compression_tools.files.decompress_file` checks it. Nothing read from the
+    file is kept once it is closed.
+
+    Parameters
+    ----------
+    path : Path
+        The file, as an absolute path.
+    named : Path
+        The file as it was given, which an error's message names.
+
+    Attributes
+    ----------
+    streams : _Streams
+        The file's streams, with its datasets.
+
+    Raises
+    ------
+    NotCompressed
+        If the file holds no compressed waveform.
+    UnknownFormat
+        If it is in a format version other than 1, or has a setting outside 8 to 32.
+    ValueError
+        If its arrays don't agree with each other.
+    """
+
+    def __init__(self, path: Path, named: Path) -> None:  # numpydoc ignore=GL08
+        # Without HDF5's cache of chunks, which would read each chunk a stream is in
+        # whole, a MiB, a stream's own bytes are all that is read.
+        self._file = h5py.File(path, "r", rdcc_nbytes=0)
+        try:
+            self.streams = _open_streams(self._file, named)
+        except BaseException:
+            self._file.close()
+            raise
+
+    def close(self) -> None:
+        """Close the file."""
+        self._file.close()
 
 
 class _CompressedFile:
@@ -34,8 +79,13 @@ class _CompressedFile:
 
     The file is opened through a `xarray.backends.CachingFileManager`, as xarray's
     h5netcdf backend opens its files: xarray keeps only so many files open, and opens a
-    file again when it is read after it was closed to make room for others. A file
-    closed by `close` stays closed.
+    file again when it is read after it was closed to make room for others. It is
+    opened by its absolute path, so it is the same file whatever the working folder is
+    by then. A file closed by `close` stays closed.
+
+    A deep copy of the dataset reads through the same file, and so is closed with it. A
+    pickled copy reads the file as the original does, since xarray's file manager
+    pickles itself.
 
     Parameters
     ----------
@@ -45,34 +95,28 @@ class _CompressedFile:
     Attributes
     ----------
     path : Path
-        The compressed file.
-    streams : _Streams
-        Where its streams are, and how to decode them, as it was opened. Its datasets
-        are those of the file as it was first opened: `reading` gives them as the file
-        is open at the time.
-
-    Raises
-    ------
-    NotCompressed
-        If the file holds no compressed waveform.
-    UnknownFormat
-        If it is in a format version other than 1, or has a setting outside 8 to 32.
-    ValueError
-        If its arrays don't agree with each other (see
-        `waveform_compression_tools.files.decompress_file`).
+        The compressed file, as it was given.
     """
 
     def __init__(self, path: Path) -> None:  # numpydoc ignore=GL08
         self.path = path
-        # Without HDF5's cache of chunks, which would read each chunk a stream is in
-        # whole, a MiB, a stream's own bytes are all that is read.
-        self._manager = CachingFileManager(
-            h5py.File, path, mode="r", kwargs={"rdcc_nbytes": 0}
-        )
+        self._manager = CachingFileManager(_OpenFile, path.absolute(), path)
         self._closed = False
-        # A file refused here is closed again by the manager.
-        with self._manager.acquire_context() as f:
-            self.streams = _open_streams(f, path)
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Self:
+        """Give this file, rather than a copy of it.
+
+        Parameters
+        ----------
+        memo : dict
+            What `copy.deepcopy` has copied so far.
+
+        Returns
+        -------
+        _CompressedFile
+            This file.
+        """
+        return self
 
     @contextmanager
     def reading(self) -> Generator[_Streams]:
@@ -81,22 +125,18 @@ class _CompressedFile:
         Yields
         ------
         _Streams
-            The streams, with the file's datasets as it is open now.
+            The streams, with the file's datasets.
 
         Raises
         ------
         ValueError
-            If the file has been closed.
+            If the file has been closed, or fails as `_OpenFile` does as it is opened
+            again.
         """
         if self._closed:
             raise ValueError(f"{self.path} is closed, so its waveform can't be read")
-        with self._manager.acquire_context() as f:
-            group = f[GROUP]
-            yield dataclasses.replace(
-                self.streams,
-                compressed=group["compressed"],
-                exact_waveform=group["exact_waveform"],
-            )
+        with self._manager.acquire_context() as opened:
+            yield opened.streams
 
     def close(self) -> None:
         """Close the file, for good."""
@@ -153,18 +193,22 @@ class _LazyWaveform(BackendArray):
     ----------
     file : _CompressedFile
         The file the waveform is in.
+    shape : tuple[int, int, int]
+        The waveform's shape: (component, station, time).
 
     Attributes
     ----------
     shape : tuple[int, int, int]
-        The waveform's shape: (component, station, time).
+        The waveform's shape.
     dtype : np.dtype
         float32.
     """
 
-    def __init__(self, file: _CompressedFile) -> None:  # numpydoc ignore=GL08
+    def __init__(
+        self, file: _CompressedFile, shape: tuple[int, int, int]
+    ) -> None:  # numpydoc ignore=GL08
         self.file = file
-        self.shape = file.streams.shape
+        self.shape = shape
         self.dtype = np.dtype(np.float32)
 
     def __getitem__(self, key: indexing.ExplicitIndexer) -> np.ndarray:
@@ -251,9 +295,12 @@ def open_dataset(path: str | os.PathLike[str]) -> xr.Dataset:
     _refuse_unless_hdf5(path, NotCompressed)
     file = _CompressedFile(path)
     try:
+        # Opening the file checks it, as decompress_file does, before the rest is read.
+        with file.reading() as streams:
+            lazy = _LazyWaveform(file, streams.shape)
+            waveform = streams.variable(indexing.LazilyIndexedArray(lazy))
         ds = xr.load_dataset(path, engine="h5netcdf")
-        waveform = indexing.LazilyIndexedArray(_LazyWaveform(file))
-        ds["waveform"] = file.streams.variable(waveform)
+        ds["waveform"] = waveform
     except BaseException:
         file.close()
         raise

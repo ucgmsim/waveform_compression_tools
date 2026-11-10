@@ -1,4 +1,5 @@
 import io
+import pickle
 import re
 import shutil
 import tracemalloc
@@ -75,6 +76,10 @@ SELECTIONS: dict[str, Callable[[xr.Dataset], xr.Dataset]] = {
     "a latitude range": lambda ds: ds.isel(
         station=(ds["latitude"] > -40) & (ds["latitude"] < -36)
     ),
+    "a latitude range, by where": lambda ds: ds.where(
+        (ds["latitude"] > -40) & (ds["latitude"] < -36), drop=True
+    ),
+    "sorted by latitude": lambda ds: ds.sortby("latitude"),
     "no stations": lambda ds: ds.isel(station=[]),
     "a component by name": lambda ds: ds.sel(component="090"),
     "components by index": lambda ds: ds.isel(component=[2, 0]),
@@ -87,6 +92,8 @@ SELECTIONS: dict[str, Callable[[xr.Dataset], xr.Dataset]] = {
         component=xr.DataArray([0, 2], dims="point"),
         station=xr.DataArray([7, 4], dims="point"),
     ),
+    "a deep copy": lambda ds: ds.copy(deep=True),
+    "pickled": lambda ds: pickle.loads(pickle.dumps(ds)),
 }
 
 
@@ -245,12 +252,13 @@ def test_closing_closes_the_file_and_reading_then_fails(
 ) -> None:
     path = Path(shutil.copy(compressed, tmp_path / "out.nc"))
     ds = open_dataset(path)
-    picked = ds.isel(station=[1, 2])
+    picked, copied = ds.isel(station=[1, 2]), ds.copy(deep=True)
     assert held_open(path)
     ds.close()
     assert not held_open(path)
-    # A selection made before the file was closed fails too.
-    for waveform in (ds["waveform"], picked["waveform"]):
+    # A selection made before the file was closed fails too, and so does a deep copy,
+    # which reads through the same file.
+    for waveform in (ds["waveform"], picked["waveform"], copied["waveform"]):
         with pytest.raises(ValueError, match=f"{re.escape(str(path))} is closed"):
             waveform.load()
     ds.close()  # Again, which does nothing.
@@ -271,6 +279,21 @@ def test_several_datasets_can_be_open_at_once(compressed: Path, tmp_path: Path) 
             assert bit_identical(got, want.values)
         first.close()
         third.close()
+
+
+def test_a_file_opened_by_a_relative_path_opens_again_wherever_the_folder_is_then(
+    compressed: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # xarray's cache closes the file to open another, and the working folder changes
+    # before the file is read again.
+    want = decompress_file(compressed)["waveform"].isel(station=[0, 3])
+    other = Path(shutil.copy(compressed, tmp_path / "other.nc"))
+    monkeypatch.chdir(compressed.parent)
+    with xr.set_options(file_cache_maxsize=1), open_dataset(compressed.name) as ds:
+        open_dataset(other).close()
+        monkeypatch.chdir(tmp_path)
+        got = ds["waveform"].isel(station=[0, 3]).values
+    assert bit_identical(got, want.values)
 
 
 @pytest.mark.parametrize(
