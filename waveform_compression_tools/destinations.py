@@ -132,11 +132,12 @@ def naming(path: str | os.PathLike[str]) -> Generator[None]:
     meets, so an error from reading or writing one doesn't say which it was. And the
     partial file that `path` is written as is `path` to anyone using it: `writing` names
     `path` this way.
+
     Such an error that has an error number and its words is raised again as an `OSError`
     with the same number and words, and `path` as its file, caused by the first. One
     without them, as h5py's are for what goes wrong inside HDF5, such as a file cut
-    short, is raised again with `path` as its file and its message as its words, which
-    is all it says, as before. An error that names another file is raised as it is.
+    short, is raised again with `path` as its file, and says only what the first said.
+    An error that names another file is raised as it is.
 
     Parameters
     ----------
