@@ -1419,6 +1419,31 @@ def _compressed_group(f: h5py.File) -> h5py.Group | None:
     return group if isinstance(group, h5py.Group) else None
 
 
+def _without_chunk_cache(group: h5py.Group, name: str) -> h5py.Dataset:
+    """Open a dataset of a group without HDF5's cache of chunks.
+
+    Reading part of a chunk then reads that part alone, where the cache would read the
+    whole chunk, a MiB of ``compressed``. The setting is the dataset's, not the file's:
+    HDF5 gives a file the settings of its first opening in the process, which may be
+    xarray's, and a file's setting reaches every dataset in it.
+
+    Parameters
+    ----------
+    group : h5py.Group
+        The group, open.
+    name : str
+        The dataset's name in the group.
+
+    Returns
+    -------
+    h5py.Dataset
+        The dataset.
+    """
+    access = h5py.h5p.create(h5py.h5p.DATASET_ACCESS)
+    access.set_chunk_cache(0, 0, 1.0)
+    return h5py.Dataset(h5py.h5d.open(group.id, name.encode(), access))
+
+
 def _open_streams(f: h5py.File, path: Path) -> _Streams:
     """Read where a compressed file's streams are, and how to decode them.
 
@@ -1510,7 +1535,7 @@ def _open_streams(f: h5py.File, path: Path) -> _Streams:
             else np.dtype(dtype).type(value)
         )
     return _Streams(
-        compressed=group["compressed"],
+        compressed=_without_chunk_cache(group, "compressed"),
         starts=starts,
         nbytes=group["stream_bytes"][...],
         gains=group["stream_gains"][...],

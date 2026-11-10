@@ -60,9 +60,7 @@ class _OpenFile:
     """
 
     def __init__(self, path: Path, named: Path) -> None:  # numpydoc ignore=GL08
-        # Without HDF5's cache of chunks, which would read each chunk a stream is in
-        # whole, a MiB, a stream's own bytes are all that is read.
-        self._file = h5py.File(path, "r", rdcc_nbytes=0)
+        self._file = h5py.File(path, "r")
         try:
             self.streams = _open_streams(self._file, named)
         except BaseException:

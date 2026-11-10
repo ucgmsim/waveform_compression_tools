@@ -1,3 +1,4 @@
+import contextlib
 import io
 import pickle
 import re
@@ -27,7 +28,8 @@ REAL = (2, 3, 7)
 def compressed(tmp_path_factory: pytest.TempPathFactory) -> Path:
     # A file of three blocks, with real stations, a _FillValue and a time coordinate,
     # whose waveform has attributes of several types. At 17 bits no trace comes back
-    # exactly from its stream, so only an exact copy brings a real station back.
+    # exactly from its stream, so only an exact copy brings a real station back. Its
+    # vs30 is in chunks of 4 stations, compressed with gzip, as other variables can be.
     folder = tmp_path_factory.mktemp("dataset")
     ds = build_standard_dataset(N_STATION, NT, real=REAL)
     ds = ds.assign_coords(time=DT * np.arange(NT))
@@ -35,6 +37,7 @@ def compressed(tmp_path_factory: pytest.TempPathFactory) -> Path:
         scale=np.float32(0.5), count=np.int32(7), weights=np.array([0.5, 1.5], "f4")
     )
     ds["waveform"].encoding["_FillValue"] = np.float32(-999.0)
+    ds["vs30"].encoding.update(zlib=True, chunksizes=(4,))
     dst = folder / "out.nc"
     compress_file(write(ds, folder / "in.nc"), dst, bits=17, block_stations=5)
     return dst
@@ -163,27 +166,55 @@ def test_only_the_selected_traces_are_read_and_decoded(
 
 
 def bytes_read() -> int:
-    # What this process has asked the system to read, from the disk or its cache.
+    # What this process has asked the system to read, from the disk or its cache, with
+    # the hundred bytes or so of this count's last reading.
     with open("/proc/self/io") as f:
         return int(next(line for line in f if line.startswith("rchar:")).split()[1])
 
 
-@pytest.mark.skipif(
+linux_counts_reads = pytest.mark.skipif(
     not Path("/proc/self/io").exists(), reason="Linux counts a process's reads"
 )
-def test_the_file_is_read_for_the_selected_streams_alone(compressed: Path) -> None:
+
+
+@linux_counts_reads
+@pytest.mark.parametrize("already_open", [False, True])
+def test_the_file_is_read_for_the_selected_streams_alone(
+    compressed: Path, already_open: bool
+) -> None:
     # HDF5 can keep chunks in a cache, reading each chunk a stream is in whole: here
-    # the first block's streams, and a MiB in a file of many stations. Station 0's
-    # streams are in the first chunk, and the last station's are in another, so reading
-    # the last station first loads what is read once, such as HDF5's index of chunks.
+    # the first block's streams, and a MiB in a file of many stations. A file has the
+    # settings of its first opening in the process, here xarray's if it is open
+    # already, so the cache is turned off for the streams alone. Station 0's streams
+    # are in the first chunk, and the last station's are in another, so reading the
+    # last station first loads what is read once, such as HDF5's index of chunks.
     with h5py.File(compressed, "r") as f:
         streams = int(f[GROUP]["stream_bytes"][:, 0].sum())
-    with open_dataset(compressed) as ds:
+    first = (
+        xr.open_dataset(compressed, engine="h5netcdf")
+        if already_open
+        else contextlib.nullcontext()
+    )
+    with first, open_dataset(compressed) as ds:
         ds["waveform"].isel(station=[-1]).load()
         before = bytes_read()
         ds["waveform"].isel(station=[0]).load()
         read = bytes_read() - before
     assert streams <= read < streams + 1024
+
+
+@linux_counts_reads
+def test_the_file_keeps_its_cache_for_everything_else(compressed: Path) -> None:
+    # While the dataset is open, another handle of the file reads vs30's first station
+    # 200 times from HDF5's cache. Without the cache, each read would read its chunk.
+    with open_dataset(compressed), h5py.File(compressed, "r") as f:
+        vs30 = f["vs30"]
+        vs30[0]
+        before = bytes_read()
+        for _ in range(200):
+            vs30[0]
+        read = bytes_read() - before
+    assert read < 1024
 
 
 # Station 3 is real: its trace is its exact copy, but its stream is decoded too.
