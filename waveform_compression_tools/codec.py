@@ -8,7 +8,9 @@ order: the first component of every station, then the second, then the third.
 
 A stream carries no sample count, so a stream that has been cut can decode without
 an error to fewer samples than it held. `decode_block` and `decode_trace`, which are
-told how many samples to expect, count them.
+told how many samples to expect, count them, and raise
+`waveform_compression_tools.errors.Damaged` for a stream that is short or doesn't
+decode.
 
 `check_standard` says whether a dataset holds its waveform in the layout this
 package handles. `max_relative_error` and `within_one_step` compare a decoded block
@@ -21,7 +23,7 @@ import numpy as np
 import pyflac
 import xarray as xr
 
-from .errors import NotStandardLayout
+from .errors import Damaged, NotStandardLayout
 from .quantise import dequantise, gain_for, quantise
 from .stream import decode_stream, encode_stream
 
@@ -185,10 +187,12 @@ def decode_block(
     ------
     ValueError
         If `starts`, `nbytes`, `gains` and `offsets` do not all have the same shape,
-        or `out` isn't float32 of the block's shape. If a stream is damaged, so that
-        libFLAC can't decode it, or decodes to some other number of samples than
-        `nt`, as one that was cut short does, or cut to nothing. The message names the
-        stream's component and station, counting the stations from `first_station`.
+        or `out` isn't float32 of the block's shape.
+    Damaged
+        If a stream is damaged, so that libFLAC can't decode it, or decodes to some
+        other number of samples than `nt`, as one that was cut short does, or cut to
+        nothing. The message names the stream's component and station, counting the
+        stations from `first_station`.
     """
     shapes = [a.shape for a in (starts, nbytes, gains, offsets)]
     if len(set(shapes)) != 1:
@@ -252,21 +256,20 @@ def decode_trace(
 
     Raises
     ------
-    ValueError
+    Damaged
         If the stream is damaged, so that libFLAC can't decode it, or decodes to some
         other number of samples than `nt`, as one that was cut short does, or cut to
-        nothing. The message names the trace's component and station.
+        nothing. The message names the trace's component and station, and libFLAC's
+        error, where it found the damage, is the cause.
     """
     trace = f"component {component}, station {station}"
     try:
         # The decoder needs bytes: it fails on a numpy slice of more than about 8 KB.
         q = decode_stream(stream.tobytes())
     except (pyflac.DecoderInitException, pyflac.DecoderProcessException) as e:
-        raise ValueError(f"{trace}: a FLAC stream is damaged ({e})") from e
+        raise Damaged(f"{trace}: a FLAC stream is damaged ({e})") from e
     if q.size != nt:
-        raise ValueError(
-            f"{trace}: the stream decodes to {q.size} samples, expected {nt}"
-        )
+        raise Damaged(f"{trace}: the stream decodes to {q.size} samples, expected {nt}")
     return dequantise(q, gain, offset)
 
 

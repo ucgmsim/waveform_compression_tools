@@ -179,9 +179,8 @@ class _Stop(Exception):  # noqa: N818
 def _about(path: Path) -> Generator[None]:
     """Turn any error in a block into a `_Stop` that names the file it is about.
 
-    An error that says which file it is about, as an `OSError`, a refusal or a failed
-    check does, names that file instead, and a `_Stop` from a step within the block,
-    about another file, is raised as it is.
+    An error that says which file it is about, as an `OSError`, a refusal, a failed
+    check or a damaged file's error does, names that file instead.
 
     Parameters
     ----------
@@ -201,8 +200,6 @@ def _about(path: Path) -> Generator[None]:
     """
     try:
         yield
-    except _Stop:
-        raise
     # Every error becomes one line, never a traceback.
     except Exception as error:
         named = destinations.named_file(error)
@@ -553,9 +550,10 @@ def decompress(
         is SRC or is there already, and with `EXIT_FAILED` if the run fails.
     """
     try:
-        # Each step names its own file: DST as the destination is checked and written,
-        # and SRC as it is read, a block at a time, as DST is written.
-        n_component, n_station, nt = files._decompress_to(src, dst, overwrite, _about)
+        # The library names SRC in what goes wrong as it is read, a block at a time as
+        # DST is written. What names no file is about DST, as for the converters.
+        with _about(dst):
+            n_component, n_station, nt = files.decompress_to(src, dst, overwrite)
     except _Stop as stop:
         stop.exit()
     typer.echo(

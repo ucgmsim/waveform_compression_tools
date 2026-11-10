@@ -15,7 +15,7 @@ import xarray as xr
 
 import waveform_compression_tools
 from waveform_compression_tools import codec, open_dataset
-from waveform_compression_tools.errors import NotCompressed, UnknownFormat
+from waveform_compression_tools.errors import Damaged, NotCompressed, UnknownFormat
 from waveform_compression_tools.files import (
     GROUP,
     compress_file,
@@ -252,26 +252,32 @@ def test_the_file_keeps_its_cache_for_everything_else(compressed: Path) -> None:
 def test_a_damaged_stream_fails_its_own_trace_alone(
     compressed: Path, tmp_path: Path, station: int
 ) -> None:
-    # Component 1 of the station is damaged, and fails as it does in decompress_file
-    # and decompress_to. The error names the trace as the file counts its traces, not
-    # as the selection does, and every other trace still comes back.
+    # Component 1 of the station is damaged, and fails alike in decompress_file,
+    # decompress_to and a read of open_dataset's, which names the file as they do. A
+    # read may come long after the file was opened, with other files open: here the
+    # file it was copied from is open too, and read first. The message names the trace
+    # as the file counts its traces, not as the selection does, and every other trace
+    # still comes back.
     path = Path(shutil.copy(compressed, tmp_path / "out.nc"))
     with h5py.File(path, "r+") as f:
         group = f[GROUP]
         start = group["stream_starts"][1, station]
         group["compressed"][start + group["stream_bytes"][1, station] // 2] ^= 0xFF
-    with pytest.raises(ValueError, match=f"component 1, station {station}") as failed:
+    with pytest.raises(Damaged, match=f"component 1, station {station}") as failed:
         decompress_file(path)
+    assert failed.value.filename == path
     back = tmp_path / "back.nc"
-    with pytest.raises(ValueError) as written:
+    with pytest.raises(Damaged) as written:
         decompress_to(path, back)
-    assert str(written.value) == str(failed.value) and nothing_left(back)
+    assert nothing_left(back)
     want = decompress_file(compressed)["waveform"].isel(component=[0, 2])
-    with open_dataset(path) as ds:
-        with pytest.raises(ValueError) as read:
+    with open_dataset(compressed) as other, open_dataset(path) as ds:
+        other["waveform"].isel(station=[station]).load()
+        with pytest.raises(Damaged) as read:
             ds["waveform"].isel(component=[1], station=[4, station]).load()
         got = ds["waveform"].isel(component=[0, 2]).values
-    assert str(read.value) == str(failed.value)
+    for error in (written.value, read.value):
+        assert (str(error), vars(error)) == (str(failed.value), vars(failed.value))
     assert bit_identical(got, want.values)
 
 
@@ -430,8 +436,8 @@ def test_a_file_opened_by_a_relative_path_opens_again_wherever_the_folder_is_the
         ("not HDF5", NotCompressed),
         ("format version 2", UnknownFormat),
         # Its streams decode, but to a station fewer than its coordinates name, which
-        # fails as the waveform is put in the dataset, once the file is open.
-        ("a station short", ValueError),
+        # is found once the file is open, as the rest is read.
+        ("a station short", Damaged),
     ],
 )
 def test_a_file_that_cannot_be_read_fails_as_it_is_opened(
@@ -457,7 +463,7 @@ def test_a_file_that_cannot_be_read_fails_as_it_is_opened(
         decompress_file(path)
     with pytest.raises(error) as opened:
         open_dataset(path)
-    # The same type, message and attributes: a refusal names the file as its filename.
+    # The same type, message and attributes: each names the file as its filename.
     assert type(opened.value) is type(failed.value)
     assert (str(opened.value), vars(opened.value)) == (
         str(failed.value),

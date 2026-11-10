@@ -1,10 +1,12 @@
-"""Why an input is refused, and how a compressed file fails its check.
+"""Why an input is refused, how a compressed file fails its check, and its damage.
 
 A refusal, `Refused` or one of its subclasses, says that an input can't be used as it
 is: it can't be compressed, decompressed, verified or converted. Nothing is written: no
 file appears at the destination, and a file already there stays as it was. A failed
 check, `CheckFailed`, says that the compressed output didn't come back as it should. It
-is deleted, so nothing appears at the destination either.
+is deleted, so nothing appears at the destination either. `Damaged` says that a
+compressed file can't be read as it was written, as when a stream doesn't decode. It
+is found as the file is read, and leaves nothing at a destination either.
 
 Each names the file it is about as its `filename`, where that is known, as an `OSError`
 does; its message is the same either way. A function that knows which file a step is
@@ -97,6 +99,35 @@ class IncompleteHFBin(Refused):
     """An HF.bin is unfinished: a station's vs is 0, as it is until the station is done."""
 
 
+class Damaged(ValueError):  # noqa: N818
+    """A compressed file is damaged, so it can't be read as it was written.
+
+    A stream doesn't decode, or decodes to the wrong number of samples; the file lacks
+    a part of its format; or its parts disagree with each other. It is found as the
+    file is read, so it may be found once a run has begun to write, which then leaves
+    nothing at its destination.
+
+    Parameters
+    ----------
+    message : str
+        What is wrong.
+    filename : str or os.PathLike, optional
+        The damaged file.
+
+    Attributes
+    ----------
+    filename : str or os.PathLike or None
+        The damaged file, or None if that isn't known.
+    """
+
+    def __init__(  # numpydoc ignore=PR01
+        self, message: str, filename: str | os.PathLike[str] | None = None
+    ) -> None:
+        """Keep the message, and the file it is about."""
+        super().__init__(message)
+        self.filename = filename
+
+
 class CheckFailed(RuntimeError):  # noqa: N818
     """The compressed output didn't pass the check. Nothing is left at the destination.
 
@@ -125,14 +156,14 @@ class CheckFailed(RuntimeError):  # noqa: N818
 
 @contextmanager
 def about(path: str | os.PathLike[str]) -> Generator[None]:
-    """Have a refusal or a failed check in a block that names no file name `path`.
+    """Have a refusal, a failed check or damage in a block that names no file name `path`.
 
     One that names a file already keeps it.
 
     Parameters
     ----------
     path : str or os.PathLike
-        The file the block's refusals and failed checks are about.
+        The file the block's refusals, failed checks and damage are about.
 
     Yields
     ------
@@ -141,7 +172,7 @@ def about(path: str | os.PathLike[str]) -> Generator[None]:
     """
     try:
         yield
-    except (Refused, CheckFailed) as error:
+    except (Refused, CheckFailed, Damaged) as error:
         if error.filename is None:
             error.filename = path
         raise

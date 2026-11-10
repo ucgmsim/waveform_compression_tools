@@ -1,4 +1,5 @@
 import numpy as np
+import pyflac
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
@@ -10,6 +11,7 @@ from waveform_compression_tools.codec import (
     max_relative_error,
     within_one_step,
 )
+from waveform_compression_tools.errors import Damaged
 
 from helpers import RealTraces, within_one_step_of_the_setting
 
@@ -179,3 +181,33 @@ def test_a_block_decodes_into_the_array_given() -> None:
     for wrong in (np.zeros((3, 4, 299), np.float32), np.zeros((3, 4, 300))):
         with pytest.raises(ValueError, match="out must be float32 of shape"):
             decode_block(*args, out=wrong)
+
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        ("a flipped byte", "a FLAC stream is damaged"),
+        ("cut to nothing", "the stream decodes to 0 samples, expected 300"),
+    ],
+)
+def test_a_damaged_stream_is_named_by_its_trace_in_the_file(
+    damage: str, message: str
+) -> None:
+    # Components 2 and 0 of stations 7 and 8 of a file, in that order: the second
+    # stream of the first row is component 2 of station 8. The error isn't libFLAC's
+    # own: where libFLAC finds the damage, its error is the cause. The file isn't known
+    # here, so none is named.
+    block = encode_block(random_walks((2, 2, 300), seed=2), 24)
+    compressed, starts, nbytes = pack(block.streams, block.gains.shape)
+    compressed = compressed.copy()
+    if damage == "a flipped byte":
+        compressed[starts[0, 1] + nbytes[0, 1] // 2] ^= 0xFF
+    else:
+        nbytes[0, 1] = 0
+    offsets = np.zeros_like(block.gains)
+    args = (compressed, starts, nbytes, block.gains, offsets, 300)
+    with pytest.raises(Damaged, match=f"component 2, station 8: {message}") as bad:
+        decode_block(*args, first_station=7, components=np.array([2, 0]))
+    assert bad.value.filename is None
+    libflac = (pyflac.DecoderInitException, pyflac.DecoderProcessException)
+    assert isinstance(bad.value.__cause__, libflac) == (damage == "a flipped byte")

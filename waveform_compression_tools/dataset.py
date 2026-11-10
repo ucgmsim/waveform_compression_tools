@@ -27,7 +27,7 @@ from xarray.backends import BackendArray, CachingFileManager
 from xarray.core import indexing
 
 from .engine import FlacBackendEntrypoint
-from .errors import NotCompressed
+from .errors import NotCompressed, about
 from .files import _open_streams, _original, _refuse_unless_hdf5, _Streams
 
 
@@ -59,8 +59,8 @@ class _OpenFile:
         If the file holds no compressed waveform.
     UnknownFormat
         If it is in a format version other than 1, or has a setting outside 8 to 32.
-    ValueError
-        If its arrays don't agree with each other.
+    Damaged
+        If it lacks a part of the format, or its parts don't agree with each other.
     """
 
     def __init__(
@@ -131,7 +131,10 @@ class _CompressedFile:
 
     @contextmanager
     def reading(self) -> Generator[_Streams]:
-        """Have the file open while its streams are read.
+        """Have the file open while its streams are read, and name it in their damage.
+
+        A read may come long after the file was opened, with other files open, so a
+        damaged stream names the file it is in.
 
         Yields
         ------
@@ -141,12 +144,14 @@ class _CompressedFile:
         Raises
         ------
         ValueError
-            If the file has been closed, or fails as `_OpenFile` does as it is opened
-            again.
+            If the file has been closed.
+        Damaged
+            If the file fails as `_OpenFile` does as it is opened again, or a stream read
+            is damaged. It names the file.
         """
         if self._closed:
             raise ValueError(f"{self.path} is closed, so its waveform can't be read")
-        with self._manager.acquire_context() as opened:
+        with about(self.path), self._manager.acquire_context() as opened:
             yield opened.streams
 
     def close(self) -> None:
@@ -206,7 +211,7 @@ def _read_traces(
 
     Raises
     ------
-    ValueError
+    Damaged
         If a stream is damaged, or decodes to the wrong number of samples (see
         `waveform_compression_tools.codec.decode_block`).
     """
@@ -284,7 +289,9 @@ class _LazyWaveform(BackendArray):
         Raises
         ------
         ValueError
-            If the file has been closed, or a stream doesn't decode.
+            If the file has been closed.
+        Damaged
+            If a stream doesn't decode, naming the file.
         """
         components, stations, times = key
         n_component, n_station, _ = self.shape
@@ -319,8 +326,8 @@ def _open(
 
     Raises
     ------
-    ValueError
-        As `open_dataset` raises it.
+    NotCompressed, UnknownFormat, Damaged
+        As `open_dataset` raises them.
     """
     path = Path(path)
     if isinstance(drop_variables, str):
@@ -354,7 +361,8 @@ def open_dataset(path: str | os.PathLike[str]) -> xr.Dataset:
     selection in time decodes whole traces and then cuts them. A selection of points
     decodes every chosen component of every chosen station and then picks. Every value
     read is bit for bit the one `decompress_file` gives, and a damaged stream fails as
-    it does in `decompress_file`.
+    it does in `decompress_file`, with `waveform_compression_tools.errors.Damaged`
+    naming the file.
 
     It is ``xr.open_dataset(path, engine="waveform_compression_tools")``, so the dataset
     behaves as the datasets of xarray's other engines do: the values read are kept with
@@ -380,8 +388,8 @@ def open_dataset(path: str | os.PathLike[str]) -> xr.Dataset:
         If `path` is a file that isn't HDF5, or holds no compressed waveform.
     UnknownFormat
         If it is in a format version other than 1, or has a setting outside 8 to 32.
-    ValueError
-        If its arrays don't agree with each other, or its ``waveform_attr_types`` names
-        an attribute that its ``waveform_attrs`` lacks, as for `decompress_file`.
+    Damaged
+        If it lacks a part of the format, or its parts don't agree with each other, as
+        when its streams don't fit its dimensions, as for `decompress_file`.
     """
     return xr.open_dataset(path, engine=FlacBackendEntrypoint)

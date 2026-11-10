@@ -315,7 +315,7 @@ print(peaks.values, south["waveform"].shape)
 - Reading a selection's values, with `.values`, `.load()` or a computation, reads and decodes only its traces' own streams. A real station's trace is then its exact copy, as in `decompress_file`. A selection in time decodes whole traces, then cuts them.
 - As with xarray's other engines, the values that a selection reads are kept with that selection, so using it again decodes nothing more.
 - A selection of points decodes and holds every chosen component of every chosen station at every chosen time before it picks. So for many points, select the stations, load them, and pick from what was loaded.
-- Every value is bit for bit the one that `decompress_file` gives, and a damaged stream raises the error that `decompress_file` raises.
+- Every value is bit for bit the one that `decompress_file` gives, and a damaged stream raises the error that `decompress_file` raises: `Damaged`, naming the file, however long after it was opened (see [Errors](#errors)).
 - The file stays open until the dataset is closed, with `ds.close()` or at the end of a `with` block. Selections read through their dataset, so after that, reading one raises `ValueError`.
 - Reading the whole waveform decodes all of it into memory, 4 bytes a sample, and the dataset holds it from then on. Writing the dataset with `to_netcdf` does that, so a whole file should go through `decompress_to`, or the `decompress` command, instead.
 - `open_dataset(path)` is `xr.open_dataset(path, engine="waveform_compression_tools")`, which also takes `drop_variables`. It takes none of xarray's options for decoding, since the dataset is the original as it was compressed, so `decode_cf=False` changes nothing. Without the engine, xarray opens a compressed file as an ordinary netCDF file, without its waveform.
@@ -343,9 +343,11 @@ A refusal raises `Refused`, or one of its subclasses, from `waveform_compression
 
 `CheckFailed`, a `RuntimeError`, means that the output of `compress_file` failed its check. The output is deleted, so nothing is left at the destination, and a file already there stays as it was.
 
-A refusal and a failed check name the file they are about as their `filename`, as an `OSError` does, where it is known.
+`Damaged`, a `ValueError`, means that a compressed file can't be read as it was written: a stream doesn't decode, or decodes to the wrong number of samples; the file lacks a part of the format; or its parts disagree, as when its streams don't fit its dimensions. `decompress_file`, `decompress_to`, `verify_file` and `open_dataset`'s reads raise it where they find the damage, which for `decompress_to` may be once it has begun to write: nothing is left at the destination then either, and a file already there stays as it was. For a damaged stream, the message names the trace, and libFLAC's own error, where libFLAC found the damage, is the cause. It isn't a refusal, so the command line exits with status 1 for it. Catch it, too, before `ValueError`.
 
-Anything else is a failure of the run: `OSError` for a file that can't be read or written; `ValueError` for a bad argument (such as `bits` outside 8 to 32) or a damaged compressed file, whose message names the trace that doesn't decode, and whose cause is libFLAC's own error where libFLAC found the damage; and pyflac's exceptions when libFLAC can't encode a trace.
+A refusal, a failed check and `Damaged` name the file they are about as their `filename`, as an `OSError` does, where it is known.
+
+Anything else is a failure of the run: `OSError` for a file that can't be read or written; `ValueError` for a bad argument, such as `bits` outside 8 to 32, or an original and a compressed file of different shapes for `verify_file`; and pyflac's exceptions when libFLAC can't encode a trace.
 
 ## The file format
 

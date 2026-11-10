@@ -20,7 +20,7 @@ import pyflac
 import pytest
 import xarray as xr
 
-from waveform_compression_tools import bbbin, files
+from waveform_compression_tools import bbbin, files, open_dataset
 from waveform_compression_tools.bbbin import convert_bbbin, read_bbbin
 from waveform_compression_tools.codec import (
     STANDARD_DIMS,
@@ -36,6 +36,7 @@ from waveform_compression_tools.destinations import (
     write_netcdf,
 )
 from waveform_compression_tools.errors import (
+    Damaged,
     NotStandardLayout,
     OutputExists,
     SameFile,
@@ -348,13 +349,14 @@ def test_a_stream_that_cant_be_read_names_the_compressed_file(
     assert nothing_left(back)
 
 
-def test_a_file_whose_time_disagrees_with_its_streams_is_refused(
-    tmp_path: Path, standard_dataset: StandardDataset
+@pytest.mark.parametrize("call", ["decompress_file", "decompress_to", "open_dataset"])
+def test_a_file_whose_time_disagrees_with_its_streams_is_damaged(
+    tmp_path: Path, standard_dataset: StandardDataset, call: str
 ) -> None:
     # A compressed file holds its streams apart from everything else, so damage or an
     # edit can make the two disagree: here the streams of 60 samples are put in a file
-    # whose time coordinate has 50. decompress_to refuses the file, as decompress_file
-    # does, rather than write a waveform that doesn't fit, and writes nothing.
+    # whose time coordinate has 50. Each way in fails alike, naming the file, rather
+    # than give a waveform that doesn't fit, and decompress_to writes nothing.
     packed = {}
     for nt in (50, 60):
         ds = standard_dataset(5, nt=nt).assign_coords(time=np.arange(nt) * 0.005)
@@ -364,11 +366,17 @@ def test_a_file_whose_time_disagrees_with_its_streams_is_refused(
         del f[GROUP]
         other.copy(GROUP, f)
     back = tmp_path / "back.nc"
-    with pytest.raises(ValueError, match="time dimension has length 50") as refused:
-        decompress_to(packed[50], back)
-    assert str(refused.value).startswith(
+    with pytest.raises(Damaged, match="time dimension has length 50") as damaged:
+        if call == "decompress_file":
+            decompress_file(packed[50])
+        elif call == "decompress_to":
+            decompress_to(packed[50], back)
+        else:
+            open_dataset(packed[50])
+    assert str(damaged.value).startswith(
         f"{packed[50]} decodes to a waveform of shape (3, 5, 60)"
     )
+    assert damaged.value.filename == packed[50]
     assert nothing_left(back)
 
 
@@ -671,11 +679,11 @@ def test_a_bad_stream_is_named_by_its_station_in_the_file(
     message: str,
 ) -> None:
     # In blocks of 2 stations, station 3 is the second of the second block: the message
-    # counts it from the file's first station, not its block's. libFLAC's own error,
-    # for a stream it can't decode, is a ValueError's cause, not raised as it is. The
-    # file is in one block, so a block of 2 reads a run of streams for each component.
-    # A stream said to run past the end of the file is read as far as it goes, and one
-    # said to start before the file is read from its start.
+    # counts it from the file's first station, not its block's, and the error names the
+    # file. libFLAC's own error, for a stream it can't decode, is the cause, not raised
+    # as it is. The file is in one block, so a block of 2 reads a run of streams for
+    # each component. A stream said to run past the end of the file is read as far as
+    # it goes, and one said to start before the file is read from its start.
     src, dst = write_and_compress(standard_dataset(5, nt=100), tmp_path)
     with h5py.File(dst, "r+") as f:
         g = f[GROUP]
@@ -691,12 +699,12 @@ def test_a_bad_stream_is_named_by_its_station_in_the_file(
             start, size = int(g["stream_starts"][1, 3]), int(g["stream_bytes"][1, 3])
             g["compressed"][start + size // 2] ^= 0xFF
     monkeypatch.setattr(files, "BLOCK_BYTES", 2 * 3 * 100 * 4)  # For decompress_file.
-    with pytest.raises(ValueError, match=f"component 1, station 3: {message}") as bad:
+    with pytest.raises(Damaged, match=f"component 1, station 3: {message}") as bad:
         if call == "verify_file":
             verify_file(src, dst, block_stations=2)
         else:
             decompress_file(dst)
-    assert type(bad.value) is ValueError
+    assert bad.value.filename == dst
 
 
 def test_decompress_decodes_each_block_into_the_waveform(
@@ -963,18 +971,35 @@ def test_every_kind_of_encoding_value_is_strict_json() -> None:
     assert files._encoding_json({"_FillValue": None}) == '{"_FillValue": null}'
 
 
-@pytest.mark.parametrize("attribute", ["waveform_encoding", "waveform_attr_types"])
-def test_a_file_without_an_attribute_of_the_format_is_not_read(
-    tmp_path: Path, standard_dataset: StandardDataset, attribute: str
+# Two attributes of the group, and two of its datasets.
+@pytest.mark.parametrize(
+    "part", ["waveform_encoding", "waveform_attr_types", "stream_offsets", "compressed"]
+)
+@pytest.mark.parametrize(
+    "call", ["decompress_file", "decompress_to", "open_dataset", "verify_file"]
+)
+def test_a_file_without_a_part_of_the_format_is_damaged(
+    tmp_path: Path, standard_dataset: StandardDataset, part: str, call: str
 ) -> None:
-    # Every file this package writes has both; it reads no file without one.
+    # Every file this package writes has each of them, and it reads no file without
+    # one. The error names the file, and its message the part.
     src, dst = write_and_compress(standard_dataset(2, nt=50), tmp_path)
     with h5py.File(dst, "r+") as f:
-        del f[GROUP].attrs[attribute]
-    with pytest.raises(KeyError, match=attribute):
-        decompress_file(dst)
-    with pytest.raises(KeyError, match=attribute):
-        verify_file(src, dst)
+        group = f[GROUP]
+        if part in group:
+            del group[part]
+        else:
+            del group.attrs[part]
+    with pytest.raises(Damaged, match=part) as damaged:
+        if call == "decompress_file":
+            decompress_file(dst)
+        elif call == "decompress_to":
+            decompress_to(dst, tmp_path / "back.nc")
+        elif call == "open_dataset":
+            open_dataset(dst)
+        else:
+            verify_file(src, dst)
+    assert damaged.value.filename == dst
 
 
 def test_an_unlimited_time_dimension_is_no_trouble(
@@ -1183,10 +1208,11 @@ def test_verify_wants_exact_copies_of_the_real_stations_and_no_others(
         "copies in float64",
     ],
 )
-def test_exact_copies_that_cannot_be_put_back_are_refused(
+def test_exact_copies_that_cannot_be_put_back_are_damaged(
     tmp_path: Path, standard_dataset: StandardDataset, fault: str
 ) -> None:
     # Each would put a copy back at the wrong place, or not at all, or not exactly.
+    # The error names the file.
     ds = standard_dataset(4, nt=100, real=(1, 2))
     src, dst = write_and_compress(ds, tmp_path)
     stations, copies = np.array([1, 2]), ds["waveform"].values[:, [1, 2]]
@@ -1208,10 +1234,11 @@ def test_exact_copies_that_cannot_be_put_back_are_refused(
     with h5py.File(dst, "r+") as f:
         rewrite(f[GROUP], "exact_stations", stations)
         rewrite(f[GROUP], "exact_waveform", copies)
-    with pytest.raises(ValueError, match=name):
+    with pytest.raises(Damaged, match=name) as decompressed:
         decompress_file(dst)
-    with pytest.raises(ValueError, match=name):
+    with pytest.raises(Damaged, match=name) as verified:
         verify_file(src, dst)
+    assert decompressed.value.filename == verified.value.filename == dst
 
 
 # The waveform's attributes, which the file holds as JSON, changed from the original's
