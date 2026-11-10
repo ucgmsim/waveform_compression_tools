@@ -83,6 +83,14 @@ class NotBBBin(Refused):
     """A file can't be a BB.bin: its size doesn't fit its header, or its text isn't ASCII."""
 
 
+class NotHFBin(Refused):
+    """A file can't be an HF.bin: its size doesn't fit its header, or its text isn't ASCII."""
+
+
+class IncompleteHFBin(Refused):
+    """An HF.bin is unfinished: a station's vs is 0, as it is until the station is done."""
+
+
 class CheckFailed(RuntimeError):  # noqa: N818
     """The compressed output didn't pass the check. Nothing is left at the destination.
 

@@ -6,10 +6,12 @@ import pytest
 
 from helpers import (
     MakeBbbin,
+    MakeHfbin,
     RealTraces,
     StandardDataset,
     build_standard_dataset,
     write_bbbin,
+    write_hfbin,
 )
 
 
@@ -50,6 +52,28 @@ def make_bbbin() -> MakeBbbin:
     """
 
     return write_bbbin
+
+
+@pytest.fixture
+def make_hfbin() -> MakeHfbin:
+    """Return a function that writes a legacy HF.bin file.
+
+    ``make_hfbin(path, nstat, nt, endian="<", names=None, unfinished=())`` writes an
+    HF.bin file in the byte order `endian` (``"<"`` or ``">"``, for everything in it)
+    and returns its data: float32 of shape (nstat, nt, 3), in cm/s^2, with the
+    components in the file's order, 090, 000 and ver. The stations are named STA0,
+    STA1, ... unless `names` says otherwise; those names are 4 characters long, like a
+    real station's. The header holds nstat and nt, then helpers.py's `HFBIN_INTS`,
+    `HFBIN_FLOATS` and `HFBIN_TEXTS`.
+
+    The header and the records are packed with struct, a description of the layout
+    that is independent of the reader's. Each number has a value of its own, and
+    station i's are station 0's plus i, so a field that is read from the wrong place
+    shows. The stations whose indices are in `unfinished` have an ``e_dist`` and a
+    ``vs`` of 0, as the writer of an HF.bin leaves a station until it is done.
+    """
+
+    return write_hfbin
 
 
 REAL_TRACES = Path(__file__).parent / "real_traces"

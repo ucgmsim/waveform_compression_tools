@@ -16,9 +16,11 @@ import xarray as xr
 from waveform_compression_tools.codec import EncodedBlock
 from waveform_compression_tools.files import compress_file
 
-# The types of conftest.py's fixtures standard_dataset, make_bbbin and real_traces.
+# The types of conftest.py's fixtures standard_dataset, make_bbbin, make_hfbin and
+# real_traces.
 StandardDataset = Callable[..., xr.Dataset]
 MakeBbbin = Callable[..., np.ndarray]
+MakeHfbin = Callable[..., np.ndarray]
 RealTraces = Callable[[str], np.ndarray]
 
 # For a test that fails writes with a limit on the size of a file (see
@@ -156,6 +158,93 @@ def write_bbbin(
     )
     path.write_bytes(
         header.ljust(0x500, b"\0") + records + data.astype(f"{endian}f4").tobytes()
+    )
+    return data
+
+
+# What write_hfbin writes in the header after the numbers of stations and samples, in
+# the file's order: the int32s, the float32s, then the strings. Each field has a value
+# of its own, so that one read from the wrong place shows.
+HFBIN_INTS = {
+    "seed": 5_234_567,
+    "siteamp": 1,
+    "pdur_model": 11,
+    "nrayset": 2,
+    "rayset1": 21,
+    "rayset2": 22,
+    "rayset3": 23,
+    "rayset4": 24,
+    "nbu": 4,
+    "ift": 5,
+    "nlskip": -99,
+    "icflag": 6,
+    "same_seed": 7,
+    "site_specific_vm": 8,
+}
+HFBIN_FLOATS = {
+    "duration": 123.5,
+    "dt": 0.005,
+    "start_sec": -1.0,
+    "sdrop": 50.0,
+    "kappa": 0.045,
+    "qfexp": 0.6,
+    "fmax": 10.0,
+    "flo": 0.02,
+    "fhi": 19.9,
+    "rvfac": 0.8,
+    "rvfac_shal": 0.7,
+    "rvfac_deep": 0.75,
+    "czero": 2.1,
+    "calpha": -99.0,
+    "mom": -2.5,
+    "rupv": -3.5,
+    "vs_moho": 999.9,
+    "vp_sig": 0.11,
+    "vsh_sig": 0.12,
+    "rho_sig": 0.13,
+    "qs_sig": 0.14,
+    "fa_sig1": 0.21,
+    "fa_sig2": 0.22,
+    "rv_sig1": 0.1,
+}
+HFBIN_TEXTS = {"stoch_file": "rel01.stoch", "velocity_model": "model.1d"}
+
+
+def write_hfbin(
+    path: Path,
+    nstat: int,
+    nt: int,
+    endian: str = "<",
+    names: Sequence[str] | None = None,
+    unfinished: Sequence[int] = (),
+) -> np.ndarray:
+    # conftest.py's make_hfbin fixture gives this, and says what it writes.
+    names = [f"STA{i}" for i in range(nstat)] if names is None else names
+    assert len(names) == nstat
+    rng = np.random.default_rng(0)
+    # Random walks of tens of cm/s^2, like a high-frequency acceleration record.
+    data = (10 * np.cumsum(rng.normal(size=(nstat, nt, 3)), axis=1)).astype(np.float32)
+    header = struct.pack(
+        f"{endian}16i24f64s64s",
+        nstat,
+        nt,
+        *HFBIN_INTS.values(),
+        *HFBIN_FLOATS.values(),
+        *(text.encode() for text in HFBIN_TEXTS.values()),
+    )
+    records = b"".join(
+        struct.pack(
+            f"{endian}ff8sff",
+            170.5 + i,
+            -40.5 + i,
+            name.encode(),
+            0.0 if i in unfinished else 44.5 + i,
+            0.0 if i in unfinished else 555.5 + i,
+        )
+        for i, name in enumerate(names)
+    )
+    path.write_bytes(
+        header.ljust(0x200, b"\0") + records + data.astype(f"{endian}f4").tobytes()
     )
     return data
 

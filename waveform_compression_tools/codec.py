@@ -26,8 +26,8 @@ from .quantise import dequantise, gain_for, quantise
 from .stream import decode_stream, encode_stream
 
 STANDARD_DIMS = ("component", "station", "time")
-# The components the BB.bin converter writes, in its order. A file's own component
-# coordinate can name them otherwise: some files use x, y and z.
+# The components the BB.bin and HF.bin converters write, in their order. A file's own
+# component coordinate can name them otherwise: some files use x, y and z.
 STANDARD_COMPONENTS = ("000", "090", "ver")
 
 # How far past one quantisation step, relative to the step, a decoded sample may be
