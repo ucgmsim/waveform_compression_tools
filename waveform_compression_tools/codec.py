@@ -145,6 +145,7 @@ def decode_block(
     nt: int,
     first_station: int = 0,
     out: np.ndarray | None = None,
+    components: np.ndarray | None = None,
 ) -> np.ndarray:
     """Decode a block of stations.
 
@@ -153,26 +154,32 @@ def decode_block(
     compressed : np.ndarray
         The bytes of the streams: a 1-D uint8 array.
     starts : np.ndarray
-        Where each stream starts in `compressed`: int64, of shape (3, n).
+        Where each stream starts in `compressed`: int64, of shape (3, n), or with a
+        row for each of `components`.
     nbytes : np.ndarray
-        The length of each stream in bytes, of shape (3, n).
+        The length of each stream in bytes, of the same shape.
     gains : np.ndarray
-        The gain each trace was quantised with, of shape (3, n).
+        The gain each trace was quantised with, of the same shape.
     offsets : np.ndarray
-        The value added to each trace after dividing by its gain, of shape (3, n).
+        The value added to each trace after dividing by its gain, of the same shape.
     nt : int
         The number of samples in every trace.
     first_station : int, default 0
         The block's first station in its file, from which an error's message counts
         the stations.
     out : np.ndarray, optional
-        A float32 array of shape (3, n, nt) to decode into, such as a slice of a
-        whole waveform. By default a new one is made.
+        A float32 array of the block's shape, ``(*starts.shape, nt)``, to decode
+        into, such as a slice of a whole waveform. By default a new one is made.
+    components : np.ndarray, optional
+        The component in its file of each row, for a block of only some components,
+        or of them in another order. An error's message names it. By default the rows
+        are components 0, 1 and 2.
 
     Returns
     -------
     np.ndarray
-        The block, as a float32 array of shape (3, n, nt): `out`, if it is given.
+        The block, as a float32 array of shape ``(*starts.shape, nt)``: `out`, if it
+        is given.
 
     Raises
     ------
@@ -199,6 +206,7 @@ def decode_block(
         )
     else:
         block = out
+    labels = range(starts.shape[0]) if components is None else components
     for c, s in np.ndindex(*starts.shape):
         start, size = int(starts[c, s]), int(nbytes[c, s])
         block[c, s] = decode_trace(
@@ -206,7 +214,7 @@ def decode_block(
             gains[c, s],
             offsets[c, s],
             nt,
-            c,
+            int(labels[c]),
             s + first_station,
         )
     return block

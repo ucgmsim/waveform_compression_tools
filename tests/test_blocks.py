@@ -181,8 +181,10 @@ def test_a_block_reads_only_its_own_streams(
     read = files._Streams.read
     unneeded: list[int] = []
 
-    def counted(self: Any, s0: int, s1: int) -> tuple[np.ndarray, np.ndarray]:
-        data, starts = read(self, s0, s1)
+    def counted(
+        self: Any, s0: int, s1: int, components: None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
+        data, starts = read(self, s0, s1, components)
         unneeded.append(data.nbytes - int(self.nbytes[:, s0:s1].sum()))
         return data, starts
 

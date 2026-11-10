@@ -62,7 +62,6 @@ from .codec import (
     EncodedBlock,
     check_standard,
     decode_block,
-    decode_trace,
     encode_block,
     max_relative_error,
     within_one_step,
@@ -1167,7 +1166,9 @@ class _Streams:
         n_component, n_station = self.starts.shape
         return n_component, n_station, self.nt
 
-    def read(self, s0: int, s1: int) -> tuple[np.ndarray, np.ndarray]:
+    def read(
+        self, s0: int, s1: int, components: np.ndarray | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Read the bytes of a block of stations' streams from the file, and no others.
 
         compress lays out each of its blocks' streams one component after another. So
@@ -1182,16 +1183,20 @@ class _Streams:
             The block's first station.
         s1 : int
             The station after its last, greater than `s0`.
+        components : np.ndarray, optional
+            The components whose streams are read, as indices, in any order, and
+            repeated or not. By default every component's are.
 
         Returns
         -------
         data : np.ndarray
-            The bytes of the block's streams, as uint8.
+            The bytes of the streams, as uint8.
         starts : np.ndarray
-            Where each of the block's streams starts in `data`, of shape
-            (component, s1 - s0).
+            Where each of the streams starts in `data`, of shape
+            (component, s1 - s0): a row for each of `components`.
         """
-        starts, nbytes = self.starts[:, s0:s1], self.nbytes[:, s0:s1]
+        chosen = slice(None) if components is None else components
+        starts, nbytes = self.starts[chosen, s0:s1], self.nbytes[chosen, s0:s1]
         size = self.compressed.shape[0]
         low = np.clip(starts, 0, size)
         high = np.clip(starts + nbytes, low, size)
@@ -1215,6 +1220,7 @@ class _Streams:
         self,
         s0: int,
         s1: int,
+        components: np.ndarray | None = None,
         read: tuple[np.ndarray, np.ndarray] | None = None,
         out: np.ndarray | None = None,
     ) -> np.ndarray:
@@ -1226,9 +1232,12 @@ class _Streams:
             The block's first station.
         s1 : int
             The station after its last, greater than `s0`.
+        components : np.ndarray, optional
+            The components decoded, as indices, as `read` takes them. By default every
+            component is.
         read : tuple[np.ndarray, np.ndarray], optional
-            The block's streams as `read` gave them, if they have been read already.
-            By default they are read from the file.
+            The streams as `read` gave them, if they have been read already. By default
+            they are read from the file.
         out : np.ndarray, optional
             A float32 array of shape (component, s1 - s0, nt) to decode into. By
             default a new one is made.
@@ -1236,8 +1245,8 @@ class _Streams:
         Returns
         -------
         np.ndarray
-            The block, as a float32 array of shape (component, s1 - s0, nt): `out`, if
-            it is given.
+            The block, as a float32 array of shape (component, s1 - s0, nt), with a row
+            for each of `components`: `out`, if it is given.
 
         Raises
         ------
@@ -1245,72 +1254,65 @@ class _Streams:
             If a stream is damaged, or decodes to the wrong number of samples (see
             `waveform_compression_tools.codec.decode_block`).
         """
-        data, starts = self.read(s0, s1) if read is None else read
+        chosen = slice(None) if components is None else components
+        data, starts = self.read(s0, s1, components) if read is None else read
         return decode_block(
             data,
             starts,
-            self.nbytes[:, s0:s1],
-            self.gains[:, s0:s1],
-            self.offsets[:, s0:s1],
+            self.nbytes[chosen, s0:s1],
+            self.gains[chosen, s0:s1],
+            self.offsets[chosen, s0:s1],
             self.nt,
             first_station=s0,
             out=out,
+            components=components,
         )
 
-    def put_back_exact(self, block: np.ndarray, s0: int, s1: int) -> np.ndarray:
-        """Put the exact traces of a decoded block's real stations in place.
+    def decompressed(
+        self,
+        s0: int,
+        s1: int,
+        components: np.ndarray | None = None,
+        out: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Decompress a block of stations, as `decompress_file` gives it back.
+
+        Each stream asked for is decoded, a real station's too, so that a damaged stream
+        fails wherever it is. A real station's traces are then its exact copies.
 
         Parameters
         ----------
-        block : np.ndarray
-            The block from `decode`, changed in place.
         s0 : int
             The block's first station.
         s1 : int
-            The station after its last.
+            The station after its last, greater than `s0`.
+        components : np.ndarray, optional
+            The components decompressed, as indices, as `read` takes them. By default
+            every component is.
+        out : np.ndarray, optional
+            A float32 array of shape (component, s1 - s0, nt) to decompress into. By
+            default a new one is made.
 
         Returns
         -------
         np.ndarray
-            The stations whose traces were put back, counted from `s0`.
-        """
-        here, stations = _in_block(self.exact_stations, s0, s1)
-        block[:, stations] = self.exact_waveform[:, here]
-        return stations
-
-    def trace(self, c: int, s: int) -> np.ndarray:
-        """Decode one trace, as `decompress_file` gives it.
-
-        Its stream is decoded, of which only its own bytes are read. A real station's
-        trace is then its exact copy, as `put_back_exact` puts it back, so a damaged
-        stream fails here as it does in `decompress_file`, a real station's too.
-
-        Parameters
-        ----------
-        c : int
-            The trace's component.
-        s : int
-            The trace's station.
-
-        Returns
-        -------
-        np.ndarray
-            The trace, as float32 of shape (nt,).
+            The block, as a float32 array of shape (component, s1 - s0, nt), with a row
+            for each of `components`: `out`, if it is given.
 
         Raises
         ------
         ValueError
-            If its stream is damaged, or decodes to the wrong number of samples (see
-            `waveform_compression_tools.codec.decode_trace`).
+            If a stream is damaged, or decodes to the wrong number of samples (see
+            `waveform_compression_tools.codec.decode_block`).
         """
-        start = int(self.starts[c, s])
-        stream = self.compressed[start : start + int(self.nbytes[c, s])]
-        gain, offset = self.gains[c, s], self.offsets[c, s]
-        decoded = decode_trace(stream, gain, offset, self.nt, c, s)
-        here, _ = _in_block(self.exact_stations, s, s + 1)
-        if here.start == here.stop:  # Not a real station.
-            return decoded
-        return self.exact_waveform[c, here.start]
+        block = self.decode(s0, s1, components, out=out)
+        here, stations = _in_block(self.exact_stations, s0, s1)
+        if stations.size:
+            rows = range(len(self.starts)) if components is None else components
+            # A component at a time: h5py takes a list of indices only if they increase.
+            for i, c in enumerate(rows):
+                block[i, stations] = self.exact_waveform[int(c), here]
+        return block
 
     def variable(self, data: ArrayLike) -> xr.Variable:
         """Make the waveform's variable, with its attributes and encoding put back.
@@ -1699,7 +1701,8 @@ def _compare_block(
     passed = bool(np.all(error <= bound)) and within_one_step(
         block, decoded, streams.gains[:, s0:s1]
     )
-    put_back = streams.put_back_exact(decoded, s0, s1)
+    copies, put_back = _in_block(streams.exact_stations, s0, s1)
+    decoded[:, put_back] = streams.exact_waveform[:, copies]
     # The error reported is of the file as it decompresses.
     error[:, put_back] = max_relative_error(block[:, put_back], decoded[:, put_back])
     _, here = _in_block(real, s0, s1)
@@ -1796,7 +1799,7 @@ def _check_block(
     """
     read = streams.read(s0, s1)
     try:
-        decoded = streams.decode(s0, s1, read)
+        decoded = streams.decode(s0, s1, read=read)
     except ValueError as e:
         raise CheckFailed(
             f"{path}: stations {s0} to {s1 - 1} don't decode ({e})", path
@@ -1951,39 +1954,6 @@ def _check_reopened(
                 )
 
 
-def _decompressed(
-    streams: _Streams, s0: int, s1: int, out: np.ndarray | None = None
-) -> np.ndarray:
-    """Decode a block of stations as decompressing gives it back: real stations exact.
-
-    Parameters
-    ----------
-    streams : _Streams
-        The streams of the compressed file.
-    s0 : int
-        The block's first station.
-    s1 : int
-        The station after its last, greater than `s0`.
-    out : np.ndarray, optional
-        A float32 array of shape (component, s1 - s0, nt) to decode into. By default a
-        new one is made.
-
-    Returns
-    -------
-    np.ndarray
-        The block, as a float32 array of shape (component, s1 - s0, nt): `out`, if it
-        is given.
-
-    Raises
-    ------
-    ValueError
-        If a stream is damaged, or decodes to the wrong number of samples.
-    """
-    block = streams.decode(s0, s1, out=out)
-    streams.put_back_exact(block, s0, s1)
-    return block
-
-
 def decompress_file(path: str | os.PathLike[str]) -> xr.Dataset:
     """Decompress a file written by `compress_file`.
 
@@ -2023,7 +1993,7 @@ def decompress_file(path: str | os.PathLike[str]) -> xr.Dataset:
         waveform = np.empty(streams.shape, np.float32)
         for s0, s1 in _station_blocks(streams.shape, None):
             # Straight into place, so no block is held besides the waveform.
-            _decompressed(streams, s0, s1, out=waveform[:, s0:s1])
+            streams.decompressed(s0, s1, out=waveform[:, s0:s1])
     ds = xr.load_dataset(path, engine="h5netcdf")
     ds["waveform"] = streams.variable(waveform)
     return ds
@@ -2149,7 +2119,7 @@ def _decompress_to(
                 # chunk is written twice, and read back in between.
                 for s0, s1 in _station_blocks(streams.shape, waveform.chunks):
                     with about_file(src), naming(src):
-                        block = _decompressed(streams, s0, s1)
+                        block = streams.decompressed(s0, s1)
                     waveform[:, s0:s1, :] = block
                     del block
                     _block_done(out)

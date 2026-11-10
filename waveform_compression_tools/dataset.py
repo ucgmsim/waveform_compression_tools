@@ -15,7 +15,6 @@ which xarray indexes lazily, and the file is opened through xarray's
 `xarray.backends.CachingFileManager`. Nothing needs dask.
 """
 
-import itertools
 import os
 from collections.abc import Generator, Iterable
 from contextlib import contextmanager
@@ -184,9 +183,9 @@ def _read_traces(
     """Read some traces as `decompress_file` gives them, reading only what they need.
 
     The traces are every chosen component of every chosen station, each cut to the
-    chosen samples. Each is decoded on its own (see `_Streams.trace`), and cut as soon
-    as it is decoded, so memory holds the cut traces and one whole one. When no sample
-    is chosen, nothing is decoded.
+    chosen samples. A station's chosen traces are decompressed together (see
+    `_Streams.decompressed`), and cut as soon as they are, so memory holds the cut
+    traces and one station's whole ones. When no sample is chosen, nothing is decoded.
 
     Parameters
     ----------
@@ -209,14 +208,14 @@ def _read_traces(
     ------
     ValueError
         If a stream is damaged, or decodes to the wrong number of samples (see
-        `waveform_compression_tools.codec.decode_trace`).
+        `waveform_compression_tools.codec.decode_block`).
     """
     n_time = len(range(streams.nt)[times]) if isinstance(times, slice) else times.size
     traces = np.empty((components.size, stations.size, n_time), np.float32)
     if traces.size == 0:
         return traces
-    for (i, c), (j, s) in itertools.product(enumerate(components), enumerate(stations)):
-        traces[i, j] = streams.trace(int(c), int(s))[times]
+    for j, s in enumerate(stations.tolist()):
+        traces[:, j] = streams.decompressed(s, s + 1, components)[:, 0, times]
     return traces
 
 

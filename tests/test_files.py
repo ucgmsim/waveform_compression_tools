@@ -333,10 +333,12 @@ def test_a_stream_that_cant_be_read_names_the_compressed_file(
     monkeypatch.setattr(files, "BLOCK_BYTES", 2 * 3 * 100 * 4)  # Blocks of 2 stations.
     read_streams = files._Streams.read
 
-    def read_one_block(self: Any, s0: int, s1: int) -> tuple[np.ndarray, np.ndarray]:
+    def read_one_block(
+        self: Any, s0: int, s1: int, components: None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
         if s0 > 0:
             raise OSError(errno.EIO, "Input/output error")
-        return read_streams(self, s0, s1)
+        return read_streams(self, s0, s1, components)
 
     monkeypatch.setattr(files._Streams, "read", read_one_block)
     back = tmp_path / "back.nc"

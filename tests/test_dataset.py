@@ -16,9 +16,21 @@ import xarray as xr
 import waveform_compression_tools
 from waveform_compression_tools import codec, open_dataset
 from waveform_compression_tools.errors import NotCompressed, UnknownFormat
-from waveform_compression_tools.files import GROUP, compress_file, decompress_file
+from waveform_compression_tools.files import (
+    GROUP,
+    compress_file,
+    decompress_file,
+    decompress_to,
+)
 
-from helpers import bit_identical, build_standard_dataset, rewrite, run_python, write
+from helpers import (
+    bit_identical,
+    build_standard_dataset,
+    nothing_left,
+    rewrite,
+    run_python,
+    write,
+)
 
 N_STATION, NT, DT = 12, 400, 0.005
 # Real stations 2 and 3 are in the first block of 5 stations, and 7 in the second.
@@ -110,6 +122,11 @@ SELECTIONS: dict[str, Callable[[xr.Dataset], xr.Dataset]] = {
     "no stations": lambda ds: ds.isel(station=[]),
     "a component by name": lambda ds: ds.sel(component="090"),
     "components by index": lambda ds: ds.isel(component=[2, 0]),
+    # xarray asks for component 2 twice, and station 3 is real: its exact copy goes in
+    # both places.
+    "a component twice, at a real station": lambda ds: ds.isel(
+        component=[0, 2, 2], station=[3, 5]
+    ),
     "a chain": lambda ds: (
         ds.isel(station=slice(2, 11)).isel(station=[6, 0, 1]).sel(component="ver")
     ),
@@ -235,9 +252,9 @@ def test_the_file_keeps_its_cache_for_everything_else(compressed: Path) -> None:
 def test_a_damaged_stream_fails_its_own_trace_alone(
     compressed: Path, tmp_path: Path, station: int
 ) -> None:
-    # Component 1 of the station is damaged, and fails as it does in decompress_file.
-    # The error names the trace as the file counts its traces, not as the selection
-    # does, and every other trace still comes back.
+    # Component 1 of the station is damaged, and fails as it does in decompress_file
+    # and decompress_to. The error names the trace as the file counts its traces, not
+    # as the selection does, and every other trace still comes back.
     path = Path(shutil.copy(compressed, tmp_path / "out.nc"))
     with h5py.File(path, "r+") as f:
         group = f[GROUP]
@@ -245,6 +262,10 @@ def test_a_damaged_stream_fails_its_own_trace_alone(
         group["compressed"][start + group["stream_bytes"][1, station] // 2] ^= 0xFF
     with pytest.raises(ValueError, match=f"component 1, station {station}") as failed:
         decompress_file(path)
+    back = tmp_path / "back.nc"
+    with pytest.raises(ValueError) as written:
+        decompress_to(path, back)
+    assert str(written.value) == str(failed.value) and nothing_left(back)
     want = decompress_file(compressed)["waveform"].isel(component=[0, 2])
     with open_dataset(path) as ds:
         with pytest.raises(ValueError) as read:
@@ -310,15 +331,21 @@ def test_reading_a_few_stations_takes_little_memory_for_each_station_in_the_file
 
 
 def peak_reading_a_station(path: Path) -> int:
-    # Once the file is open, and another station has been read.
+    # Once the file is open, and another station has been read. h5py keeps a table of
+    # its open objects, which it makes anew now and then as they come and go: 9 kB at
+    # once in a process that has run many tests. That falls in one read at most of
+    # three, so the least of three leaves it out.
     with open_dataset(path) as ds:
         ds["waveform"].isel(station=[1]).load()  # What loads on first use, untraced.
-        tracemalloc.start()
-        try:
-            ds["waveform"].isel(station=[2]).load()
-            return tracemalloc.get_traced_memory()[1]
-        finally:
-            tracemalloc.stop()
+        peaks = []
+        for _ in range(3):
+            tracemalloc.start()
+            try:
+                ds["waveform"].isel(station=[2]).load()
+                peaks.append(tracemalloc.get_traced_memory()[1])
+            finally:
+                tracemalloc.stop()
+    return min(peaks)
 
 
 def test_reading_a_station_takes_nothing_for_each_station_in_the_file(
