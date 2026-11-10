@@ -759,8 +759,9 @@ def test_decompress_gives_back_the_standard_layout(
     assert_complete("decompress", packed, back)
 
 
-# Damage that decompressing and verifying both meet, to one trace's stream or to the
-# types of the waveform's attributes, and a word of the reason each gives.
+# Damage that decompressing and verifying both meet, to one trace's stream, to the
+# types of the waveform's attributes or to which streams the file holds, and a word of
+# the reason each gives.
 DAMAGE = {
     "a zeroed fLaC marker": "component 1, station 2: a FLAC stream is damaged (",
     "a flipped byte": "component 1, station 2: a FLAC stream is damaged (",
@@ -768,6 +769,7 @@ DAMAGE = {
     "a cut between frames": "component 1, station 2: the stream decodes to 8192",
     "a cut to nothing": "component 1, station 2: the stream decodes to 0 samples",
     "a type for an attribute that isn't there": "waveform_attr_types",
+    "the streams of 2 stations of 3": "decodes to a waveform of shape (3, 2, 10000)",
 }
 # Damage that only a check against the original can find.
 CHECK_DAMAGE = {
@@ -809,6 +811,14 @@ def test_a_damaged_file_fails_the_check(
             g["stream_bytes"][c, s] = 0
         elif damage == "a type for an attribute that isn't there":
             g.attrs["waveform_attr_types"] = json.dumps({"gain": "float32"})
+        elif damage == "the streams of 2 stations of 3":
+            # The streams of a file of the first 2 stations, whole in themselves, in
+            # place of these: the file's stations and its streams disagree.
+            two, other = tmp_path / "two.nc", tmp_path / "two.flac.nc"
+            compress_file(write(ds.isel(station=slice(0, 2)), two), other)
+            del f[GROUP]
+            with h5py.File(other, "r") as streams:
+                streams.copy(GROUP, f)
         elif damage == "a doubled gain":
             g["stream_gains"][c, s] *= 2
     original = src

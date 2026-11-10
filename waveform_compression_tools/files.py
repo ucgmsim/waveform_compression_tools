@@ -2083,6 +2083,14 @@ def _decompress_to(
             streams = _open_streams(f, src)
             # Everything but the waveform is small, and is read once, here.
             rest = xr.load_dataset(src, engine="h5netcdf")
+            # The streams have to fit the file, as xarray makes them fit when
+            # decompress_file adds the waveform to its dataset.
+            for dim, size in zip(STANDARD_DIMS, streams.shape, strict=True):
+                if rest.sizes.get(dim, size) != size:
+                    raise ValueError(
+                        f"{src} decodes to a waveform of shape {streams.shape}, but "
+                        f"its {dim} dimension has length {rest.sizes[dim]}"
+                    )
         # The file is written through out, which never tells HDF5 that a write failed,
         # and while it is open, Ctrl-C and SIGTERM wait.
         with about_file(dst), writing(dst) as partial, HDF5Output(partial) as out:
@@ -2147,7 +2155,8 @@ def decompress_to(
     NotCompressed, UnknownFormat
         As `decompress_file` raises them. Nothing is written.
     ValueError
-        As `decompress_file` raises it, as for a damaged stream.
+        As `decompress_file` raises it, as for a damaged stream, or for a dimension
+        of the file whose length isn't what its streams decode to.
     OSError
         If `src` can't be read, naming it, or `dst` can't be written, as on a full
         disk, naming `dst`.

@@ -314,6 +314,30 @@ def test_a_stream_that_cant_be_read_names_the_compressed_file(
     assert nothing_left(back)
 
 
+def test_a_file_whose_time_disagrees_with_its_streams_is_refused(
+    tmp_path: Path, standard_dataset: StandardDataset
+) -> None:
+    # A compressed file holds its streams apart from everything else, so damage or an
+    # edit can make the two disagree: here the streams of 60 samples are put in a file
+    # whose time coordinate has 50. decompress_to refuses the file, as decompress_file
+    # does, rather than write a waveform that doesn't fit, and writes nothing.
+    packed = {}
+    for nt in (50, 60):
+        ds = standard_dataset(5, nt=nt).assign_coords(time=np.arange(nt) * 0.005)
+        packed[nt] = tmp_path / f"out{nt}.nc"
+        compress_file(write(ds, tmp_path / f"in{nt}.nc"), packed[nt])
+    with h5py.File(packed[50], "r+") as f, h5py.File(packed[60], "r") as other:
+        del f[GROUP]
+        other.copy(GROUP, f)
+    back = tmp_path / "back.nc"
+    with pytest.raises(ValueError, match="time dimension has length 50") as refused:
+        decompress_to(packed[50], back)
+    assert str(refused.value).startswith(
+        f"{packed[50]} decodes to a waveform of shape (3, 5, 60)"
+    )
+    assert nothing_left(back)
+
+
 @pytest.mark.parametrize(
     "call", ["check_compressible", "compress_file", "decompress_to", "convert_bbbin"]
 )
