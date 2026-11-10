@@ -332,6 +332,8 @@ REFUSALS = {
     "station names along another dimension": (NotStandardLayout, True, "station"),
     "station names of bytes that aren't ASCII": (NotStandardLayout, True, "ASCII"),
     "no stations": (NotStandardLayout, True, "no stations"),
+    "no components": (NotStandardLayout, True, "no components"),
+    "no samples": (NotStandardLayout, True, "no samples"),
     "an attribute JSON can't hold": (NotStandardLayout, True, "JSON"),
     "a _FillValue JSON can't hold": (NotStandardLayout, True, "JSON"),
     "a _FillValue of text": (NotStandardLayout, True, "not a number"),

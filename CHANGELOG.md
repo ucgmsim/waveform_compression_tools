@@ -11,6 +11,7 @@
 - **A file that can't be read is named in its error, one cut short included.** HDF5's errors, as for an HDF5 file cut short, name no file. `decompress_file`, `decompress_to`, `verify_file`, `open_dataset`, `check_compressible` and `compress_file` now raise them again as an `OSError` whose `filename` is the file, with the same words. So `verify` of an ORIGINAL cut short names ORIGINAL, where 1.1.0 named COMPRESSED, and an HDF5 error while `compress` writes DST names DST, where 1.1.0 named SRC.
 - **verify says when all but the samples differ.** A file whose variables, coordinates or attributes differ from its original's fails, however small its error, and its line now says so: `doesn't agree with ORIGINAL: its variables, coordinates or attributes differ (largest error … of a trace's peak)`. In 1.1.0 the line gave only the error, which read like a pass. `VerifyResult` has the new field `same_besides_samples`.
 - **compress refuses a boolean waveform attribute,** with `NotStandardLayout` and status 3, before anything is written. h5py writes one, but no netCDF file holds one, so its compressed file couldn't be decompressed: in 1.1.0, decompress failed with xarray's `TypeError` and status 1, naming DST.
+- **compress refuses a waveform with no components or no samples,** with `NotStandardLayout` and status 3, as it refuses one with no stations. In 1.1.0 it failed with `ZeroDivisionError` and status 1.
 
 ## 1.1.0
 

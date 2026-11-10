@@ -790,11 +790,12 @@ def _check_dataset(src: Path, ds: xr.Dataset) -> tuple[np.ndarray, dict[str, str
     check_standard(ds)
     exact = _real_stations(ds)
     waveform = ds["waveform"]
+    for size, what in zip(waveform.shape, ("components", "stations", "samples")):
+        if size == 0:
+            raise NotStandardLayout(
+                f"{src} has no {what}, so there is nothing to compress", src
+            )
     n_station = waveform.shape[1]
-    if n_station == 0:
-        raise NotStandardLayout(
-            f"{src} has no stations, so there is nothing to compress", src
-        )
     # Each refuses an attribute that the compressed file can't keep.
     attrs_json, attr_types = _attrs_json(waveform.attrs)
     _refuse_unkeepable_fill_values(waveform.encoding, src)
@@ -888,10 +889,10 @@ def check_compressible(
         If `src` is a file that isn't HDF5, is not in the standard layout (see
         `waveform_compression_tools.codec.check_standard`), has no ``station``
         coordinate along the station dimension, has a station whose name is bytes that
-        aren't ASCII, has no stations, has a waveform attribute that can't be written
-        as JSON or whose type can't be kept, as a complex, a compound or a boolean one
-        can't, or has a ``_FillValue`` or ``missing_value`` that isn't one value, that
-        JSON can't hold, or both, and they differ.
+        aren't ASCII, has no components, stations or samples, has a waveform attribute
+        that can't be written as JSON or whose type can't be kept, as a complex, a
+        compound or a boolean one can't, or has a ``_FillValue`` or ``missing_value``
+        that isn't one value, that JSON can't hold, or both, and they differ.
     AllStationsReal
         If every station of `src` is real, so it stays exact as it is.
     FileNotFoundError

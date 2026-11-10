@@ -330,6 +330,10 @@ def refused_input(
         ds = standard_dataset(3, nt=100, real=(0, 1, 2))
     elif case == "no stations":
         ds = standard_dataset(0, nt=100)
+    elif case == "no components":
+        ds = ds.isel(component=slice(0, 0))
+    elif case == "no samples":
+        ds = standard_dataset(3, nt=0)
     elif case == "a float64 waveform":
         ds["waveform"] = ds["waveform"].astype(np.float64)
     elif case == "dimensions in another order":
