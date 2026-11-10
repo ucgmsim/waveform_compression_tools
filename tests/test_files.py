@@ -283,9 +283,10 @@ def test_decompress_to_writes_each_sample_once(
 ) -> None:
     # Written in blocks, a waveform with a _FillValue, as xarray gives one by default,
     # would be filled by HDF5 first, and so written twice, which for a big file takes
-    # as long again. With an unlimited dimension the waveform is chunked, here in
-    # chunks of 25 stations, and a block that ended within a row of chunks would have
-    # HDF5 write that row twice. So the blocks are whole rows: 25 stations, not 20.
+    # as long again. With an unlimited dimension the waveform is chunked, in chunks
+    # that h5py chooses as it writes the file, and a block that ended within a row of
+    # chunks would have HDF5 write that row twice. So with a budget of a fifth less
+    # than a row, the blocks are still whole rows.
     ds = standard_dataset(100, nt=1000)
     options = {}
     if time == "an unlimited time":
@@ -293,7 +294,15 @@ def test_decompress_to_writes_each_sample_once(
         options = {"unlimited_dims": ["time"]}
     packed = tmp_path / "out.nc"
     compress_file(write(ds, tmp_path / "in.nc", **options), packed)
-    monkeypatch.setattr(files, "BLOCK_BYTES", 20 * 3 * 1000 * 4)  # 20 stations.
+    stations = 20
+    if time == "an unlimited time":
+        decompress_to(packed, tmp_path / "first.nc")
+        with h5py.File(tmp_path / "first.nc", "r") as f:
+            row = f["waveform"].chunks[1]
+        stations = row - row // 5
+        # A row of fewer than 5 stations has no budget a fifth less.
+        assert stations < row
+    monkeypatch.setattr(files, "BLOCK_BYTES", stations * 3 * 1000 * 4)
     hdf5_write = HDF5Output.write
     written: list[int] = []
 
