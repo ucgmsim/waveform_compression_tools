@@ -8,8 +8,10 @@ its exact copy, as in `decompress_file`. A selection in time decodes whole trace
 then cuts them.
 
 It is built on xarray's backend machinery, as xarray's own netCDF backends are: the
-waveform is a `xarray.backends.BackendArray`, which xarray indexes lazily, and the file
-is opened through xarray's `xarray.backends.CachingFileManager`. Nothing needs dask.
+dataset is opened by ``xr.open_dataset`` with this package's engine (see
+`waveform_compression_tools.engine`), the waveform is a `xarray.backends.BackendArray`,
+which xarray indexes lazily, and the file is opened through xarray's
+`xarray.backends.CachingFileManager`. Nothing needs dask.
 """
 
 import itertools
@@ -17,14 +19,14 @@ import os
 from collections.abc import Generator, Iterable
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Self
 
 import h5py
 import numpy as np
 import xarray as xr
-from xarray.backends import BackendArray, BackendEntrypoint, CachingFileManager
+from xarray.backends import BackendArray, CachingFileManager
 from xarray.core import indexing
 
+from .engine import FlacBackendEntrypoint
 from .errors import NotCompressed
 from .files import _open_streams, _refuse_unless_hdf5, _Streams
 
@@ -81,9 +83,9 @@ class _CompressedFile:
     opened by its absolute path, so it is the same file whatever the working folder is
     by then. A file closed by `close` stays closed.
 
-    A deep copy of the dataset reads through the same file, and so is closed with it. A
-    pickled copy reads the file as the original does, since xarray's file manager
-    pickles itself.
+    A deep copy of the dataset reads through the same file, since xarray's deep copy
+    shares an engine's arrays, and so it is closed with the dataset. A pickled copy
+    reads the file as the original does, since xarray's file manager pickles itself.
 
     Parameters
     ----------
@@ -100,21 +102,6 @@ class _CompressedFile:
         self.path = path
         self._manager = CachingFileManager(_OpenFile, path.absolute(), path)
         self._closed = False
-
-    def __deepcopy__(self, memo: dict[int, object]) -> Self:
-        """Give this file, rather than a copy of it.
-
-        Parameters
-        ----------
-        memo : dict
-            What `copy.deepcopy` has copied so far.
-
-        Returns
-        -------
-        _CompressedFile
-            This file.
-        """
-        return self
 
     @contextmanager
     def reading(self) -> Generator[_Streams]:
@@ -252,6 +239,56 @@ class _LazyWaveform(BackendArray):
         return traces.reshape([n for indices in chosen for n in np.shape(indices)])
 
 
+def _open(
+    path: str | os.PathLike[str], drop_variables: str | Iterable[str] | None
+) -> xr.Dataset:
+    """Build the dataset that xarray's engine, and so `open_dataset`, gives.
+
+    Parameters
+    ----------
+    path : str or os.PathLike
+        The compressed file.
+    drop_variables : str or iterable of str, optional
+        Variables to leave out, which aren't read. With ``waveform`` left out, the file
+        is closed once it is checked.
+
+    Returns
+    -------
+    xr.Dataset
+        The dataset, which closes the file as it is closed.
+
+    Raises
+    ------
+    ValueError
+        As `open_dataset` raises it.
+    """
+    path = Path(path)
+    if isinstance(drop_variables, str):
+        drop_variables = [drop_variables]
+    drop = list(drop_variables or ())
+    _refuse_unless_hdf5(path, NotCompressed)
+    file = _CompressedFile(path)
+    try:
+        # Opening the file checks it, as decompress_file does, before the rest is read.
+        with file.reading() as streams:
+            lazy = _LazyWaveform(file, streams.shape)
+            waveform = streams.variable(indexing.LazilyIndexedArray(lazy))
+        # The variables are dropped once the rest is open, before any is read. xarray's
+        # own drop_variables would forget the coordinates that a dropped variable names,
+        # and the waveform isn't among the rest to name them too.
+        with xr.open_dataset(path, engine="h5netcdf") as rest:
+            ds = rest.drop_vars(drop, errors="ignore").load()
+        if "waveform" in drop:
+            file.close()
+            return ds
+        ds["waveform"] = waveform
+    except BaseException:
+        file.close()
+        raise
+    ds.set_close(file.close)
+    return ds
+
+
 def open_dataset(path: str | os.PathLike[str]) -> xr.Dataset:
     """Open a compressed file as an xarray dataset, decoding only the traces read.
 
@@ -260,11 +297,14 @@ def open_dataset(path: str | os.PathLike[str]) -> xr.Dataset:
     printing and selecting read none of it. Reading a selection's values, with
     ``.values``, ``.load()`` or a computation, decodes its traces then, and only those,
     each from its own stream; a real station's trace is then its exact copy. A
-    selection in time decodes whole traces and then cuts them. Each read
-    decodes again, so ``.load()`` a selection to keep it. Every value read is bit for bit
-    the one `decompress_file` gives.
+    selection in time decodes whole traces and then cuts them. Every value read is bit
+    for bit the one `decompress_file` gives, and a damaged stream fails as it does in
+    `decompress_file`.
 
-    The file stays open until the dataset is closed, with ``.close()`` or at the end of a
+    It is ``xr.open_dataset(path, engine="waveform_compression_tools")``, so the dataset
+    behaves as the datasets of xarray's other engines do: the values read are kept with
+    the selection that read them, and loading the whole waveform holds all of it. The
+    file stays open until the dataset is closed, with ``.close()`` or at the end of a
     ``with`` block, and its waveform can't be read after that. Selections made from the
     dataset read through it, so close it once they are read.
 
@@ -276,8 +316,8 @@ def open_dataset(path: str | os.PathLike[str]) -> xr.Dataset:
     Returns
     -------
     xr.Dataset
-        The original dataset, with its waveform decoded as it is read. Everything else in
-        it is read into memory as it is opened.
+        The original dataset, with its waveform decoded as it is read. Everything else
+        in it is read into memory as it is opened.
 
     Raises
     ------
@@ -289,68 +329,4 @@ def open_dataset(path: str | os.PathLike[str]) -> xr.Dataset:
         If its arrays don't agree with each other, or its ``waveform_attr_types`` names
         an attribute that its ``waveform_attrs`` lacks, as for `decompress_file`.
     """
-    path = Path(path)
-    _refuse_unless_hdf5(path, NotCompressed)
-    file = _CompressedFile(path)
-    try:
-        # Opening the file checks it, as decompress_file does, before the rest is read.
-        with file.reading() as streams:
-            lazy = _LazyWaveform(file, streams.shape)
-            waveform = streams.variable(indexing.LazilyIndexedArray(lazy))
-        ds = xr.load_dataset(path, engine="h5netcdf")
-        ds["waveform"] = waveform
-    except BaseException:
-        file.close()
-        raise
-    ds.set_close(file.close)
-    return ds
-
-
-class FlacBackendEntrypoint(BackendEntrypoint):
-    """xarray's engine for compressed files, ``"waveform_compression_tools"``.
-
-    ``xr.open_dataset(path, engine="waveform_compression_tools")`` opens a compressed
-    file as `open_dataset` does. It takes none of xarray's options for decoding, since
-    the dataset is the original as it was compressed. xarray never picks this engine by
-    itself: without it, xarray opens a compressed file as an ordinary netCDF file,
-    without its waveform.
-    """
-
-    description = "Open a compressed file, decoding only the traces read"
-    url = "https://github.com/ucgmsim/waveform_compression_tools"
-
-    def open_dataset(
-        self,
-        filename_or_obj: object,
-        *,
-        drop_variables: str | Iterable[str] | None = None,
-    ) -> xr.Dataset:
-        """Open a compressed file as `open_dataset` does.
-
-        Parameters
-        ----------
-        filename_or_obj : str or os.PathLike
-            The compressed file. xarray can give an engine a file object or bytes too,
-            but a compressed file is opened only by its path.
-        drop_variables : str or iterable of str, optional
-            Variables to leave out. A name the file doesn't hold is ignored.
-
-        Returns
-        -------
-        xr.Dataset
-            The dataset, as `open_dataset` gives it, without `drop_variables`.
-
-        Raises
-        ------
-        TypeError
-            If `filename_or_obj` isn't a path.
-        """
-        if not isinstance(filename_or_obj, str | os.PathLike):
-            raise TypeError(
-                "a compressed file is opened by its path, not from a "
-                f"{type(filename_or_obj).__name__}"
-            )
-        ds = open_dataset(filename_or_obj)
-        kept = ds.drop_vars(drop_variables or [], errors="ignore")
-        kept.set_close(ds.close)  # Dropping makes a dataset that wouldn't close it.
-        return kept
+    return xr.open_dataset(path, engine=FlacBackendEntrypoint)

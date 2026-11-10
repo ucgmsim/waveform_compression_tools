@@ -28,7 +28,7 @@ waveform-compression-tools = "waveform_compression_tools.cli:app"
 
 # xarray's engine: xr.open_dataset(path, engine="waveform_compression_tools").
 [project.entry-points."xarray.backends"]
-waveform_compression_tools = "waveform_compression_tools.dataset:FlacBackendEntrypoint"
+waveform_compression_tools = "waveform_compression_tools.engine:FlacBackendEntrypoint"
 
 [tool.deptry]
 optional_dependencies_dev_groups = ["test", "dev"]

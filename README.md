@@ -313,12 +313,12 @@ print(peaks.values, south["waveform"].shape)
 
 - Opening reads everything but the waveform: the coordinates and the other variables, and where each trace's stream is. Selecting with `sel` or `isel`, by name, index, slice, mask or coordinate, reads nothing.
 - Reading a selection's values, with `.values`, `.load()` or a computation, reads and decodes only its traces' own streams. A real station's trace is then its exact copy, as in `decompress_file`. A selection in time decodes whole traces, then cuts them.
-- Each read decodes again, so `.load()` a selection that is used more than once.
+- As with xarray's other engines, the values a selection reads are kept with it, so using it again decodes nothing more. Loading the whole waveform holds all of it.
 - A selection of points, such as one component at each of several stations, decodes every chosen component at every chosen station.
 - Every value is bit for bit the one that `decompress_file` gives.
 - The file stays open until the dataset is closed, with `ds.close()` or at the end of a `with` block. Selections read through their dataset, so after that, reading one raises `ValueError`.
 - Reading the whole waveform decodes all of it into memory, 4 bytes a sample. Writing the dataset with `to_netcdf` does that, so a whole file should go through `decompress_to`, or the `decompress` command, instead.
-- xarray opens a compressed file in the same way with `xr.open_dataset(path, engine="waveform_compression_tools")`, which also takes `drop_variables`. Without the engine, xarray opens it as an ordinary netCDF file, without its waveform.
+- `open_dataset(path)` is `xr.open_dataset(path, engine="waveform_compression_tools")`, which also takes `drop_variables`. It takes none of xarray's options for decoding, since the dataset is the original as it was compressed, so `decode_cf=False` changes nothing. Without the engine, xarray opens a compressed file as an ordinary netCDF file, without its waveform.
 
 Opening takes time and memory with the number of stations, not with the size of the waveform. On a synthetic file of 12,000 stations of 39,629 samples, 2.9 GiB at 24 bits, opening it and reading 3 stations took 0.04 s, and resident memory peaked at 115 MB, of which 103 MB was Python and the packages it had imported. On one of a million stations of 16 samples, it took 0.5 to 0.6 s, and memory peaked at 335 MB.
 

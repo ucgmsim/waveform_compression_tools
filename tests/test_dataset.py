@@ -17,7 +17,7 @@ from waveform_compression_tools import codec, open_dataset
 from waveform_compression_tools.errors import NotCompressed, UnknownFormat
 from waveform_compression_tools.files import GROUP, compress_file, decompress_file
 
-from helpers import bit_identical, build_standard_dataset, rewrite, write
+from helpers import bit_identical, build_standard_dataset, rewrite, run_python, write
 
 N_STATION, NT, DT = 12, 400, 0.005
 # Real stations 2 and 3 are in the first block of 5 stations, and 7 in the second.
@@ -65,6 +65,19 @@ def assert_same(got: xr.Dataset, want: xr.Dataset) -> None:
         assert repr((got[name].attrs, got[name].encoding)) == repr(
             (variable.attrs, variable.encoding)
         ), name
+
+
+def record_reads(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, Any]]:
+    # Each read of an HDF5 dataset from now on: the dataset's name, and its key.
+    reads: list[tuple[str, Any]] = []
+    read = h5py.Dataset.__getitem__
+
+    def spy(self: h5py.Dataset, args: object, new_dtype: object = None) -> object:
+        reads.append((self.name, args))
+        return read(self, args, new_dtype)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", spy)
+    return reads
 
 
 SELECTIONS: dict[str, Callable[[xr.Dataset], xr.Dataset]] = {
@@ -126,36 +139,31 @@ def test_only_the_selected_traces_are_read_and_decoded(
         stream_bytes[starts[c, s] : starts[c, s] + nbytes[c, s]].tobytes()
         for c, s in selected
     )
-    reads: dict[str, list[Any]] = {"compressed": [], "exact_waveform": []}
     decoded: list[bytes] = []
-    read, decode = h5py.Dataset.__getitem__, codec.decode_stream
-
-    def spy_read(self: h5py.Dataset, args: object, new_dtype: object = None) -> object:
-        name = self.name.removeprefix(f"/{GROUP}/")
-        if name in reads:
-            reads[name].append(args)
-        return read(self, args, new_dtype)
+    decode = codec.decode_stream
 
     def spy_decode(blob: bytes) -> np.ndarray:
         decoded.append(bytes(blob))
         return decode(blob)
 
-    monkeypatch.setattr(h5py.Dataset, "__getitem__", spy_read)
     monkeypatch.setattr(codec, "decode_stream", spy_decode)
+    reads = record_reads(monkeypatch)
+    names = {f"/{GROUP}/compressed", f"/{GROUP}/exact_waveform"}
     with open_dataset(compressed) as ds:
         repr(ds)
         picked = ds.sel(
             component=["000", "ver"], station=["R003", "S000005", "S000010"]
         )
         # Opening, printing and selecting read no sample.
-        assert reads == {"compressed": [], "exact_waveform": []} and decoded == []
+        assert [name for name, _ in reads if name in names] == [] and decoded == []
         picked.load()
     assert sorted(decoded) == streams
     read_bytes, read_copies = np.zeros(stream_bytes.size), np.zeros(exact_shape)
-    for key in reads["compressed"]:
-        read_bytes[key] += 1
-    for key in reads["exact_waveform"]:
-        read_copies[key] = 1
+    for name, key in reads:
+        if name == f"/{GROUP}/compressed":
+            read_bytes[key] += 1
+        elif name == f"/{GROUP}/exact_waveform":
+            read_copies[key] = 1
     in_selected = np.zeros(stream_bytes.size)
     for c, s in selected:
         in_selected[starts[c, s] : starts[c, s] + nbytes[c, s]] = 1
@@ -372,15 +380,35 @@ def test_a_file_that_cannot_be_read_fails_as_it_is_opened(
 
 
 def test_xarray_opens_a_compressed_file_with_its_engine(
-    compressed: Path, tmp_path: Path
+    compressed: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # As open_dataset does, with the variables asked for dropped.
+    # As open_dataset does. A variable dropped isn't read, so neither the dataset nor
+    # its close can keep it, and with the waveform dropped, no file is kept open.
     path = Path(shutil.copy(compressed, tmp_path / "out.nc"))
     engine = "waveform_compression_tools"
+    reads = record_reads(monkeypatch)
     with xr.open_dataset(path, engine=engine, drop_variables=["vs30"]) as ds:
         got = ds.isel(station=[2, 5]).load()
         assert held_open(path)
     assert not held_open(path)
+    names = {name for name, _ in reads}
+    assert "/latitude" in names and "/vs30" not in names
+    with xr.open_dataset(path, engine=engine, drop_variables="waveform") as ds:
+        assert "waveform" not in ds and not held_open(path)
+    monkeypatch.undo()
     assert_same(got, decompress_file(path).drop_vars("vs30").isel(station=[2, 5]))
     with pytest.raises(TypeError, match="by its path"):
         xr.open_dataset(io.BytesIO(path.read_bytes()), engine=engine)
+
+
+def test_importing_the_package_and_its_engine_imports_neither_h5py_nor_pyflac(
+    tmp_path: Path,
+) -> None:
+    # xarray imports the engine, and so the package, to list its engines, as it does
+    # for any file it opens without being told one of its own engines.
+    code = (
+        "import sys, waveform_compression_tools, waveform_compression_tools.engine; "
+        "print(sorted({'h5py', 'pyflac'} & sys.modules.keys()))"
+    )
+    ran = run_python(code, cwd=tmp_path)
+    assert (ran.returncode, ran.stdout) == (0, "[]\n"), ran.stderr
