@@ -49,6 +49,7 @@ from helpers import (
     MakeBbbin,
     RealTraces,
     StandardDataset,
+    bit_identical,
     limit_file_sizes,
     limits_file_sizes,
     names_in,
@@ -62,11 +63,6 @@ from helpers import (
     write,
     write_and_compress,
 )
-
-
-def bit_identical(a: np.ndarray, b: np.ndarray) -> bool:
-    # Compares the bits of float32 arrays, so -0.0 differs from 0.0 and a NaN can match.
-    return np.array_equal(a.view(np.uint32), b.view(np.uint32))
 
 
 def assert_attrs_come_back(src: Path, dst: Path) -> None:
