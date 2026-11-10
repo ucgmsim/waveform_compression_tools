@@ -122,7 +122,7 @@ def test_text_that_is_not_ascii_or_holds_a_nul_is_refused(
         at = 4 * (16 + 24) + 64  # The start of velocity_model, the second string.
         content[at : at + len(raw)] = raw
         path.write_bytes(content)
-    message = re.escape(f"not an HF.bin file: {path} holds {reason}")
+    message = re.escape(f"{path}: not an HF.bin file: it holds {reason}")
     with pytest.raises(NotHFBin, match=f"^{message}$"):
         read_hfbin(path)
     with pytest.raises(NotHFBin, match=f"^{message}$"):
@@ -165,14 +165,13 @@ def header_saying(nstat: int, nt: int, size: int) -> bytes:
 def test_a_file_that_cannot_be_an_hfbin_is_refused(
     tmp_path: Path, content: bytes, cut_short: bool
 ) -> None:
-    (tmp_path / "x.bin").write_bytes(content)
-    start = (
-        "not an HF.bin file, or one cut short: "
-        if cut_short
-        else "not an HF.bin file: "
-    )
-    with pytest.raises(NotHFBin, match=f"^{re.escape(start)}"):
-        read_hfbin(tmp_path / "x.bin")
+    path = tmp_path / "x.bin"
+    path.write_bytes(content)
+    what = "not an HF.bin file, or one cut short" if cut_short else "not an HF.bin file"
+    # The message names the file once, at its start, which the error line drops.
+    message = re.escape(f"{path}: {what} ({len(content)} bytes)")
+    with pytest.raises(NotHFBin, match=f"^{message}$"):
+        read_hfbin(path)
 
 
 # The size of the header and of the three records of the file the size test writes.
@@ -208,12 +207,9 @@ def test_the_size_has_to_fit_the_header(
     path = tmp_path / "HF.bin"
     make_hfbin(path, nstat=3, nt=7, endian=endian)
     path.write_bytes(change(path.read_bytes()))
-    start = (
-        "not an HF.bin file, or one cut short: "
-        if cut_short
-        else "not an HF.bin file: "
-    )
-    with pytest.raises(NotHFBin, match=f"^{re.escape(start)}"):
+    what = "not an HF.bin file, or one cut short" if cut_short else "not an HF.bin file"
+    message = re.escape(f"{path}: {what} ({path.stat().st_size} bytes)")
+    with pytest.raises(NotHFBin, match=f"^{message}$"):
         read_hfbin(path)
 
 

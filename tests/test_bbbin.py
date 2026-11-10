@@ -121,7 +121,7 @@ def test_text_that_is_not_ascii_or_holds_a_nul_is_refused(
         content, raw = bytearray(path.read_bytes()), text.encode()
         content[20 : 20 + len(raw)] = raw  # At the start of lf_dir.
         path.write_bytes(content)
-    message = re.escape(f"not a BB.bin file: {path} holds {reason}")
+    message = re.escape(f"{path}: not a BB.bin file: it holds {reason}")
     with pytest.raises(NotBBBin, match=f"^{message}$"):
         read_bbbin(path)
     with pytest.raises(NotBBBin, match=f"^{message}$"):
@@ -165,12 +165,13 @@ def header_saying(nstat: int, nt: int, size: int) -> bytes:
 def test_a_file_that_cannot_be_a_bbbin_is_refused(
     tmp_path: Path, content: bytes, cut_short: bool
 ) -> None:
-    (tmp_path / "x.bin").write_bytes(content)
-    start = (
-        "not a BB.bin file, or one cut short: " if cut_short else "not a BB.bin file: "
-    )
-    with pytest.raises(ValueError, match=f"^{re.escape(start)}"):
-        read_bbbin(tmp_path / "x.bin")
+    path = tmp_path / "x.bin"
+    path.write_bytes(content)
+    what = "not a BB.bin file, or one cut short" if cut_short else "not a BB.bin file"
+    # The message names the file once, at its start, which the error line drops.
+    message = re.escape(f"{path}: {what} ({len(content)} bytes)")
+    with pytest.raises(ValueError, match=f"^{message}$"):
+        read_bbbin(path)
 
 
 # The size of the header and of the three records of the file the size test writes.
@@ -206,10 +207,9 @@ def test_the_size_has_to_fit_the_header(
     path = tmp_path / "BB.bin"
     make_bbbin(path, nstat=3, nt=7, endian=endian)
     path.write_bytes(change(path.read_bytes()))
-    start = (
-        "not a BB.bin file, or one cut short: " if cut_short else "not a BB.bin file: "
-    )
-    with pytest.raises(ValueError, match=f"^{re.escape(start)}"):
+    what = "not a BB.bin file, or one cut short" if cut_short else "not a BB.bin file"
+    message = re.escape(f"{path}: {what} ({path.stat().st_size} bytes)")
+    with pytest.raises(ValueError, match=f"^{message}$"):
         read_bbbin(path)
 
 

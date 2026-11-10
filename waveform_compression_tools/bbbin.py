@@ -99,7 +99,7 @@ def _not_bbbin(path: Path, f: io.BufferedIOBase, head: bytes) -> NotBBBin:
     what = "not a BB.bin file"
     if legacy.cut_short(head, size, _HEAD_BYTES, _STATION_BYTES):
         what += ", or one cut short"
-    return NotBBBin(f"{what}: {path} ({size} bytes)", path)
+    return NotBBBin(f"{path}: {what} ({size} bytes)", path)
 
 
 def read_bbbin(path: str | os.PathLike[str]) -> xr.Dataset:
@@ -167,7 +167,7 @@ def read_bbbin(path: str | os.PathLike[str]) -> xr.Dataset:
             names = legacy.decode(stations["name"])
             texts = legacy.decode(np.frombuffer(head, "S256", count=3, offset=20))
         except ValueError as e:
-            raise NotBBBin(f"not a BB.bin file: {path} holds {e}", path) from e
+            raise NotBBBin(f"{path}: not a BB.bin file: it holds {e}", path) from e
         lf_dir, lf_vm, hf_file = texts.tolist()
         waveform = legacy.standard_waveform(f, endian, nstat, nt)
         if waveform is None:

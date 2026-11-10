@@ -609,10 +609,10 @@ SAME_CODES = [
     ("verify", "an unknown setting", 1, "bits must be from 8 to 32"),
     ("verify", "an original that isn't in the standard layout", 0, "float32"),
     ("verify", "an original that is a text file", 0, "isn't an HDF5 file"),
-    ("convert-bbbin", "a file that isn't a BB.bin", 0, "not a BB.bin file"),
-    ("convert-bbbin", "text that isn't ASCII", 0, "ASCII"),
-    ("convert-hfbin", "a file that isn't an HF.bin", 0, "not an HF.bin file"),
-    ("convert-hfbin", "text that isn't ASCII", 0, "ASCII"),
+    ("convert-bbbin", "a file that isn't a BB.bin", 0, "BB.bin file (2000 bytes)"),
+    ("convert-bbbin", "text that isn't ASCII", 0, "it holds text that isn't ASCII"),
+    ("convert-hfbin", "a file that isn't an HF.bin", 0, "HF.bin file (2000 bytes)"),
+    ("convert-hfbin", "text that isn't ASCII", 0, "it holds text that isn't ASCII"),
     ("convert-hfbin", "an unfinished HF.bin", 0, "with 2 of its 3 stations unfinished"),
 ]
 

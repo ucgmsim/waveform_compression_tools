@@ -142,7 +142,7 @@ def _not_hfbin(path: Path, f: io.BufferedIOBase, head: bytes) -> NotHFBin:
     what = "not an HF.bin file"
     if legacy.cut_short(head, size, _HEAD_BYTES, _STATION_BYTES):
         what += ", or one cut short"
-    return NotHFBin(f"{what}: {path} ({size} bytes)", path)
+    return NotHFBin(f"{path}: {what} ({size} bytes)", path)
 
 
 def read_hfbin(path: str | os.PathLike[str]) -> xr.Dataset:
@@ -214,7 +214,7 @@ def read_hfbin(path: str | os.PathLike[str]) -> xr.Dataset:
                 np.frombuffer(head, "S64", count=len(_TEXT_FIELDS), offset=_TEXTS_AT)
             )
         except ValueError as e:
-            raise NotHFBin(f"not an HF.bin file: {path} holds {e}", path) from e
+            raise NotHFBin(f"{path}: not an HF.bin file: it holds {e}", path) from e
         unfinished = int(np.count_nonzero(stations["vs"] == 0))
         if unfinished:
             raise IncompleteHFBin(
