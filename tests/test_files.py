@@ -1,10 +1,13 @@
 import errno
+import gc
 import json
 import shutil
+import signal
 import string
 import struct
 import subprocess
 import textwrap
+import tracemalloc
 import warnings
 from collections.abc import Callable
 from pathlib import Path
@@ -515,126 +518,136 @@ def test_failure_mid_write_leaves_nothing(
     assert nothing_left(dst)
 
 
+def stopped_by_a_full_disk(folder: Path, counted: str, call: str) -> list[Any]:
+    # Runs a call of the package's in its own Python, in folder, where a limit on the
+    # size of each file fails writes as a full disk does. counted names the function of
+    # files.py that each block calls once. Returns the error's number and file, the
+    # blocks begun by the time it was raised, and a list of those begun when the first
+    # write failed. HDF5 is never told of the failure, so it closes the file cleanly,
+    # and the process can go on using it: closing another file it wrote looks at every
+    # dataset HDF5 has open, where HDF5 2.0.0, had it been told, would have left one
+    # that crashes Python.
+    code = limit_file_sizes(1_000_000) + textwrap.dedent(
+        """
+        import json, sys
+        import h5py, numpy as np
+        from waveform_compression_tools import files
+        from waveform_compression_tools.destinations import HDF5Output
+
+        begun, first_failure = [], []
+        step = getattr(files, sys.argv[1])
+
+        def counted(*args, **kwargs):
+            begun.append(None)
+            return step(*args, **kwargs)
+
+        def watched(self, data):
+            written = write(self, data)
+            if self.failure is not None and not first_failure:
+                first_failure.append(len(begun))  # The blocks begun by then.
+            return written
+
+        setattr(files, sys.argv[1], counted)
+        write, HDF5Output.write = HDF5Output.write, watched
+        try:
+            CALL
+        except OSError as error:
+            print(json.dumps([error.errno, error.filename, len(begun), first_failure]))
+        with h5py.File("again.h5", "w") as f:
+            f["x"] = np.arange(10)
+        print("HDF5 carries on")
+        """
+    ).replace("CALL", call)
+    ran = run_python(code, counted, cwd=folder)
+    assert ran.returncode == 0, ran.stderr
+    raised, carried_on = ran.stdout.splitlines()
+    assert carried_on == "HDF5 carries on"
+    return json.loads(raised)
+
+
 @limits_file_sizes
 def test_a_full_disk_stops_compress_at_its_block_and_hdf5_carries_on(
     tmp_path: Path, standard_dataset: StandardDataset
 ) -> None:
     # When a write fails, as on a full disk, compress raises the error, naming the file,
     # at the end of that block: what HDF5 writes after the failure is held in memory,
-    # so going on would hold the rest of the file there. A limit on the size of each
-    # file fails writes the same way. HDF5 is never told of the failure, so it closes
-    # the file cleanly, and the process can go on using it: closing another file it
-    # wrote looks at every dataset HDF5 has open, where HDF5 2.0.0, had it been told,
-    # would have left one that crashes Python. In 20 blocks of about 2 MiB of streams,
-    # the first write comes once HDF5's 8 MiB cache of chunks fills, past the limit. A
-    # cache of 32 MiB or more would hold the streams until the file is closed.
+    # so going on would hold the rest of the file there. In 20 blocks of about 2 MiB of
+    # streams, the first write comes once HDF5's 8 MiB cache of chunks fills, past the
+    # limit. A cache of 32 MiB or more would hold the streams until the file is closed.
     if h5py.h5p.create(h5py.h5p.FILE_ACCESS).get_cache()[2] >= 32 * 2**20:
         pytest.skip("HDF5's cache of chunks holds all the streams")
     write(standard_dataset(4000, nt=1000), tmp_path / "in.nc")
-    code = limit_file_sizes(1_000_000) + textwrap.dedent(
-        """
-        import json
-        import h5py, numpy as np
-        from waveform_compression_tools import files
-        from waveform_compression_tools.destinations import HDF5Output
-
-        encoded, first_failure = [], []
-
-        def counted(*args):
-            encoded.append(None)
-            return encode_block(*args)
-
-        def watched(self, data):
-            written = write(self, data)
-            if self.failure is not None and not first_failure:
-                first_failure.append(len(encoded))  # The blocks encoded by then.
-            return written
-
-        encode_block, files.encode_block = files.encode_block, counted
-        write, HDF5Output.write = HDF5Output.write, watched
-        try:
-            files.compress_file("in.nc", "out.nc", block_stations=200)
-        except OSError as error:
-            print(json.dumps([error.errno, error.filename, len(encoded)]))
-        print(json.dumps(first_failure))
-        with h5py.File("again.h5", "w") as f:
-            f["x"] = np.arange(10)
-        print("HDF5 carries on")
-        """
+    error_number, filename, begun, first_failure = stopped_by_a_full_disk(
+        tmp_path,
+        "encode_block",
+        'files.compress_file("in.nc", "out.nc", block_stations=200)',
     )
-    ran = run_python(code, cwd=tmp_path)
-    assert ran.returncode == 0, ran.stderr
-    raised, first_failure, carried_on = ran.stdout.splitlines()
-    error_number, filename, encoded = json.loads(raised)
     assert (error_number, filename) == (errno.EFBIG, "out.nc")
-    assert json.loads(first_failure) == [encoded] and encoded < 20
-    assert carried_on == "HDF5 carries on"
+    assert first_failure == [begun] and begun < 20
     assert names_in(tmp_path) == ["again.h5", "in.nc"]
 
 
-@pytest.mark.parametrize(
-    "stop", ["a Ctrl-C", pytest.param("a full disk", marks=limits_file_sizes)]
-)
-def test_decompress_to_stops_at_the_end_of_a_block_and_hdf5_carries_on(
-    tmp_path: Path, standard_dataset: StandardDataset, stop: str
+@limits_file_sizes
+def test_a_full_disk_stops_decompress_to_at_its_block_and_hdf5_carries_on(
+    tmp_path: Path, standard_dataset: StandardDataset
 ) -> None:
-    # decompress_to writes the waveform a block of stations at a time. A Ctrl-C waits
-    # until the end of its block, here the first, so that HDF5 never takes it for a
-    # failed write. A write that fails, as on a full disk, stops the run at the end of
-    # its block too, with its own error, naming the file: going on would hold the rest
-    # in memory. Nothing is left, and HDF5 carries on. A limit on the size of each
-    # file fails writes as a full disk does: of 10 blocks of 10 stations, written
-    # straight to the file, the first few fit.
+    # decompress_to stops at the end of the block too, as compress does. Of 10 blocks
+    # of 10 stations, written straight to the file, the first few fit.
     write_and_compress(standard_dataset(100, nt=1000), tmp_path)
-    limit = limit_file_sizes(1_000_000) if stop == "a full disk" else ""
-    code = limit + textwrap.dedent(
-        """
-        import json, signal, sys
-        import h5py, numpy as np
-        from waveform_compression_tools import files
-        from waveform_compression_tools.destinations import HDF5Output
-
-        files.BLOCK_BYTES = 10 * 3 * 1000 * 4  # Blocks of 10 stations.
-        decoded, first_failure = [], []
-
-        def counted(*args, **kwargs):
-            if sys.argv[1] == "a Ctrl-C" and not decoded:
-                signal.raise_signal(signal.SIGINT)
-            block = decode_block(*args, **kwargs)
-            decoded.append(None)
-            return block
-
-        def watched(self, data):
-            written = write(self, data)
-            if self.failure is not None and not first_failure:
-                first_failure.append(len(decoded))  # The blocks decoded by then.
-            return written
-
-        decode_block, files.decode_block = files.decode_block, counted
-        write, HDF5Output.write = HDF5Output.write, watched
-        try:
-            files.decompress_to("out.nc", "back.nc")
-        except KeyboardInterrupt:
-            print(json.dumps(["KeyboardInterrupt", len(decoded)]))
-        except OSError as error:
-            print(json.dumps([error.errno, error.filename, len(decoded)]))
-        print(json.dumps(first_failure))
-        with h5py.File("again.h5", "w") as f:
-            f["x"] = np.arange(10)
-        print("HDF5 carries on")
-        """
+    error_number, _, begun, first_failure = stopped_by_a_full_disk(
+        tmp_path,
+        "decode_block",
+        "files.BLOCK_BYTES = 10 * 3 * 1000 * 4; "
+        'files.decompress_to("out.nc", "back.nc")',
     )
-    ran = run_python(code, stop, cwd=tmp_path)
-    assert ran.returncode == 0, ran.stderr
-    raised, first_failure, carried_on = ran.stdout.splitlines()
-    if stop == "a Ctrl-C":
-        assert json.loads(raised) == ["KeyboardInterrupt", 1]  # The first block.
-    else:
-        error_number, filename, decoded = json.loads(raised)
-        assert (error_number, filename) == (errno.EFBIG, "back.nc")
-        assert json.loads(first_failure) == [decoded] and 0 < decoded < 10
-    assert carried_on == "HDF5 carries on"
+    assert error_number == errno.EFBIG
+    assert first_failure == [begun] and 0 < begun < 10
     assert names_in(tmp_path) == ["again.h5", "in.nc", "out.nc"]
+
+
+@pytest.mark.parametrize("call", ["compress_file", "decompress_to"])
+def test_a_ctrl_c_stops_the_run_at_the_end_of_its_block_and_keeps_no_block(
+    tmp_path: Path,
+    standard_dataset: StandardDataset,
+    monkeypatch: pytest.MonkeyPatch,
+    call: str,
+) -> None:
+    # compress_file and decompress_to write a block of stations at a time. A Ctrl-C,
+    # here as the first block is encoded or decoded, waits until the end of its block,
+    # so that HDF5 never takes it for a failed write, and nothing is left. The block is
+    # dropped before the run stops, so that the KeyboardInterrupt, which a notebook
+    # keeps, doesn't keep the block too: 1.2 MB here, and 128 MiB in a real run.
+    src, packed = write_and_compress(standard_dataset(4, nt=50_000), tmp_path)
+    block_bytes = 2 * 3 * 50_000 * 4
+    monkeypatch.setattr(files, "BLOCK_BYTES", block_bytes)  # Blocks of 2 stations.
+    name = "encode_block" if call == "compress_file" else "decode_block"
+    step = getattr(files, name)
+    begun: list[None] = []
+
+    def interrupted(*args: Any, **kwargs: Any) -> Any:
+        if not begun:
+            signal.raise_signal(signal.SIGINT)
+        begun.append(None)
+        return step(*args, **kwargs)
+
+    monkeypatch.setattr(files, name, interrupted)
+    dst = tmp_path / "again.nc"
+    tracemalloc.start()
+    try:
+        with pytest.raises(KeyboardInterrupt) as stopped:
+            if call == "compress_file":
+                compress_file(src, dst)
+            else:
+                decompress_to(packed, dst)
+        kept = tracemalloc.get_traced_memory()[0]
+        del stopped
+        gc.collect()
+        kept -= tracemalloc.get_traced_memory()[0]  # What the error kept.
+    finally:
+        tracemalloc.stop()
+    assert len(begun) == 1  # The first block.
+    assert nothing_left(dst)
+    assert kept < block_bytes / 2
 
 
 @pytest.mark.parametrize("call", ["verify_file", "decompress_file"])

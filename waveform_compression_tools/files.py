@@ -304,6 +304,34 @@ def _station_blocks(
     return _blocks(n_station, block_stations)
 
 
+def _block_done(out: HDF5Output | None = None) -> None:
+    """End a block of stations, once its arrays are dropped.
+
+    The arrays go first so that they aren't kept while the next block is read, nor by
+    an error raised here. pyflac's encoders and decoders keep their output in
+    reference cycles, which would otherwise wait for the next collection and add up;
+    they are all young, so a young collection frees them, without walking the whole
+    heap. Then a write that failed, or a Ctrl-C, stops the run, before what HDF5
+    writes from then on, held in memory, adds up.
+
+    Parameters
+    ----------
+    out : HDF5Output, optional
+        The file the block was written to, if it was.
+
+    Raises
+    ------
+    KeyboardInterrupt
+        For a Ctrl-C that waited, or whatever another waiting signal's handler raises
+        (see `waveform_compression_tools.destinations.HDF5Output.raise_pending`).
+    OSError
+        If a write to `out` failed.
+    """
+    gc.collect(1)
+    if out is not None:
+        out.raise_pending()
+
+
 def _attr_types(attrs: dict) -> dict[str, str]:
     """Name the numpy dtype of each attribute that is a numpy scalar or array.
 
@@ -1032,9 +1060,6 @@ def compress_file(
                     del encoded
                     here, local = _in_block(exact, s0, s1)
                     written.exact_waveform[:, here] = block[:, local]
-                    # A write that failed, or a Ctrl-C, stops the run here, before what
-                    # HDF5 writes from then on, held in memory, adds up.
-                    out.raise_pending()
                     stopwatch.lap("write")
                     if check:
                         error, stream_crcs[:, s0:s1], exact_crcs[:, here] = (
@@ -1042,11 +1067,8 @@ def compress_file(
                         )
                         worst = max(worst, error)
                         stopwatch.lap("check")
-                    # pyflac's encoders keep their output in reference cycles, which
-                    # would otherwise wait for the next collection and add up. They are
-                    # all young, so a young collection frees them, without walking the
-                    # whole heap.
-                    gc.collect(1)
+                    del block
+                    _block_done(out)
                 datasets = {
                     "stream_starts": written.starts,
                     "stream_bytes": written.nbytes,
@@ -2129,13 +2151,8 @@ def _decompress_to(
                     with about_file(src), naming(src):
                         block = _decompressed(streams, s0, s1)
                     waveform[:, s0:s1, :] = block
-                    # A write that failed, or a Ctrl-C, stops the run here, before what
-                    # HDF5 writes from then on, held in memory, adds up.
-                    out.raise_pending()
-                    del block  # So that it isn't kept while the next one is decoded.
-                    # Each stream's decoder is kept in a reference cycle, which a young
-                    # collection frees (see verify_file).
-                    gc.collect(1)
+                    del block
+                    _block_done(out)
     return streams.shape
 
 
@@ -2281,13 +2298,8 @@ def verify_file(
             error, block_passed = _compare_block(streams, block, decoded, real, s0, s1)
             passed = passed and block_passed
             worst = np.maximum(worst, error)  # A NaN stays.
-            # So that neither is kept while the next block is read and decoded.
             del block, decoded
-            # Each stream's decoder is kept in a reference cycle, as pyflac's encoders
-            # are, which would otherwise wait for the next collection and add up. They
-            # are all young, so a young collection frees them, without walking the
-            # whole heap.
-            gc.collect(1)
+            _block_done()
     return VerifyResult(
         max_relative_error=float(worst),
         passed=passed,
