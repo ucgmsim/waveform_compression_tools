@@ -28,7 +28,7 @@ from xarray.core import indexing
 
 from .engine import FlacBackendEntrypoint
 from .errors import NotCompressed
-from .files import _open_streams, _refuse_unless_hdf5, _Streams
+from .files import _open_streams, _original, _refuse_unless_hdf5, _Streams
 
 
 class _OpenFile:
@@ -331,21 +331,15 @@ def _open(
     try:
         # Opening the file checks it, as decompress_file does, before the rest is read.
         with file.reading() as streams:
-            lazy = _LazyWaveform(file, streams.shape)
-            waveform = streams.variable(indexing.LazilyIndexedArray(lazy))
-        # The variables are dropped once the rest is open, before any is read. xarray's
-        # own drop_variables would forget the coordinates that a dropped variable names,
-        # and the waveform isn't among the rest to name them too.
-        with xr.open_dataset(path, engine="h5netcdf") as rest:
-            ds = rest.drop_vars(drop, errors="ignore").load()
-        if "waveform" in drop:
-            file.close()
-            return ds
-        ds["waveform"] = waveform
+            lazy = indexing.LazilyIndexedArray(_LazyWaveform(file, streams.shape))
+            ds = _original(path, streams, lazy, drop)
     except BaseException:
         file.close()
         raise
-    ds.set_close(file.close)
+    if "waveform" in drop:
+        file.close()
+    else:
+        ds.set_close(file.close)
     return ds
 
 

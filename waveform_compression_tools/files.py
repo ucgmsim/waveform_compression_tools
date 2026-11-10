@@ -1314,22 +1314,6 @@ class _Streams:
                 block[i, stations] = self.exact_waveform[int(c), here]
         return block
 
-    def variable(self, data: ArrayLike) -> xr.Variable:
-        """Make the waveform's variable, with its attributes and encoding put back.
-
-        Parameters
-        ----------
-        data : array_like
-            The waveform's samples, of shape (component, station, nt), or an array
-            that reads them as it is indexed.
-
-        Returns
-        -------
-        xr.Variable
-            The waveform, as `decompress_file` gives it.
-        """
-        return xr.Variable(STANDARD_DIMS, data, self.waveform_attrs, self.encoding)
-
 
 def _new_group(
     f: h5py.File,
@@ -1954,6 +1938,43 @@ def _check_reopened(
                 )
 
 
+def _original(
+    path: Path, streams: _Streams, waveform: ArrayLike, drop: Sequence[str] = ()
+) -> xr.Dataset:
+    """Build the original dataset of a compressed file, with the waveform given.
+
+    Everything but the waveform is read into memory, but for the variables dropped.
+    They are dropped once the rest is open, so that the coordinates a dropped variable
+    names stay: xarray's own ``drop_variables`` would forget them, and the waveform
+    isn't among the rest to name them too.
+
+    Parameters
+    ----------
+    path : Path
+        The compressed file.
+    streams : _Streams
+        Its streams.
+    waveform : array_like
+        The waveform's samples, of shape (component, station, nt), or an array that
+        reads them as it is indexed.
+    drop : sequence of str, default ()
+        The variables to leave out. With ``waveform`` among them, `waveform` isn't
+        used.
+
+    Returns
+    -------
+    xr.Dataset
+        The original dataset, with the waveform's attributes and encoding put back.
+    """
+    with xr.open_dataset(path, engine="h5netcdf") as rest:
+        ds = rest.drop_vars(drop, errors="ignore").load()
+    if "waveform" not in drop:
+        ds["waveform"] = xr.Variable(
+            STANDARD_DIMS, waveform, streams.waveform_attrs, streams.encoding
+        )
+    return ds
+
+
 def decompress_file(path: str | os.PathLike[str]) -> xr.Dataset:
     """Decompress a file written by `compress_file`.
 
@@ -1994,9 +2015,7 @@ def decompress_file(path: str | os.PathLike[str]) -> xr.Dataset:
         for s0, s1 in _station_blocks(streams.shape, None):
             # Straight into place, so no block is held besides the waveform.
             streams.decompressed(s0, s1, out=waveform[:, s0:s1])
-    ds = xr.load_dataset(path, engine="h5netcdf")
-    ds["waveform"] = streams.variable(waveform)
-    return ds
+    return _original(path, streams, waveform)
 
 
 def _new_waveform(
