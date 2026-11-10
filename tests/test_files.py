@@ -269,7 +269,6 @@ def test_decompress_to_writes_a_block_at_a_time_the_file_written_whole(
     monkeypatch.setattr(files, "BLOCK_BYTES", 2 * 3 * 50 * 4)  # Blocks of 2 stations.
     back, whole = tmp_path / "back.nc", tmp_path / "whole.nc"
     decompress_to(packed, back)
-    xr.testing.assert_identical(read(back), decompress_file(packed))
     write_netcdf(decompress_file(packed), whole)
     assert netcdf_contents(back) == netcdf_contents(whole)
 

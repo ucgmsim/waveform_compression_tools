@@ -14,7 +14,7 @@ A Python package, `waveform_compression_tools`, and a command, `waveform-compres
 
 An input has to be in the standard layout: a float32 data variable `waveform` with exactly the dimensions (component, station, time), a `station` coordinate that names the stations, and no HDF5 group besides the root. The components can be named anything, such as `x`, `y`, `z` or `000`, `090`, `ver`.
 
-`compress`, `verify` and `decompress` work a block of stations at a time, so their memory doesn't grow with the file. On a synthetic file of 36.4 GiB, `compress` peaked at 0.74 GB of resident memory, and `verify` at 0.76 GB. `decompress` peaked at 0.34 GB on a file of 3.5 GiB, and at 0.35 GB on one of 10.6 GiB.
+`compress`, `verify` and `decompress` work a block of stations at a time, so their memory doesn't grow with the file. On a synthetic file of 36.4 GiB, `compress` peaked at 0.74 GB of resident memory, and `verify` at 0.76 GB. `decompress` peaked at 0.34 GB for 3.5 GiB of waveform, and at 0.35 GB for 10.6 GiB.
 
 ### Choosing a setting
 
@@ -104,7 +104,7 @@ compressed realisation.nc to realisation.flac.nc at 24 bits: 246000 traces, 41 r
 
 #### Blocks and memory
 
-A block holds about `BLOCK_BYTES` (128 MiB) of float32 samples, so a block has fewer stations when the traces are longer. For a chunked waveform, a block is a whole number of the file's station chunks, so that no chunk is read twice, unless whole chunks would exceed the budget by more than a quarter; then the budget wins, and chunks are read more than once. Memory is a few blocks, however many stations the file has.
+A block holds about `BLOCK_BYTES` (128 MiB) of float32 samples, so a block has fewer stations when the traces are longer. For a chunked waveform, a block is a whole number of the file's station chunks, so that no chunk is read or written twice, unless whole chunks would exceed the budget by more than a quarter; then the budget wins, and chunks are read or written more than once. The waveform is the original's for `compress` and `verify`, and for `decompress` the one it writes, which is chunked if it has an unlimited dimension. Memory is a few blocks, however many stations the file has, and whatever blocks it was compressed in.
 
 #### The check
 

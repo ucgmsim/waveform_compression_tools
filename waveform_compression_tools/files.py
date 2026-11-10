@@ -2078,18 +2078,18 @@ def _new_waveform(
         for name, coord in rest.coords.items()
         if name not in rest.dims and set(coord.dims) <= set(STANDARD_DIMS)
     )
-    attrs = dict(streams.waveform_attrs)
+    variable.attrs.update(streams.waveform_attrs)
     if along:
-        attrs["coordinates"] = " ".join(along)
+        variable.attrs["coordinates"] = " ".join(along)
     if streams.encoding.get("missing_value") is not None:
-        attrs["missing_value"] = streams.encoding["missing_value"]
-    variable.attrs.update(attrs)
+        variable.attrs["missing_value"] = streams.encoding["missing_value"]
     listed = nc.attrs.get("coordinates", "").split()
     others = [name for name in listed if name not in along]
     if others != listed:
-        del nc.attrs["coordinates"]
         if others:
             nc.attrs["coordinates"] = " ".join(others)
+        else:
+            del nc.attrs["coordinates"]
     return variable
 
 
