@@ -350,7 +350,7 @@ def _open(
         # Opening the file checks it, as decompress_file does, before the rest is read.
         with file.reading() as streams:
             lazy = indexing.LazilyIndexedArray(_LazyWaveform(file, streams.shape))
-            ds = _original(path, streams, lazy, drop)
+            ds = _original(path, streams, lambda: lazy, drop)
     except BaseException:
         file.close()
         raise

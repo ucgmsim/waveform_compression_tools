@@ -365,7 +365,8 @@ def test_a_file_whose_time_disagrees_with_its_streams_is_damaged(
     # A compressed file holds its streams apart from everything else, so damage or an
     # edit can make the two disagree: here the streams of 60 samples are put in a file
     # whose time coordinate has 50. Each way in fails alike, naming the file, rather
-    # than give a waveform that doesn't fit, and decompress_to writes nothing.
+    # than give a waveform that doesn't fit, and decompress_to writes nothing. Each
+    # finds it before it decodes a stream, so a damaged stream too fails the same way.
     packed = {}
     for nt in (50, 60):
         ds = standard_dataset(5, nt=nt).assign_coords(time=np.arange(nt) * 0.005)
@@ -374,6 +375,9 @@ def test_a_file_whose_time_disagrees_with_its_streams_is_damaged(
     with h5py.File(packed[50], "r+") as f, h5py.File(packed[60], "r") as other:
         del f[GROUP]
         other.copy(GROUP, f)
+        g = f[GROUP]
+        start, size = int(g["stream_starts"][1, 2]), int(g["stream_bytes"][1, 2])
+        g["compressed"][start + size // 2] ^= 0xFF
     back = tmp_path / "back.nc"
     with pytest.raises(Damaged, match="time dimension has length 50") as damaged:
         if call == "decompress_file":

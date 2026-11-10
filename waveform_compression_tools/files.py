@@ -44,7 +44,7 @@ import json
 import os
 import time
 import zlib
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -1324,6 +1324,27 @@ class _Streams:
                 block[i, stations] = self.exact_waveform[int(c), here]
         return block
 
+    def whole(self) -> np.ndarray:
+        """Decompress the whole waveform, as `decompress_file` gives it back.
+
+        It is decompressed a block of stations at a time, each straight into place, so
+        no block is held besides the waveform (see `decompressed`).
+
+        Returns
+        -------
+        np.ndarray
+            The waveform, as a float32 array of shape (component, station, nt).
+
+        Raises
+        ------
+        Damaged
+            If a stream is damaged, or decodes to the wrong number of samples.
+        """
+        waveform = np.empty(self.shape, np.float32)
+        for s0, s1 in _station_blocks(self.shape, None):
+            self.decompressed(s0, s1, out=waveform[:, s0:s1])
+        return waveform
+
 
 def _new_group(
     f: h5py.File,
@@ -2000,15 +2021,21 @@ def _check_fits(rest: xr.Dataset, streams: _Streams, path: Path) -> None:
 
 
 def _original(
-    path: Path, streams: _Streams, waveform: ArrayLike, drop: Sequence[str] = ()
+    path: Path,
+    streams: _Streams,
+    waveform: Callable[[], ArrayLike] | None = None,
+    drop: Sequence[str] = (),
 ) -> xr.Dataset:
-    """Build the original dataset of a compressed file, with the waveform given.
+    """Build the original dataset of a compressed file, once its streams fit the rest.
 
-    Everything but the waveform is read into memory, but for the variables dropped.
-    They are dropped once the rest is open, so that the coordinates a dropped variable
-    names stay: xarray's own ``drop_variables`` would forget them, and the waveform
-    isn't among the rest to name them too. The streams have to fit the whole of the
-    rest, whatever is dropped (see `_check_fits`).
+    Everything but the waveform is read into memory first, but for the variables
+    dropped, and the streams are checked against it, so that a waveform that wouldn't
+    fit is never decoded. The streams have to fit the whole of the rest, whatever is
+    dropped (see `_check_fits`). The variables are dropped once the rest is open, so
+    that the coordinates a dropped variable names stay: xarray's own ``drop_variables``
+    would forget them, and the waveform isn't among the rest to name them too. Only
+    then is the waveform asked for. Every reader builds its dataset here, so each finds
+    a misfit before a damaged stream.
 
     Parameters
     ----------
@@ -2016,12 +2043,12 @@ def _original(
         The compressed file.
     streams : _Streams
         Its streams.
-    waveform : array_like
-        The waveform's samples, of shape (component, station, nt), or an array that
-        reads them as it is indexed.
+    waveform : callable, optional
+        Gives the waveform's samples, of shape (component, station, nt), or an array
+        that reads them as it is indexed. Without it, or with ``waveform`` among the
+        variables dropped, the dataset has no waveform.
     drop : sequence of str, default ()
-        The variables to leave out. With ``waveform`` among them, `waveform` isn't
-        used.
+        The variables to leave out.
 
     Returns
     -------
@@ -2031,14 +2058,14 @@ def _original(
     Raises
     ------
     Damaged
-        If the streams don't fit the rest.
+        If the streams don't fit the rest, or `waveform` raises it.
     """
     with xr.open_dataset(path, engine="h5netcdf") as rest:
         _check_fits(rest, streams, path)
         ds = rest.drop_vars(drop, errors="ignore").load()
-    if "waveform" not in drop:
+    if waveform is not None and "waveform" not in drop:
         ds["waveform"] = xr.Variable(
-            STANDARD_DIMS, waveform, streams.waveform_attrs, streams.encoding
+            STANDARD_DIMS, waveform(), streams.waveform_attrs, streams.encoding
         )
     return ds
 
@@ -2084,11 +2111,7 @@ def decompress_file(path: str | os.PathLike[str]) -> xr.Dataset:
         _refuse_unless_hdf5(path, NotCompressed)
         with h5py.File(path, "r") as f:
             streams = _open_streams(f, path)
-            waveform = np.empty(streams.shape, np.float32)
-            for s0, s1 in _station_blocks(streams.shape, None):
-                # Straight into place, so no block is held besides the waveform.
-                streams.decompressed(s0, s1, out=waveform[:, s0:s1])
-        return _original(path, streams, waveform)
+            return _original(path, streams, streams.whole)
 
 
 def _new_waveform(
@@ -2220,8 +2243,7 @@ def decompress_to(
         with about(src), naming(src):
             streams = _open_streams(f, src)
             # Everything but the waveform is small, and is read once, here.
-            rest = xr.load_dataset(src, engine="h5netcdf")
-            _check_fits(rest, streams, src)
+            rest = _original(src, streams)
         # The file is written through out, which never tells HDF5 that a write failed,
         # and while it is open, Ctrl-C and SIGTERM wait.
         with writing(dst) as partial, HDF5Output(partial) as out:
