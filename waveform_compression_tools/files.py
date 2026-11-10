@@ -349,12 +349,17 @@ def _attr_types(attrs: dict) -> dict[str, str]:
     ------
     NotStandardLayout
         If an attribute's dtype can't be named by its string and read back, as a
-        compound (structured) one can't.
+        compound (structured) one can't, or is boolean, which no netCDF file holds, so
+        the decompressed file couldn't be written.
     """
     types = {}
     for name, value in attrs.items():
         if isinstance(value, np.ndarray | np.generic):
             dtype = value.dtype
+            if dtype.kind == "b":
+                raise NotStandardLayout(
+                    f"attribute {name!r} is boolean, which a netCDF file can't hold"
+                )
             try:
                 restorable = np.dtype(str(dtype)) == dtype
             except TypeError:
@@ -874,9 +879,9 @@ def check_compressible(
         `waveform_compression_tools.codec.check_standard`), has no ``station``
         coordinate along the station dimension, has a station whose name is bytes that
         aren't ASCII, has no stations, has a waveform attribute that can't be written
-        as JSON or whose type can't be kept, as a complex or a compound one can't, or
-        has a ``_FillValue`` or ``missing_value`` that isn't one value, that JSON can't
-        hold, or both, and they differ.
+        as JSON or whose type can't be kept, as a complex, a compound or a boolean one
+        can't, or has a ``_FillValue`` or ``missing_value`` that isn't one value, that
+        JSON can't hold, or both, and they differ.
     AllStationsReal
         If every station of `src` is real, so it stays exact as it is.
     FileNotFoundError

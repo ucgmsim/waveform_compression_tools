@@ -335,6 +335,7 @@ REFUSALS = {
     "a _FillValue JSON can't hold": (NotStandardLayout, True, "JSON"),
     "a _FillValue of text": (NotStandardLayout, True, "not a number"),
     "an attribute whose type can't be kept": (NotStandardLayout, True, "pair"),
+    "a boolean attribute": (NotStandardLayout, True, "boolean"),
     "conflicting fill values": (NotStandardLayout, True, "differ"),
     "a vector missing_value": (NotStandardLayout, True, "missing_value"),
     "every station real": (AllStationsReal, True, "real"),

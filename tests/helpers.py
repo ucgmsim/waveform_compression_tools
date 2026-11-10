@@ -381,6 +381,11 @@ def refused_input(
         with h5py.File(src, "r+") as f:
             pair = np.zeros((), np.dtype([("a", "<i4"), ("b", "<f4")]))
             f["waveform"].attrs.create("pair", pair)
+    elif case == "a boolean attribute":
+        # h5py writes one, but no netCDF file holds one, so its decompressed file
+        # couldn't be written.
+        with h5py.File(src, "r+") as f:
+            f["waveform"].attrs["flag"] = np.True_
     elif case == "already compressed":
         src = folder / "in.flac.nc"
         compress_file(folder / "in.nc", src)
