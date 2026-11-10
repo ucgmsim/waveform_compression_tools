@@ -11,6 +11,7 @@ from waveform_compression_tools.bbbin import read_bbbin
 from waveform_compression_tools.files import (
     block_stations_for,
     compress_file,
+    decompress_to,
     verify_file,
 )
 from waveform_compression_tools.hfbin import read_hfbin
@@ -66,11 +67,14 @@ def _peak(step: str, src: Path, dst: Path, again: Path) -> int:
     try:
         if step == "compress":
             compress_file(src, again)
+        elif step == "decompress":
+            decompress_to(dst, again)
         else:
             assert verify_file(src, dst).passed
         return tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
+        again.unlink(missing_ok=True)  # The tests' folder is in memory.
 
 
 # Some stations of 2,000 samples, four times as many stations, and four times as many
@@ -98,7 +102,7 @@ def compressed_sizes(
     return written
 
 
-@pytest.mark.parametrize("step", ["compress", "verify"])
+@pytest.mark.parametrize("step", ["compress", "verify", "decompress"])
 def test_peak_memory_stays_flat(
     tmp_path: Path,
     compressed_sizes: dict[tuple[int, int], tuple[Path, Path]],

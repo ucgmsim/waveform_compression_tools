@@ -10,6 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import h5netcdf
 import h5py
 import numpy as np
 import pyflac
@@ -26,7 +27,11 @@ from waveform_compression_tools.codec import (
     within_one_step,
 )
 from waveform_compression_tools.content_hash import content_hash
-from waveform_compression_tools.destinations import check_destination, write_netcdf
+from waveform_compression_tools.destinations import (
+    HDF5Output,
+    check_destination,
+    write_netcdf,
+)
 from waveform_compression_tools.errors import (
     NotStandardLayout,
     OutputExists,
@@ -201,6 +206,114 @@ def test_decompress_to_writes_the_decompressed_file_safely(
     assert back.read_bytes() == before
 
 
+def netcdf_contents(path: Path) -> dict[str, object]:
+    # A netCDF file as h5netcdf reads it: each dimension's size and whether it is
+    # unlimited, the file's attributes, and each variable's dimensions, values and
+    # attributes. A value is given with its type and dtype, and its bytes.
+    def described(value: object) -> tuple[str, str, object]:
+        array = np.asarray(value)
+        data = array.tolist() if array.dtype.kind in "OSU" else array.tobytes()
+        return type(value).__name__, array.dtype.str, data
+
+    def attributes(owner: Any) -> dict[str, object]:
+        return {name: described(value) for name, value in owner.attrs.items()}
+
+    with h5netcdf.File(path, "r") as f:
+        return {
+            "dimensions": {
+                name: (dim.size, dim.isunlimited())
+                for name, dim in f.dimensions.items()
+            },
+            "attributes": attributes(f),
+            "variables": {
+                name: (v.dimensions, described(v[...]), attributes(v))
+                for name, v in f.variables.items()
+            },
+        }
+
+
+@pytest.mark.parametrize("time", ["no time coordinate", "an unlimited time"])
+def test_decompress_to_writes_a_block_at_a_time_the_file_written_whole(
+    tmp_path: Path,
+    standard_dataset: StandardDataset,
+    monkeypatch: pytest.MonkeyPatch,
+    time: str,
+) -> None:
+    # Block by block, decompress_to writes the file that write_netcdf writes of
+    # decompress_file's dataset, but for how HDF5 lays it out: every variable,
+    # coordinate and attribute, each attribute in its own type, the waveform's fill
+    # value and missing value, and the unlimited dimensions. A coordinate along the
+    # waveform's dimensions is in its list of coordinates, and in the file's only if
+    # no variable lists it, as corner_hz, along a dimension that the waveform lacks.
+    ds = standard_dataset(7, nt=50, real=(1, 4))
+    ds["waveform"].attrs.update(
+        count=np.int32(7), flags=np.array([1, 2], np.int16), names=["a", "bb"]
+    )
+    ds["waveform"].encoding["_FillValue"] = np.float32(-999.0)
+    ds = ds.assign_coords(
+        orientation=("component", [0.0, 90.0, 0.0]),
+        corner_hz=("corner", [0.1, 10.0]),
+    )
+    options = {}
+    if time == "an unlimited time":
+        ds = ds.assign_coords(time=np.arange(50) * 0.005)
+        options = {"unlimited_dims": ["time"]}
+    src = write(ds, tmp_path / "in.nc", **options)
+    with h5py.File(src, "r+") as f:  # As a writer other than xarray may give it.
+        f["waveform"].attrs["missing_value"] = np.float32(-999.0)
+    packed = tmp_path / "out.nc"
+    compress_file(src, packed)
+    monkeypatch.setattr(files, "BLOCK_BYTES", 2 * 3 * 50 * 4)  # Blocks of 2 stations.
+    back, whole = tmp_path / "back.nc", tmp_path / "whole.nc"
+    decompress_to(packed, back)
+    xr.testing.assert_identical(read(back), decompress_file(packed))
+    write_netcdf(decompress_file(packed), whole)
+    assert netcdf_contents(back) == netcdf_contents(whole)
+
+
+def test_decompress_to_writes_each_sample_once(
+    tmp_path: Path, standard_dataset: StandardDataset, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Written in blocks, a waveform with a _FillValue, as xarray gives one by default,
+    # would be filled by HDF5 first, and so written twice, which for a big file takes
+    # as long again.
+    _, packed = write_and_compress(standard_dataset(100, nt=1000), tmp_path)
+    monkeypatch.setattr(files, "BLOCK_BYTES", 10 * 3 * 1000 * 4)  # 10 stations.
+    write = HDF5Output.write
+    written: list[int] = []
+
+    def counted(self: HDF5Output, data: Any) -> int:
+        written.append(memoryview(data).nbytes)
+        return write(self, data)
+
+    monkeypatch.setattr(HDF5Output, "write", counted)
+    decompress_to(packed, tmp_path / "back.nc")
+    assert sum(written) < 1.1 * (3 * 100 * 1000 * 4)
+
+
+def test_a_stream_that_cant_be_read_names_the_compressed_file(
+    tmp_path: Path, standard_dataset: StandardDataset, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # decompress_to reads each block as it writes the output. An error in reading may
+    # name no file, as h5py's don't, and then it names the file it was reading, not
+    # the output.
+    _, packed = write_and_compress(standard_dataset(5, nt=100), tmp_path)
+    monkeypatch.setattr(files, "BLOCK_BYTES", 2 * 3 * 100 * 4)  # Blocks of 2 stations.
+    read_streams = files._Streams.read
+
+    def read_one_block(self: Any, s0: int, s1: int) -> tuple[np.ndarray, np.ndarray]:
+        if s0 > 0:
+            raise OSError(errno.EIO, "Input/output error")
+        return read_streams(self, s0, s1)
+
+    monkeypatch.setattr(files._Streams, "read", read_one_block)
+    back = tmp_path / "back.nc"
+    with pytest.raises(OSError, match="Input/output error") as failed:
+        decompress_to(packed, back)
+    assert failed.value.filename == str(packed)
+    assert nothing_left(back)
+
+
 @pytest.mark.parametrize(
     "call", ["check_compressible", "compress_file", "decompress_to", "convert_bbbin"]
 )
@@ -218,8 +331,8 @@ def test_a_missing_destination_folder_is_refused_before_any_work(
     def too_late(*args: object, **kwargs: object) -> None:
         raise AssertionError("the input was read")
 
-    for module, name in [(files, "encode_block"), (files, "decompress_file")]:
-        monkeypatch.setattr(module, name, too_late)
+    for name in ("encode_block", "decode_block"):
+        monkeypatch.setattr(files, name, too_late)
     monkeypatch.setattr(bbbin, "read_bbbin", too_late)
     nowhere = tmp_path / "nowhere"
     dst = nowhere / "out.nc"
@@ -403,6 +516,71 @@ def test_a_full_disk_stops_compress_at_its_block_and_hdf5_carries_on(
     assert json.loads(first_failure) == [encoded] and encoded < 20
     assert carried_on == "HDF5 carries on"
     assert names_in(tmp_path) == ["again.h5", "in.nc"]
+
+
+@pytest.mark.parametrize(
+    "stop", ["a Ctrl-C", pytest.param("a full disk", marks=limits_file_sizes)]
+)
+def test_decompress_to_stops_at_the_end_of_a_block_and_hdf5_carries_on(
+    tmp_path: Path, standard_dataset: StandardDataset, stop: str
+) -> None:
+    # decompress_to writes the waveform a block of stations at a time. A Ctrl-C waits
+    # until the end of its block, here the first, so that HDF5 never takes it for a
+    # failed write. A write that fails, as on a full disk, stops the run at the end of
+    # its block too, with its own error, naming the file: going on would hold the rest
+    # in memory. Nothing is left, and HDF5 carries on. A limit on the size of each
+    # file fails writes as a full disk does: of 10 blocks of 10 stations, written
+    # straight to the file, the first few fit.
+    write_and_compress(standard_dataset(100, nt=1000), tmp_path)
+    limit = limit_file_sizes(1_000_000) if stop == "a full disk" else ""
+    code = limit + textwrap.dedent(
+        """
+        import json, signal, sys
+        import h5py, numpy as np
+        from waveform_compression_tools import files
+        from waveform_compression_tools.destinations import HDF5Output
+
+        files.BLOCK_BYTES = 10 * 3 * 1000 * 4  # Blocks of 10 stations.
+        decoded, first_failure = [], []
+
+        def counted(*args, **kwargs):
+            if sys.argv[1] == "a Ctrl-C" and not decoded:
+                signal.raise_signal(signal.SIGINT)
+            block = decode_block(*args, **kwargs)
+            decoded.append(None)
+            return block
+
+        def watched(self, data):
+            written = write(self, data)
+            if self.failure is not None and not first_failure:
+                first_failure.append(len(decoded))  # The blocks decoded by then.
+            return written
+
+        decode_block, files.decode_block = files.decode_block, counted
+        write, HDF5Output.write = HDF5Output.write, watched
+        try:
+            files.decompress_to("out.nc", "back.nc")
+        except KeyboardInterrupt:
+            print(json.dumps(["KeyboardInterrupt", len(decoded)]))
+        except OSError as error:
+            print(json.dumps([error.errno, error.filename, len(decoded)]))
+        print(json.dumps(first_failure))
+        with h5py.File("again.h5", "w") as f:
+            f["x"] = np.arange(10)
+        print("HDF5 carries on")
+        """
+    )
+    ran = run_python(code, stop, cwd=tmp_path)
+    assert ran.returncode == 0, ran.stderr
+    raised, first_failure, carried_on = ran.stdout.splitlines()
+    if stop == "a Ctrl-C":
+        assert json.loads(raised) == ["KeyboardInterrupt", 1]  # The first block.
+    else:
+        error_number, filename, decoded = json.loads(raised)
+        assert (error_number, filename) == (errno.EFBIG, "back.nc")
+        assert json.loads(first_failure) == [decoded] and 0 < decoded < 10
+    assert carried_on == "HDF5 carries on"
+    assert names_in(tmp_path) == ["again.h5", "in.nc", "out.nc"]
 
 
 @pytest.mark.parametrize("call", ["verify_file", "decompress_file"])

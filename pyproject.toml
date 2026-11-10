@@ -33,10 +33,6 @@ waveform_compression_tools = "waveform_compression_tools.engine:FlacBackendEntry
 [tool.deptry]
 optional_dependencies_dev_groups = ["test", "dev"]
 
-# h5netcdf is used only through xarray's `engine` argument.
-[tool.deptry.per_rule_ignores]
-DEP002 = ["h5netcdf"]
-
 [tool.setuptools_scm]
 
 [tool.setuptools]

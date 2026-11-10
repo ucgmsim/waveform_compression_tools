@@ -25,8 +25,9 @@ if TYPE_CHECKING:
     from _typeshed import ReadableBuffer, WriteableBuffer
 
 # From a failed write on, a write to an HDF5Output of this many bytes or more is held as
-# zeros, not copied. Only a variable's data, which xarray has written in one go, comes
-# that big; HDF5 reads none of it back, and its own records are far smaller.
+# zeros, not copied. Only a variable's data comes that big, as xarray writes it in one
+# go, or as decompress writes a block of the waveform; HDF5 reads none of it back, and
+# its own records are far smaller.
 _BIG_WRITE = 16 * 2**20
 
 # The signals whose handlers in Python wait while an HDF5Output is open: Ctrl-C's, and

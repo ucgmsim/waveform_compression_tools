@@ -233,11 +233,12 @@ def test_a_failed_write_leaves_nothing_held_in_memory(tmp_path: Path) -> None:
 @limits_file_sizes
 def test_a_failed_write_of_a_big_variable_holds_no_copy_of_it(tmp_path: Path) -> None:
     # From a failed write on, what HDF5 writes is held in memory, for its reads to find.
-    # xarray writes each variable of a netCDF file in one go, as decompress and
-    # convert-bbbin have it do, and HDF5 reads none of that back, so a write that big
-    # isn't copied: a run that fails on a full disk mustn't need twice the memory that
-    # it would to succeed. A limit on the size of each file fails the write as a full
-    # disk does; tracemalloc follows numpy's memory and Python's.
+    # xarray writes each variable of a netCDF file in one go, as convert-bbbin has it
+    # do, and decompress writes the waveform a block at a time: HDF5 reads none of that
+    # back, so a write that big isn't copied. A run that fails on a full disk mustn't
+    # need twice the memory that it would to succeed. A limit on the size of each file
+    # fails the write as a full disk does; tracemalloc follows numpy's memory and
+    # Python's.
     code = limit_file_sizes(1_000_000) + textwrap.dedent(
         """
         import tracemalloc
@@ -329,9 +330,9 @@ def test_a_signal_as_hdf5_closes_the_file_waits_then_stops_the_run(
 
 @pytest.mark.skipif(sys.platform == "win32", reason="a signal ends Windows' processes")
 def test_a_second_ctrl_c_ends_python_at_once(tmp_path: Path) -> None:
-    # A Ctrl-C waits while a file is written, which for decompress is until the whole
-    # file is. Pressed again, it ends Python at once, as it does by default, and leaves
-    # the partial file, which the next run replaces.
+    # A Ctrl-C waits while a file is written, which for convert-bbbin is until the
+    # whole file is. Pressed again, it ends Python at once, as it does by default, and
+    # leaves the partial file, which the next run replaces.
     code = textwrap.dedent(
         """
         import signal

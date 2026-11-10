@@ -31,12 +31,12 @@ setting), ``encoder`` (``"waveform_compression_tools"`` and the package's versio
 
 A file whose stations are all real is not compressed, so it stays exact as it is.
 
-A waveform can run to a hundred gigabytes or more, so it is read, compressed and
-verified a block of stations at a time. A compressed file appears at its path only
-when it is complete: it is written to the path with ``.partial`` added, then renamed.
-`compress_file` checks the file it writes as `verify_file` would, but reads the
-original's samples only once; `verify_file` checks a compressed file against its
-original on its own, reading both again.
+A waveform can run to a hundred gigabytes or more, so it is read, compressed,
+verified and decompressed to a file a block of stations at a time. A file appears at
+its path only when it is complete: it is written to the path with ``.partial`` added,
+then renamed. `compress_file` checks the file it writes as `verify_file` would, but
+reads the original's samples only once; `verify_file` checks a compressed file against
+its original on its own, reading both again.
 """
 
 import gc
@@ -44,11 +44,12 @@ import json
 import os
 import time
 import zlib
-from collections.abc import Generator, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Generator, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+import h5netcdf
 import h5py
 import numpy as np
 import xarray as xr
@@ -67,13 +68,7 @@ from .codec import (
     within_one_step,
 )
 from .content_hash import content_hash
-from .destinations import (
-    HDF5Output,
-    check_destination,
-    naming,
-    write_netcdf,
-    writing,
-)
+from .destinations import HDF5Output, check_destination, naming, writing
 from .errors import (
     AllStationsReal,
     AlreadyCompressed,
@@ -1912,6 +1907,39 @@ def _check_reopened(
                 )
 
 
+def _decompressed(
+    streams: _Streams, s0: int, s1: int, out: np.ndarray | None = None
+) -> np.ndarray:
+    """Decode a block of stations as decompressing gives it back: real stations exact.
+
+    Parameters
+    ----------
+    streams : _Streams
+        The streams of the compressed file.
+    s0 : int
+        The block's first station.
+    s1 : int
+        The station after its last, greater than `s0`.
+    out : np.ndarray, optional
+        A float32 array of shape (component, s1 - s0, nt) to decode into. By default a
+        new one is made.
+
+    Returns
+    -------
+    np.ndarray
+        The block, as a float32 array of shape (component, s1 - s0, nt): `out`, if it
+        is given.
+
+    Raises
+    ------
+    ValueError
+        If a stream is damaged, or decodes to the wrong number of samples.
+    """
+    block = streams.decode(s0, s1, out=out)
+    streams.put_back_exact(block, s0, s1)
+    return block
+
+
 def decompress_file(path: str | os.PathLike[str]) -> xr.Dataset:
     """Decompress a file written by `compress_file`.
 
@@ -1951,26 +1979,152 @@ def decompress_file(path: str | os.PathLike[str]) -> xr.Dataset:
         waveform = np.empty(streams.shape, np.float32)
         for s0, s1 in _station_blocks(streams.shape, None):
             # Straight into place, so no block is held besides the waveform.
-            streams.decode(s0, s1, out=waveform[:, s0:s1])
-            streams.put_back_exact(waveform[:, s0:s1], s0, s1)
+            _decompressed(streams, s0, s1, out=waveform[:, s0:s1])
     ds = xr.load_dataset(path, engine="h5netcdf")
     ds["waveform"] = streams.variable(waveform)
     return ds
 
 
+def _new_waveform(
+    nc: h5netcdf.File, rest: xr.Dataset, streams: _Streams
+) -> h5netcdf.Variable:
+    """Add the waveform's variable to a file of everything else, as xarray adds it.
+
+    A dimension of the waveform that the file lacks, as time is without a time
+    coordinate, is added after the file's own, and isn't unlimited. The waveform's
+    attributes are the original's, then the coordinates it lies along, then its
+    ``missing_value``, if it had one; its ``_FillValue`` is its fill value in HDF5.
+    xarray lists a coordinate in the file's ``coordinates`` attribute when no variable
+    lists it, so a coordinate that only the waveform lies along is taken off that list.
+    The samples are left to be written.
+
+    Parameters
+    ----------
+    nc : h5netcdf.File
+        The file, written by xarray from `rest`, open to be changed.
+    rest : xr.Dataset
+        Everything in the compressed file but the waveform, as xarray read it.
+    streams : _Streams
+        The streams of the compressed file.
+
+    Returns
+    -------
+    h5netcdf.Variable
+        The waveform's variable: float32, with the dimensions (component, station,
+        time).
+    """
+    for dim, size in zip(STANDARD_DIMS, streams.shape, strict=True):
+        if dim not in nc.dimensions:
+            nc.dimensions[dim] = size
+    # Every sample is written, so HDF5 needn't write the fill value first, which would
+    # write the whole waveform twice.
+    variable = nc.create_variable(
+        "waveform",
+        STANDARD_DIMS,
+        np.float32,
+        fillvalue=streams.encoding.get("_FillValue"),
+        fill_time="never",
+    )
+    # The coordinates along the waveform's dimensions, by name, as xarray lists them.
+    along = sorted(
+        str(name)
+        for name, coord in rest.coords.items()
+        if name not in rest.dims and set(coord.dims) <= set(STANDARD_DIMS)
+    )
+    attrs = dict(streams.waveform_attrs)
+    if along:
+        attrs["coordinates"] = " ".join(along)
+    if streams.encoding.get("missing_value") is not None:
+        attrs["missing_value"] = streams.encoding["missing_value"]
+    variable.attrs.update(attrs)
+    listed = nc.attrs.get("coordinates", "").split()
+    others = [name for name in listed if name not in along]
+    if others != listed:
+        del nc.attrs["coordinates"]
+        if others:
+            nc.attrs["coordinates"] = " ".join(others)
+    return variable
+
+
+def _decompress_to(
+    src: Path,
+    dst: Path,
+    overwrite: bool,
+    about_file: Callable[[Path], AbstractContextManager[None]],
+) -> tuple[int, int, int]:
+    """Do what `decompress_to` does, each step in a context about its file.
+
+    Parameters
+    ----------
+    src : Path
+        The compressed file.
+    dst : Path
+        Where to write the netCDF file.
+    overwrite : bool
+        Whether to replace a file already at `dst`.
+    about_file : callable
+        Given a file, a context for a step about it, which may name the file in the
+        step's errors, as `waveform_compression_tools.errors.about` does: `dst` for
+        checking the destination and for writing, and `src` for each read, a block's
+        decoding included.
+
+    Returns
+    -------
+    tuple[int, int, int]
+        The waveform's shape: (component, station, nt).
+    """
+    with about_file(dst):
+        check_destination(dst, src, overwrite=overwrite)
+    with about_file(src), naming(src):
+        _refuse_unless_hdf5(src, NotCompressed)
+        f = h5py.File(src, "r")
+    with f:
+        with about_file(src), naming(src):
+            streams = _open_streams(f, src)
+            # Everything but the waveform is small, and is read once, here.
+            rest = xr.load_dataset(src, engine="h5netcdf")
+        # The file is written through out, which never tells HDF5 that a write failed,
+        # and while it is open, Ctrl-C and SIGTERM wait.
+        with about_file(dst), writing(dst) as partial, HDF5Output(partial) as out:
+            rest.to_netcdf(out, engine="h5netcdf")
+            out.raise_pending()
+            with h5netcdf.File(out, "r+") as nc:
+                waveform = _new_waveform(nc, rest, streams)
+                for s0, s1 in _station_blocks(streams.shape, None):
+                    with about_file(src), naming(src):
+                        block = _decompressed(streams, s0, s1)
+                    waveform[:, s0:s1, :] = block
+                    # A write that failed, or a Ctrl-C, stops the run here, before what
+                    # HDF5 writes from then on, held in memory, adds up.
+                    out.raise_pending()
+                    del block  # So that it isn't kept while the next one is decoded.
+                    # Each stream's decoder is kept in a reference cycle, which a young
+                    # collection frees (see verify_file).
+                    gc.collect(1)
+    return streams.shape
+
+
 def decompress_to(
     src: str | os.PathLike[str], dst: str | os.PathLike[str], overwrite: bool = False
 ) -> None:
-    """Decompress a file written by `compress_file` to a netCDF file.
+    """Decompress a file written by `compress_file` to a netCDF file, a block at a time.
 
     The destination and its folder are checked first (see
-    `waveform_compression_tools.destinations.check_destination`). The dataset that
-    `decompress_file` gives is then written by xarray with the h5netcdf engine to `dst`
-    with ``.partial`` added, and renamed to `dst` when it is complete (see
-    `waveform_compression_tools.destinations.write_netcdf`). If anything goes wrong,
-    the partial file is deleted and the exception raised again; a file already at
-    `dst` is then as it was. As in `decompress_file`, the whole waveform is decoded
-    into memory.
+    `waveform_compression_tools.destinations.check_destination`). Everything but the
+    waveform is then written by xarray with the h5netcdf engine, and the waveform is
+    decoded and written a block of stations at a time, so memory holds one block of
+    about `BLOCK_BYTES`, whatever the size of the file. The file is the one that
+    xarray writes of the dataset `decompress_file` gives, but for how HDF5 lays it out:
+    every variable, coordinate and attribute, each attribute in its own type, the
+    waveform's ``_FillValue`` and ``missing_value``, and the unlimited dimensions.
+
+    The file is written to `dst` with ``.partial`` added, and renamed to `dst` when it
+    is complete (see `waveform_compression_tools.destinations.writing`). If anything
+    goes wrong, the partial file is deleted and the exception raised again; a file
+    already at `dst` is then as it was. The file is written through a
+    `waveform_compression_tools.destinations.HDF5Output`, so a write that fails, as on
+    a full disk, stops the run at the end of its block with its own error, naming
+    `dst`, and a Ctrl-C or SIGTERM waits until the end of the block.
 
     Parameters
     ----------
@@ -1992,9 +2146,13 @@ def decompress_to(
         If there is no folder to write `dst` in, before `src` is read.
     NotCompressed, UnknownFormat
         As `decompress_file` raises them. Nothing is written.
+    ValueError
+        As `decompress_file` raises it, as for a damaged stream.
+    OSError
+        If `src` can't be read, naming it, or `dst` can't be written, as on a full
+        disk, naming `dst`.
     """
-    check_destination(dst, src, overwrite=overwrite)
-    write_netcdf(decompress_file(src), dst)
+    _decompress_to(Path(src), Path(dst), overwrite, about)
 
 
 def verify_file(
