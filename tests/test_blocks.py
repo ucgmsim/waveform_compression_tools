@@ -12,6 +12,7 @@ from waveform_compression_tools.bbbin import read_bbbin
 from waveform_compression_tools.files import (
     block_stations_for,
     compress_file,
+    decompress_file,
     decompress_to,
     verify_file,
 )
@@ -189,3 +190,7 @@ def test_a_block_reads_only_its_own_streams(
     peak = _peak("decompress", src, packed, tmp_path / "back.nc")
     assert unneeded and not any(unneeded)
     assert peak < 1.25 * _peak("decompress", src, in_its_blocks, tmp_path / "back.nc")
+    # And what it reads is each stream's own: the file decodes to what the same file
+    # compressed in decompress's own blocks does, which a block reads at once.
+    back = decompress_file(packed)["waveform"].values
+    assert np.array_equal(back, decompress_file(in_its_blocks)["waveform"].values)
