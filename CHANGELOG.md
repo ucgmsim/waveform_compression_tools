@@ -2,7 +2,8 @@
 
 ## 1.2.0
 
-- **An HF.bin converter,** `convert-hfbin`, and `read_hfbin` and `convert_hfbin` in Python, beside `convert-bbbin`: it brings a simulation's legacy HF.bin file of high-frequency waveforms into the standard layout, for `compress`, with its acceleration in cm/s² as stored and every field of its header as an attribute in its own type. A file that isn't an HF.bin is refused with `NotHFBin`, and one that its run left unfinished, in which a station's `vs` is 0, with `IncompleteHFBin`, whose error line says how many stations are unfinished; both exit with status 3.
+- **An HF.bin converter,** `convert-hfbin`, and `read_hfbin` and `convert_hfbin` in Python, beside `convert-bbbin`. It keeps the acceleration in cm/s², as stored, and every field of the header as an attribute in its own type. A file that isn't an HF.bin is refused with `NotHFBin`, as is one cut short by a run that stopped early, whose error line adds `or one cut short`. A full-size file that its run left unfinished, with a station's `vs` of 0, is refused with `IncompleteHFBin`. Both exit with status 3.
+- **convert-bbbin takes less memory, and its refusals say more.** It reads the traces a block of stations at a time, so converting a synthetic BB.bin of 0.36 GB peaked at 0.54 GB of resident memory, where 1.1.0 took 0.83 GB. A file shorter than its header says, which holds the whole header and every record, is refused with a line that adds `or one cut short`. A name or a string with a NUL inside it, and a file that shrinks while it is read, are refused with `NotBBBin` and status 3, with a line that names SRC, where 1.1.0 failed with status 1 and a line that named DST.
 
 ## 1.1.0
 
