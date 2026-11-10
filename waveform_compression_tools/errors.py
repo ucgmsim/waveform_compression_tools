@@ -80,11 +80,17 @@ class UnknownFormat(Refused):
 
 
 class NotBBBin(Refused):
-    """A file can't be a BB.bin: its size doesn't fit its header, or its text isn't ASCII."""
+    """A file can't be a BB.bin, or is one cut short.
+
+    Its size doesn't fit its header, or its text isn't ASCII.
+    """
 
 
 class NotHFBin(Refused):
-    """A file can't be an HF.bin: its size doesn't fit its header, or its text isn't ASCII."""
+    """A file can't be an HF.bin, or is one cut short.
+
+    Its size doesn't fit its header, or its text isn't ASCII.
+    """
 
 
 class IncompleteHFBin(Refused):

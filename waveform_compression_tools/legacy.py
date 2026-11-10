@@ -69,6 +69,43 @@ def layout(
     return None
 
 
+def cut_short(head: bytes, size: int, head_bytes: int, station_bytes: int) -> bool:
+    """Say whether a file whose size doesn't fit its header may be one cut short.
+
+    The writers write the header and every station's record before the traces, so a
+    run that stops early, or a copy that does, leaves a file that holds those but not
+    every trace. Its size is all that tells such a file from any other, so it can't be
+    read, but the refusal can say what it may be.
+
+    Parameters
+    ----------
+    head : bytes
+        The start of the file: its header, or all of it if it is shorter.
+    size : int
+        The size of the whole file in bytes.
+    head_bytes : int
+        The size of the header, as for `layout`.
+    station_bytes : int
+        The size of each station's record, as for `layout`.
+
+    Returns
+    -------
+    bool
+        Whether, in either byte order, the header counts at least one station and at
+        least one sample, and the file holds the whole header and every record, but
+        not every trace.
+    """
+    if len(head) < head_bytes:
+        return False
+    for endian in ("<", ">"):
+        nstat, nt = (int(n) for n in np.frombuffer(head, f"{endian}i4", count=2))
+        records_end = head_bytes + nstat * station_bytes
+        traces_end = records_end + nstat * nt * SAMPLE_BYTES
+        if nstat > 0 and nt > 0 and records_end <= size < traces_end:
+            return True
+    return False
+
+
 def standard_waveform(
     f: io.BufferedIOBase, endian: str, nstat: int, nt: int
 ) -> np.ndarray | None:

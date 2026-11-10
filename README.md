@@ -205,7 +205,7 @@ An HF.bin file holds the high-frequency acceleration that a simulation computed 
 
 The file also has a `time` coordinate, in float64, `start_sec + dt * arange(nt)`, and the attribute `source_format = "HF.bin"`. As for a BB.bin, the whole waveform is read into memory, a block of stations at a time, which takes about the file's size at the peak, and 64 MiB more: converting a synthetic HF.bin of 0.36 GB peaked at 0.54 GB of resident memory.
 
-The writer of an HF.bin fills in each station's `vs` once that station is done, so a file in which any station's `vs` is 0 is unfinished. It is refused, and the error line says how many stations are unfinished, as `waveform-compression-tools: HF.bin: is incomplete, with 2 of its 120 stations unfinished: their vs is 0`. A run that stopped before it had written the last station's traces leaves a file shorter than its header says, and that is refused as not an HF.bin.
+The writer of an HF.bin writes the header and every station's record first, then each station's traces, and fills in the station's `vs` once they are written. So a run that stops early leaves a file shorter than its header says, unless it had written the last station's traces. That file is refused as not an HF.bin, since its size is all that tells an HF.bin from any other file, but the error line adds that it may be one cut short when it holds the whole header and every record, as `waveform-compression-tools: HF.bin: not an HF.bin file, or one cut short: HF.bin (2144 bytes)`. A file of its full size in which a station's `vs` is 0 is unfinished. It is refused, and the error line says how many stations are unfinished, as `waveform-compression-tools: HF.bin: is incomplete, with 2 of its 120 stations unfinished: their vs is 0`.
 
 ### Exit codes
 
@@ -223,8 +223,8 @@ The refusals, by command:
 - `compress`: DST is SRC; a file is at DST, or at the record's PATH, and `--overwrite` isn't given; SRC isn't an HDF5 file, is compressed already, or holds an HDF5 group besides its root; SRC isn't in the standard layout, which includes having no `station` coordinate, a station name that is bytes but not ASCII, no stations, a waveform attribute that JSON can't hold or whose type can't be kept, a `_FillValue` or `missing_value` that isn't one value, isn't a number, or that JSON can't hold, a `_FillValue` and a `missing_value` that differ, and a finite fill value within one step of a trace's range; every station is real; a trace holds a NaN or an infinity.
 - `decompress`: SRC isn't an HDF5 file, isn't compressed, or is in another format version or has a setting outside 8 to 32; DST is SRC; a file is at DST, and `--overwrite` isn't given.
 - `verify`: ORIGINAL isn't an HDF5 file, or isn't in the standard layout; COMPRESSED isn't an HDF5 file, isn't compressed, or is in another format version or has a setting outside 8 to 32.
-- `convert-bbbin`: SRC can't be a BB.bin file (it is shorter than a header, its size doesn't fit its header, or it holds text that isn't ASCII); DST is SRC; a file is at DST, and `--overwrite` isn't given.
-- `convert-hfbin`: SRC can't be an HF.bin file (it is shorter than a header, its size doesn't fit its header, or it holds text that isn't ASCII), or it is unfinished (a station's `vs` is 0); DST is SRC; a file is at DST, and `--overwrite` isn't given.
+- `convert-bbbin`: SRC can't be a BB.bin file (it is shorter than a header, its size doesn't fit its header, or it holds text that isn't ASCII), where the line adds `or one cut short` if it holds the whole header and every record but not every trace; DST is SRC; a file is at DST, and `--overwrite` isn't given.
+- `convert-hfbin`: SRC can't be an HF.bin file (it is shorter than a header, its size doesn't fit its header, or it holds text that isn't ASCII), where the line adds `or one cut short` if it holds the whole header and every record but not every trace, or it is unfinished (a station's `vs` is 0); DST is SRC; a file is at DST, and `--overwrite` isn't given.
 
 A refusal writes nothing but `compress`'s record, and leaves a file already at the destination as it was. A file that isn't HDF5 at all is refused, while an HDF5 file that is damaged or cut short is a failure: it may be the right kind of file, and the run went wrong.
 
@@ -312,8 +312,8 @@ A refusal raises `Refused`, or one of its subclasses, from `waveform_compression
 | `NonFiniteSamples` | a trace holds a NaN or an infinity |
 | `NotCompressed` | a file to decompress or verify isn't HDF5, or holds no compressed waveform |
 | `UnknownFormat` | a compressed file is in another format version, or has a setting outside 8 to 32 |
-| `NotBBBin` | a file can't be a BB.bin file |
-| `NotHFBin` | a file can't be an HF.bin file |
+| `NotBBBin` | a file can't be a BB.bin file, or is one cut short |
+| `NotHFBin` | a file can't be an HF.bin file, or is one cut short |
 | `IncompleteHFBin` | an HF.bin file is unfinished: a station's `vs` is 0 |
 
 `CheckFailed`, a `RuntimeError`, means that the output of `compress_file` failed its check. The output is deleted, so nothing is left at the destination, and a file already there stays as it was.

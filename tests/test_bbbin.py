@@ -1,3 +1,4 @@
+import re
 import struct
 from collections.abc import Callable
 from pathlib import Path
@@ -126,51 +127,80 @@ def header_saying(nstat: int, nt: int, size: int) -> bytes:
 
 
 @pytest.mark.parametrize(
-    "content",
+    ("content", "cut_short"),
     [
-        pytest.param(b"", id="empty"),
-        pytest.param(b"\0" * 7, id="shorter than the counts"),
-        pytest.param(header_saying(3, 7, 0x4FF), id="shorter than the header"),
+        pytest.param(b"", False, id="empty"),
+        pytest.param(b"\0" * 7, False, id="shorter than the counts"),
+        pytest.param(header_saying(3, 7, 0x4FF), False, id="shorter than the header"),
         # These fit the size a BB.bin of their counts would have, so only the counts
         # can refuse them: a file of zeros the size of a header is not an empty BB.bin.
-        pytest.param(b"\0" * 0x500, id="zeros the size of a header"),
-        pytest.param(header_saying(0, 5, 0x500), id="no stations"),
+        pytest.param(b"\0" * 0x500, False, id="zeros the size of a header"),
+        pytest.param(header_saying(0, 5, 0x500), False, id="no stations"),
         pytest.param(
-            header_saying(3, 0, 0x500 + 3 * 0x2C), id="stations with no samples"
+            header_saying(3, 0, 0x500 + 3 * 0x2C), False, id="stations with no samples"
         ),
         # In 32-bit arithmetic, 2**30 samples of 12 bytes would take no room at all.
+        # The file holds the header and the one record, so it may be one cut short.
         pytest.param(
-            header_saying(1, 2**30, 0x500 + 0x2C), id="a size that wraps around"
+            header_saying(1, 2**30, 0x500 + 0x2C), True, id="a size that wraps around"
+        ),
+        # Counts below zero would put any size between the end of the records and
+        # the end of the traces.
+        pytest.param(
+            header_saying(-(2**31), -(2**31), 0x500 + 0x100),
+            False,
+            id="counts below zero",
         ),
     ],
 )
 def test_a_file_that_cannot_be_a_bbbin_is_refused(
-    tmp_path: Path, content: bytes
+    tmp_path: Path, content: bytes, cut_short: bool
 ) -> None:
     (tmp_path / "x.bin").write_bytes(content)
-    with pytest.raises(ValueError, match="not a BB.bin file"):
+    start = (
+        "not a BB.bin file, or one cut short: " if cut_short else "not a BB.bin file: "
+    )
+    with pytest.raises(ValueError, match=f"^{re.escape(start)}"):
         read_bbbin(tmp_path / "x.bin")
+
+
+# The size of the header and of the three records of the file the size test writes.
+RECORDS_END = 0x500 + 3 * 0x2C
 
 
 @pytest.mark.parametrize("endian", ["<", ">"])
 @pytest.mark.parametrize(
-    "change",
+    ("change", "cut_short"),
     [
-        pytest.param(lambda content: content[:-1], id="a byte short"),
-        pytest.param(lambda content: content + b"\0", id="a byte too many"),
-        pytest.param(lambda content: content[:-12], id="a sample short"),
+        pytest.param(lambda content: content[:-1], True, id="a byte short"),
+        pytest.param(lambda content: content + b"\0", False, id="a byte too many"),
+        pytest.param(lambda content: content[:-12], True, id="a sample short"),
+        pytest.param(
+            lambda content: content[:RECORDS_END], True, id="every record, no trace"
+        ),
+        pytest.param(
+            lambda content: content[: RECORDS_END - 1],
+            False,
+            id="a byte short of its records",
+        ),
     ],
 )
 def test_the_size_has_to_fit_the_header(
     tmp_path: Path,
     endian: str,
     change: Callable[[bytes], bytes],
+    cut_short: bool,
     make_bbbin: MakeBbbin,
 ) -> None:
+    # A file that holds the whole header and every record, but not every trace, may be
+    # one cut short, and its refusal says so.
     path = tmp_path / "BB.bin"
     make_bbbin(path, nstat=3, nt=7, endian=endian)
     path.write_bytes(change(path.read_bytes()))
-    with pytest.raises(ValueError, match="not a BB.bin file"):
+    start = (
+        "not a BB.bin file, or one cut short: " if cut_short else "not a BB.bin file: "
+    )
+    with pytest.raises(ValueError, match=f"^{re.escape(start)}"):
         read_bbbin(path)
 
 

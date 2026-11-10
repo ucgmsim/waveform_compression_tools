@@ -28,6 +28,7 @@ for a BB.bin (see `waveform_compression_tools.legacy`):
 `waveform_compression_tools.files.compress_file` can then compress.
 """
 
+import io
 import os
 from pathlib import Path
 
@@ -117,22 +118,31 @@ def _station_dtype(endian: str) -> np.dtype:
     )
 
 
-def _not_hfbin(path: Path, size: int) -> NotHFBin:
-    """Refuse a file whose size doesn't fit its header.
+def _not_hfbin(path: Path, f: io.BufferedIOBase, head: bytes) -> NotHFBin:
+    """Refuse a file whose size doesn't fit its header, as it is now.
 
     Parameters
     ----------
     path : Path
         The file.
-    size : int
-        Its size in bytes, as it was found.
+    f : io.BufferedIOBase
+        The file, open.
+    head : bytes
+        The start of the file: its header, or all of it if it is shorter.
 
     Returns
     -------
     NotHFBin
-        The refusal, which names the file and gives its size.
+        The refusal, which names the file and gives its size now, which is less than
+        it was found to be if it has shrunk since. It adds that the file may be one
+        cut short if it holds the whole header and every record, but not every trace
+        (see `waveform_compression_tools.legacy.cut_short`).
     """
-    return NotHFBin(f"not an HF.bin file: {path} ({size} bytes)", path)
+    size = os.fstat(f.fileno()).st_size
+    what = "not an HF.bin file"
+    if legacy.cut_short(head, size, _HEAD_BYTES, _STATION_BYTES):
+        what += ", or one cut short"
+    return NotHFBin(f"{what}: {path} ({size} bytes)", path)
 
 
 def read_hfbin(path: str | os.PathLike[str]) -> xr.Dataset:
@@ -175,9 +185,11 @@ def read_hfbin(path: str | os.PathLike[str]) -> xr.Dataset:
         If `path` is not an HF.bin file: if it is shorter than a header, if neither
         byte order makes the header's numbers of stations and samples, both at least
         1, fit its size exactly, or if a station's name, or a string of the header, is
-        not ASCII. A file that shrinks while it is read, so that by the time its
-        records or its traces are read it is shorter than its header says, is refused
-        as a file of its new size would be.
+        not ASCII. If the file's size doesn't fit its header, but it holds the whole
+        header and every record, the message adds that it may be one cut short. A
+        file that shrinks while it is read, so that by the time its records or its
+        traces are read it is shorter than its header says, is refused as a file of
+        its new size would be.
     IncompleteHFBin
         If a station's vs is 0, so the run that wrote the file stopped before that
         station was done. The message says how many stations are unfinished.
@@ -188,13 +200,13 @@ def read_hfbin(path: str | os.PathLike[str]) -> xr.Dataset:
         head = f.read(_HEAD_BYTES)
         layout = legacy.layout(head, size, _HEAD_BYTES, _STATION_BYTES)
         if layout is None:
-            raise _not_hfbin(path, size)
+            raise _not_hfbin(path, f, head)
         endian, nstat, nt = layout
         records = f.read(nstat * _STATION_BYTES)
         # A record or a trace that the file doesn't hold means that it has shrunk since
         # its size was checked.
         if len(records) < nstat * _STATION_BYTES:
-            raise _not_hfbin(path, os.fstat(f.fileno()).st_size)
+            raise _not_hfbin(path, f, head)
         stations = np.frombuffer(records, _station_dtype(endian), count=nstat)
         # Text that isn't ASCII isn't changed into something that might differ from
         # what the file holds.
@@ -217,7 +229,7 @@ def read_hfbin(path: str | os.PathLike[str]) -> xr.Dataset:
         # Only a file that can be converted has its traces read.
         waveform = legacy.standard_waveform(f, endian, nstat, nt)
         if waveform is None:
-            raise _not_hfbin(path, os.fstat(f.fileno()).st_size)
+            raise _not_hfbin(path, f, head)
     ints = np.frombuffer(head, f"{endian}i4", count=len(_INT_FIELDS))
     floats = np.frombuffer(
         head, f"{endian}f4", count=len(_FLOAT_FIELDS), offset=_FLOATS_AT
