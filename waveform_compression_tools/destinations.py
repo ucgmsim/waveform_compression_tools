@@ -557,7 +557,7 @@ def check_destination(
                 path.exists() and os.path.samefile(src, path) for path in (dst, partial)
             )
         if same:
-            raise SameFile(f"writing {dst} would overwrite {src}", dst)
+            raise SameFile(f"{dst}: would overwrite {src}", dst)
     if not overwrite and os.path.lexists(dst):
         raise OutputExists(
             f"{dst} exists already, and is replaced only if asked (--overwrite, or "

@@ -1082,6 +1082,32 @@ def test_a_missing_or_cut_short_input_fails_rather_than_being_refused(
     assert failed.value.filename == str(bad)
 
 
+def test_verify_names_the_compressed_file_when_its_exact_copies_cannot_be_read(
+    tmp_path: Path, standard_dataset: StandardDataset
+) -> None:
+    # The exact copies are compared with the original after the streams are decoded, and
+    # HDF5's error for a damaged chunk of them names no file.
+    original = write(standard_dataset(3, nt=100, real=(1,)), tmp_path / "in.nc")
+    packed = tmp_path / "in.flac.nc"
+    compress_file(original, packed)
+    with h5py.File(packed, "r+") as f:
+        g = f[GROUP]
+        exact = g["exact_waveform"][...]
+        del g["exact_waveform"]
+        g.create_dataset(
+            "exact_waveform", data=exact, chunks=(1, 1, 100), fletcher32=True
+        )
+        info = g["exact_waveform"].id.get_chunk_info_by_coord((0, 0, 0))
+    with packed.open("r+b") as raw:
+        raw.seek(info.byte_offset + info.size // 2)
+        byte = raw.read(1)
+        raw.seek(info.byte_offset + info.size // 2)
+        raw.write(bytes([byte[0] ^ 0xFF]))
+    with pytest.raises(OSError) as failed:
+        verify_file(original, packed)
+    assert failed.value.filename == str(packed)
+
+
 @pytest.mark.parametrize(
     ("name", "value", "message"),
     [

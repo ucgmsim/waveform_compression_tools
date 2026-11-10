@@ -835,7 +835,8 @@ def _check_dataset(src: Path, ds: xr.Dataset) -> tuple[np.ndarray, dict[str, str
     encoding_json = _encoding_json(waveform.encoding)
     if exact.size == n_station:
         raise AllStationsReal(
-            f"all {n_station} stations of {src} are real, so it isn't compressed", src
+            f"{src}: all {n_station} of its stations are real, so it isn't compressed",
+            src,
         )
     kept = {
         "waveform_attrs": attrs_json,
@@ -2396,10 +2397,12 @@ def verify_file(
         for s0, s1 in _station_blocks(waveform.shape, chunks, block_stations):
             with naming(original):
                 block = waveform[:, s0:s1, :].values
-            # A damaged stream doesn't know its file.
+            # A damaged stream, and HDF5 reading the exact copies, don't know their file.
             with naming(compressed), about(compressed):
                 decoded = streams.decode(s0, s1)
-            error, block_passed = _compare_block(streams, block, decoded, real, s0, s1)
+                error, block_passed = _compare_block(
+                    streams, block, decoded, real, s0, s1
+                )
             passed = passed and block_passed
             worst = np.maximum(worst, error)  # A NaN stays.
             del block, decoded

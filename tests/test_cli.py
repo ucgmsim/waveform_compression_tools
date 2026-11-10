@@ -337,6 +337,9 @@ def test_each_refusal_exits_3_with_one_line_and_a_record(
     result = run("compress", src, dst, "--record", rec, *options)
     reason = assert_stopped(result, EXIT_REFUSED, {"src": src, "dst": dst}[named])
     assert word in reason
+    # The line names its file once. Only a refusal of src being dst names it again, as
+    # the file it would overwrite.
+    assert reason.count(str({"src": src, "dst": dst}[named])) == (src == dst)
     # Nothing is written but the record: the input, and a file already at the
     # destination, are as they were, and no partial file is left.
     assert contents(tmp_path) == {**before, "rec.json": rec.read_bytes()}
