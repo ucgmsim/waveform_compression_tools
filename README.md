@@ -297,6 +297,31 @@ A path can be given as a string or as a `pathlib.Path` object.
 
 `block_stations` is the most stations in a block. By default it follows the memory budget and the file's chunks, as in [Blocks and memory](#blocks-and-memory).
 
+### Reading a few stations
+
+`open_dataset` opens a compressed file as the dataset that `decompress_file` gives, but decodes its waveform only where it is read:
+
+```python
+from waveform_compression_tools import open_dataset
+
+with open_dataset("realisation.flac.nc") as ds:  # reads no waveform
+    picked = ds.sel(station=["WXYZ", "S000123"])  # selecting reads nothing either
+    peaks = abs(picked["waveform"]).max("time")  # reads those 6 traces, and no others
+    south = ds.isel(station=ds["latitude"] < -45).load()  # read once, and kept
+print(peaks.values, south["waveform"].shape)
+```
+
+- Opening reads everything but the waveform: the coordinates and the other variables, and where each trace's stream is. Selecting with `sel` or `isel`, by name, index, slice, mask or coordinate, reads nothing.
+- Reading a selection's values, with `.values`, `.load()` or a computation, reads only its traces: a real station's exact copy, or any other trace's own stream, which is then decoded. A selection in time decodes whole traces, then cuts them.
+- Each read decodes again, so `.load()` a selection that is used more than once.
+- A selection of points, such as one component at each of several stations, decodes every chosen component at every chosen station.
+- Every value is bit for bit the one that `decompress_file` gives.
+- The file stays open until the dataset is closed, with `ds.close()` or at the end of a `with` block. Selections read through their dataset, so after that, reading one raises `ValueError`.
+- Reading the whole waveform decodes all of it into memory, 4 bytes a sample. Writing the dataset with `to_netcdf` does that, so a whole file should go through `decompress_to`, or the `decompress` command, instead.
+- xarray opens a compressed file in the same way with `xr.open_dataset(path, engine="waveform_compression_tools")`, which also takes `drop_variables`. Without the engine, xarray opens it as an ordinary netCDF file, without its waveform.
+
+Opening takes time and memory with the number of stations, not with the size of the waveform. On a synthetic file of 12,000 stations of 39,629 samples, 2.9 GiB at 24 bits, opening it and reading 3 stations took 0.04 s, and resident memory peaked at 115 MB, of which 103 MB was Python and the packages it had imported. On one of a million stations of 16 samples, it took 0.5 to 0.6 s, and memory peaked at 335 MB.
+
 ### Errors
 
 A refusal raises `Refused`, or one of its subclasses, from `waveform_compression_tools.errors`. It means that the input can't be used as it is, and that nothing was written: no file appears at the destination, and a file already there stays as it was. `Refused` is a `ValueError`, so catch it before `ValueError`.
@@ -310,7 +335,7 @@ A refusal raises `Refused`, or one of its subclasses, from `waveform_compression
 | `AlreadyCompressed` | a file is compressed already |
 | `AllStationsReal` | every station of a file is real, so it stays exact as it is |
 | `NonFiniteSamples` | a trace holds a NaN or an infinity |
-| `NotCompressed` | a file to decompress or verify isn't HDF5, or holds no compressed waveform |
+| `NotCompressed` | a file to decompress, open or verify isn't HDF5, or holds no compressed waveform |
 | `UnknownFormat` | a compressed file is in another format version, or has a setting outside 8 to 32 |
 | `NotBBBin` | a file can't be a BB.bin file, or is one cut short |
 | `NotHFBin` | a file can't be an HF.bin file, or is one cut short |
