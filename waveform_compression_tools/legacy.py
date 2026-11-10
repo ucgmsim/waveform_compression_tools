@@ -15,6 +15,8 @@ records. `layout` tells it from the file's size: in the writer's byte order, the
 counts make the file exactly as long as it is.
 """
 
+import io
+
 import numpy as np
 
 from .codec import STANDARD_COMPONENTS
@@ -24,6 +26,9 @@ from .codec import STANDARD_COMPONENTS
 FILE_COMPONENTS = ("090", "000", "ver")
 N_COMPONENT = len(FILE_COMPONENTS)
 SAMPLE_BYTES = 4 * N_COMPONENT
+# The traces read at once: a block of whole stations holds about this many bytes of
+# them, and at least one station.
+BLOCK_BYTES = 64 * 2**20
 
 
 def layout(
@@ -64,14 +69,21 @@ def layout(
     return None
 
 
-def standard_waveform(samples: bytes, endian: str, nstat: int, nt: int) -> np.ndarray:
-    """Put a file's traces in the standard order, in the machine's byte order.
+def standard_waveform(
+    f: io.BufferedIOBase, endian: str, nstat: int, nt: int
+) -> np.ndarray | None:
+    """Read a file's traces into the standard order, in the machine's byte order.
+
+    The traces are read a block of whole stations at a time, about `BLOCK_BYTES` of
+    them and at least one station, and each block is copied into place as it is read.
+    So reading takes the waveform and one block at the peak, not the file's traces too.
 
     Parameters
     ----------
-    samples : bytes
-        The traces as the file holds them: float32 of shape (nstat, nt, 3), in the
-        byte order `endian`, with the components in the order 090, 000, ver.
+    f : io.BufferedIOBase
+        The file, open for reading at the start of its traces: float32 of shape
+        (nstat, nt, 3), in the byte order `endian`, with the components in the order
+        090, 000, ver.
     endian : str
         The file's byte order: ``"<"`` for little-endian or ``">"`` for big-endian.
     nstat : int
@@ -81,18 +93,20 @@ def standard_waveform(samples: bytes, endian: str, nstat: int, nt: int) -> np.nd
 
     Returns
     -------
-    np.ndarray
+    np.ndarray | None
         The traces, float32 of shape (3, nstat, nt), with the components in the order
-        000, 090, ver, so the first two are swapped from the file's order.
-
-    Raises
-    ------
-    ValueError
-        If `samples` is too short for that, as when the file shrinks while it is read.
+        000, 090, ver, so the first two are swapped from the file's order. None if the
+        file ends before its last trace, as when it shrinks while it is read.
     """
-    raw = np.frombuffer(samples, f"{endian}f4", count=nstat * nt * N_COMPONENT)
-    raw = raw.reshape(nstat, nt, N_COMPONENT)
     waveform = np.empty((N_COMPONENT, nstat, nt), dtype=np.float32)
-    for i, component in enumerate(STANDARD_COMPONENTS):
-        waveform[i] = raw[:, :, FILE_COMPONENTS.index(component)]
+    stations = min(nstat, max(1, BLOCK_BYTES // (nt * SAMPLE_BYTES)))
+    block = np.empty((stations, nt, N_COMPONENT), f"{endian}f4")
+    for start in range(0, nstat, stations):
+        traces = block[: nstat - start]
+        if f.readinto(traces) < traces.nbytes:
+            return None
+        for i, component in enumerate(STANDARD_COMPONENTS):
+            waveform[i, start : start + len(traces)] = traces[
+                :, :, FILE_COMPONENTS.index(component)
+            ]
     return waveform

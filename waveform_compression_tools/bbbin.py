@@ -74,17 +74,37 @@ def _station_dtype(endian: str) -> np.dtype:
     )
 
 
+def _not_bbbin(path: Path, size: int) -> NotBBBin:
+    """Refuse a file whose size doesn't fit its header.
+
+    Parameters
+    ----------
+    path : Path
+        The file.
+    size : int
+        Its size in bytes, as it was found.
+
+    Returns
+    -------
+    NotBBBin
+        The refusal, which names the file and gives its size.
+    """
+    return NotBBBin(f"not a BB.bin file: {path} ({size} bytes)", path)
+
+
 def read_bbbin(path: str | os.PathLike[str]) -> xr.Dataset:
     """Read a BB.bin file into a dataset in the standard layout.
 
-    The whole file is read into memory. A BB.bin file is typically about 0.5 GiB, and
-    reading takes about twice its size at the peak, since the waveform is copied into
-    the standard order while the file's bytes are still held.
+    The whole waveform is read into memory. A BB.bin file is typically about 0.5 GiB.
+    Its traces are read a block of stations at a time, about 64 MiB of them, each
+    copied into the standard order as it is read (see
+    `waveform_compression_tools.legacy.standard_waveform`), so reading takes about the
+    file's size at the peak, and a block more.
 
     The file's byte order is the first of little-endian and big-endian in which the
     header's numbers of stations and samples make the file exactly as long as it is.
-    That is checked before the rest of the file is read. Every number in the dataset
-    is in the machine's byte order.
+    That is checked before the rest of the file is read, and the text before the
+    traces are. Every number in the dataset is in the machine's byte order.
 
     Parameters
     ----------
@@ -113,9 +133,9 @@ def read_bbbin(path: str | os.PathLike[str]) -> xr.Dataset:
         If `path` is not a BB.bin file: if it is shorter than a header, if neither
         byte order makes the header's numbers of stations and samples, both at least
         1, fit its size exactly, or if a station's name, or a string of the header, is
-        not ASCII.
-    ValueError
-        If the file shrinks while it is read.
+        not ASCII. A file that shrinks while it is read, so that by the time its
+        records or its traces are read it is shorter than its header says, is refused
+        as a file of its new size would be.
     """
     path = Path(path)
     with path.open("rb") as f:
@@ -123,23 +143,28 @@ def read_bbbin(path: str | os.PathLike[str]) -> xr.Dataset:
         head = f.read(_HEAD_BYTES)
         layout = legacy.layout(head, size, _HEAD_BYTES, _STATION_BYTES)
         if layout is None:
-            raise NotBBBin(f"not a BB.bin file: {path} ({size} bytes)", path)
+            raise _not_bbbin(path, size)
         endian, nstat, nt = layout
         records = f.read(nstat * _STATION_BYTES)
-        samples = f.read(nstat * nt * legacy.SAMPLE_BYTES)
-    stations = np.frombuffer(records, _station_dtype(endian), count=nstat)
-    # Text that isn't ASCII isn't changed into something that might differ from what
-    # the file holds.
-    try:
-        names = stations["name"].astype(str)
-        lf_dir, lf_vm, hf_file = (
-            np.frombuffer(head, "S256", count=3, offset=20).astype(str).tolist()
-        )
-    except UnicodeDecodeError as e:
-        raise NotBBBin(
-            f"not a BB.bin file: {path} holds text that isn't ASCII", path
-        ) from e
-    waveform = legacy.standard_waveform(samples, endian, nstat, nt)
+        # A record or a trace that the file doesn't hold means that it has shrunk since
+        # its size was checked.
+        if len(records) < nstat * _STATION_BYTES:
+            raise _not_bbbin(path, os.fstat(f.fileno()).st_size)
+        stations = np.frombuffer(records, _station_dtype(endian), count=nstat)
+        # Text that isn't ASCII isn't changed into something that might differ from
+        # what the file holds.
+        try:
+            names = stations["name"].astype(str)
+            lf_dir, lf_vm, hf_file = (
+                np.frombuffer(head, "S256", count=3, offset=20).astype(str).tolist()
+            )
+        except UnicodeDecodeError as e:
+            raise NotBBBin(
+                f"not a BB.bin file: {path} holds text that isn't ASCII", path
+            ) from e
+        waveform = legacy.standard_waveform(f, endian, nstat, nt)
+        if waveform is None:
+            raise _not_bbbin(path, os.fstat(f.fileno()).st_size)
     duration, dt, start_sec = (
         float(v) for v in np.frombuffer(head, f"{endian}f4", count=3, offset=8)
     )
@@ -180,7 +205,8 @@ def convert_bbbin(
     `read_bbbin` gives is then written by xarray with the h5netcdf engine to `dst` with
     ``.partial`` added, and renamed to `dst` when it is complete. If anything goes
     wrong, the partial file is deleted and the exception raised again; a file already
-    at `dst` is then as it was. As in `read_bbbin`, the whole file is read into memory.
+    at `dst` is then as it was. As in `read_bbbin`, the whole waveform is read into
+    memory, which takes about the file's size at the peak, and a block of 64 MiB more.
 
     Parameters
     ----------

@@ -1,16 +1,27 @@
 import tracemalloc
+from collections.abc import Callable
 from pathlib import Path
 
+import numpy as np
 import pytest
+import xarray as xr
 
-from waveform_compression_tools import files
+from waveform_compression_tools import files, legacy
+from waveform_compression_tools.bbbin import read_bbbin
 from waveform_compression_tools.files import (
     block_stations_for,
     compress_file,
     verify_file,
 )
+from waveform_compression_tools.hfbin import read_hfbin
 
-from helpers import StandardDataset, build_standard_dataset, write
+from helpers import (
+    StandardDataset,
+    build_standard_dataset,
+    write,
+    write_bbbin,
+    write_hfbin,
+)
 
 
 def test_block_sizes() -> None:
@@ -104,3 +115,32 @@ def test_peak_memory_stays_flat(
     few, many, long = (peaks[size] for size in SIZES)
     assert many < 1.5 * few and few < 1.5 * many
     assert long < 1.5 * few and few < 1.5 * long
+
+
+@pytest.mark.parametrize(
+    ("read_legacy", "write_legacy"),
+    [(read_bbbin, write_bbbin), (read_hfbin, write_hfbin)],
+    ids=["BB.bin", "HF.bin"],
+)
+def test_a_legacy_file_is_read_a_block_of_stations_at_a_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    read_legacy: Callable[[Path], xr.Dataset],
+    write_legacy: Callable[..., np.ndarray],
+) -> None:
+    # Each block of traces is copied into place as it is read, so reading the file
+    # takes little more than its waveform at the peak, not the file's traces too. The
+    # 3 MB of traces of 252 stations of 1,000 samples come in a budget of 64 KiB as 50
+    # blocks of 5 stations and a last block of 2.
+    monkeypatch.setattr(legacy, "BLOCK_BYTES", 64 * 2**10)
+    path = tmp_path / "legacy.bin"
+    data = write_legacy(path, 252, 1_000)
+    read_legacy(path)  # Untraced, which loads what loads on first use.
+    tracemalloc.start()
+    try:
+        waveform = read_legacy(path)["waveform"].values
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 1.25 * data.nbytes
+    np.testing.assert_array_equal(waveform, np.moveaxis(data[:, :, [1, 0, 2]], 2, 0))

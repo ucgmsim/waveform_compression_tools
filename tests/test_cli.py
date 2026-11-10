@@ -15,7 +15,7 @@ import pytest
 import xarray as xr
 from typer.testing import CliRunner, Result
 
-from waveform_compression_tools import bbbin, cli, files
+from waveform_compression_tools import bbbin, cli, files, legacy
 from waveform_compression_tools.bbbin import read_bbbin
 from waveform_compression_tools.cli import (
     EXIT_FAILED,
@@ -672,6 +672,40 @@ def test_decompress_verify_and_convert_use_the_same_codes(
     reason = assert_stopped(run(command, *args), EXIT_REFUSED, args[named])
     assert word in reason
     assert contents(tmp_path) == before  # Nothing is written.
+
+
+@pytest.mark.parametrize("cut", ["in its records", "in its traces"])
+@pytest.mark.parametrize(
+    ("command", "head_bytes"), [("convert-bbbin", 0x500), ("convert-hfbin", 0x200)]
+)
+def test_a_legacy_file_that_shrinks_as_it_is_read_is_refused(
+    tmp_path: Path,
+    standard_dataset: StandardDataset,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    head_bytes: int,
+    cut: str,
+) -> None:
+    # A file as long as its header says when that is checked, but shorter by the time
+    # its records or its traces are read, has been cut short meanwhile. Its line names
+    # SRC, and is the one that converting it again gives. The file is cut first, and
+    # the size check is given the size it had, since a cut after the check might not
+    # be seen: the reader may hold the whole of a small file once it has the header.
+    src, dst = an_input(command, tmp_path, standard_dataset), tmp_path / "out.nc"
+    whole = src.stat().st_size
+    os.truncate(src, head_bytes + 1 if cut == "in its records" else whole - 1)
+    check = legacy.layout
+
+    def check_as_whole(
+        head: bytes, size: int, head_bytes: int, station_bytes: int
+    ) -> tuple[str, int, int] | None:
+        return check(head, whole, head_bytes, station_bytes)
+
+    monkeypatch.setattr(legacy, "layout", check_as_whole)
+    reason = assert_stopped(run(command, src, dst), EXIT_REFUSED, src)
+    monkeypatch.undo()
+    assert assert_stopped(run(command, src, dst), EXIT_REFUSED, src) == reason
+    assert names_in(tmp_path) == [src.name]
 
 
 @pytest.mark.parametrize(

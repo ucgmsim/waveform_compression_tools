@@ -644,9 +644,10 @@ def convert_bbbin(
     """Convert a BB.bin file to a netCDF file.
 
     BB.bin is the legacy layout of a simulation's broadband waveforms. DST is in the
-    standard layout, which the compress command takes. The whole BB.bin file is read
-    into memory, which takes about twice its size at the peak. The file appears at DST
-    only when it is complete. A file already at DST is replaced only with --overwrite.
+    standard layout, which the compress command takes. The whole waveform is read into
+    memory, a block of stations at a time, which takes about the BB.bin's size at the
+    peak, and 64 MiB more. The file appears at DST only when it is complete. A file
+    already at DST is replaced only with --overwrite.
 
     The command exits with status 0 when the file is converted, 1 when the run fails,
     2 for a usage error, and 3 when SRC is refused, as a file that can't be a BB.bin
@@ -693,9 +694,10 @@ def convert_hfbin(
 
     HF.bin is the legacy layout of a simulation's high-frequency waveforms. DST is in
     the standard layout, which the compress command takes, with the acceleration in
-    cm/s^2, as the HF.bin holds it. The whole HF.bin file is read into memory, which
-    takes about twice its size at the peak. The file appears at DST only when it is
-    complete. A file already at DST is replaced only with --overwrite.
+    cm/s^2, as the HF.bin holds it. The whole waveform is read into memory, a block of
+    stations at a time, which takes about the HF.bin's size at the peak, and 64 MiB
+    more. The file appears at DST only when it is complete. A file already at DST is
+    replaced only with --overwrite.
 
     An HF.bin in which a station's vs is 0 is unfinished, since the run that wrote it
     stopped before that station was done. It is refused, and the error line says how

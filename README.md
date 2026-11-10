@@ -183,7 +183,7 @@ A file that doesn't pass exits with status 1, with a line such as `waveform-comp
 waveform-compression-tools convert-bbbin BB.bin bb.nc
 ```
 
-A BB.bin file holds the broadband acceleration that a simulation recorded at its stations, in g: a header, a record for each station, then the traces. `convert-bbbin` writes it as a netCDF file in the standard layout, ready for `compress`: the waveform with the components `000`, `090`, `ver` in that order (the file holds 090, 000, ver), the station names, `latitude`, `longitude` and `time` coordinates, the stations' other fields as variables, and the header's values as attributes, with `source_format = "BB.bin"`. The whole BB.bin file is read into memory, which takes about twice its size at the peak.
+A BB.bin file holds the broadband acceleration that a simulation recorded at its stations, in g: a header, a record for each station, then the traces. `convert-bbbin` writes it as a netCDF file in the standard layout, ready for `compress`: the waveform with the components `000`, `090`, `ver` in that order (the file holds 090, 000, ver), the station names, `latitude`, `longitude` and `time` coordinates, the stations' other fields as variables, and the header's values as attributes, with `source_format = "BB.bin"`. The whole waveform is read into memory, a block of stations at a time, which takes about the file's size at the peak, and 64 MiB more: converting a synthetic BB.bin of 0.36 GB peaked at 0.54 GB of resident memory, the program's own 0.11 GB included.
 
 ### convert-hfbin
 
@@ -203,7 +203,7 @@ An HF.bin file holds the high-frequency acceleration that a simulation computed 
 | its 24 float32: `duration`, `dt`, `start_sec`, `sdrop`, `kappa`, `qfexp`, `fmax`, `flo`, `fhi`, `rvfac`, `rvfac_shal`, `rvfac_deep`, `czero`, `calpha`, `mom`, `rupv`, `vs_moho`, `vp_sig`, `vsh_sig`, `rho_sig`, `qs_sig`, `fa_sig1`, `fa_sig2` and `rv_sig1` | float32 attributes of the same names |
 | its two strings of 64 bytes, `stoch_file` and `velocity_model`, padded with NULs | text attributes of the same names, without the NULs |
 
-The file also has a `time` coordinate, in float64, `start_sec + dt * arange(nt)`, and the attribute `source_format = "HF.bin"`. The whole HF.bin file is read into memory, which takes about twice its size at the peak: converting a synthetic HF.bin of 0.36 GB peaked at 0.83 GB of resident memory.
+The file also has a `time` coordinate, in float64, `start_sec + dt * arange(nt)`, and the attribute `source_format = "HF.bin"`. As for a BB.bin, the whole waveform is read into memory, a block of stations at a time, which takes about the file's size at the peak, and 64 MiB more: converting a synthetic HF.bin of 0.36 GB peaked at 0.54 GB of resident memory.
 
 The writer of an HF.bin fills in each station's `vs` once that station is done, so a file in which any station's `vs` is 0 is unfinished. It is refused, and the error line says how many stations are unfinished, as `waveform-compression-tools: HF.bin: is incomplete, with 2 of its 120 stations unfinished: their vs is 0`. A run that stopped before it had written the last station's traces leaves a file shorter than its header says, and that is refused as not an HF.bin.
 

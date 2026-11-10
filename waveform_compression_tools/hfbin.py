@@ -117,12 +117,31 @@ def _station_dtype(endian: str) -> np.dtype:
     )
 
 
+def _not_hfbin(path: Path, size: int) -> NotHFBin:
+    """Refuse a file whose size doesn't fit its header.
+
+    Parameters
+    ----------
+    path : Path
+        The file.
+    size : int
+        Its size in bytes, as it was found.
+
+    Returns
+    -------
+    NotHFBin
+        The refusal, which names the file and gives its size.
+    """
+    return NotHFBin(f"not an HF.bin file: {path} ({size} bytes)", path)
+
+
 def read_hfbin(path: str | os.PathLike[str]) -> xr.Dataset:
     """Read an HF.bin file into a dataset in the standard layout.
 
-    The whole file is read into memory, and reading takes about twice its size at the
-    peak, since the waveform is copied into the standard order while the file's bytes
-    are still held.
+    The whole waveform is read into memory. Its traces are read a block of stations at
+    a time, about 64 MiB of them, each copied into the standard order as it is read
+    (see `waveform_compression_tools.legacy.standard_waveform`), so reading takes about
+    the file's size at the peak, and a block more.
 
     The file's byte order is the first of little-endian and big-endian in which the
     header's numbers of stations and samples make the file exactly as long as it is.
@@ -156,12 +175,12 @@ def read_hfbin(path: str | os.PathLike[str]) -> xr.Dataset:
         If `path` is not an HF.bin file: if it is shorter than a header, if neither
         byte order makes the header's numbers of stations and samples, both at least
         1, fit its size exactly, or if a station's name, or a string of the header, is
-        not ASCII.
+        not ASCII. A file that shrinks while it is read, so that by the time its
+        records or its traces are read it is shorter than its header says, is refused
+        as a file of its new size would be.
     IncompleteHFBin
         If a station's vs is 0, so the run that wrote the file stopped before that
         station was done. The message says how many stations are unfinished.
-    ValueError
-        If the file shrinks while it is read.
     """
     path = Path(path)
     with path.open("rb") as f:
@@ -169,9 +188,13 @@ def read_hfbin(path: str | os.PathLike[str]) -> xr.Dataset:
         head = f.read(_HEAD_BYTES)
         layout = legacy.layout(head, size, _HEAD_BYTES, _STATION_BYTES)
         if layout is None:
-            raise NotHFBin(f"not an HF.bin file: {path} ({size} bytes)", path)
+            raise _not_hfbin(path, size)
         endian, nstat, nt = layout
         records = f.read(nstat * _STATION_BYTES)
+        # A record or a trace that the file doesn't hold means that it has shrunk since
+        # its size was checked.
+        if len(records) < nstat * _STATION_BYTES:
+            raise _not_hfbin(path, os.fstat(f.fileno()).st_size)
         stations = np.frombuffer(records, _station_dtype(endian), count=nstat)
         # Text that isn't ASCII isn't changed into something that might differ from
         # what the file holds.
@@ -192,8 +215,9 @@ def read_hfbin(path: str | os.PathLike[str]) -> xr.Dataset:
                 path,
             )
         # Only a file that can be converted has its traces read.
-        samples = f.read(nstat * nt * legacy.SAMPLE_BYTES)
-    waveform = legacy.standard_waveform(samples, endian, nstat, nt)
+        waveform = legacy.standard_waveform(f, endian, nstat, nt)
+        if waveform is None:
+            raise _not_hfbin(path, os.fstat(f.fileno()).st_size)
     ints = np.frombuffer(head, f"{endian}i4", count=len(_INT_FIELDS))
     floats = np.frombuffer(
         head, f"{endian}f4", count=len(_FLOAT_FIELDS), offset=_FLOATS_AT
@@ -231,7 +255,8 @@ def convert_hfbin(
     `read_hfbin` gives is then written by xarray with the h5netcdf engine to `dst` with
     ``.partial`` added, and renamed to `dst` when it is complete. If anything goes
     wrong, the partial file is deleted and the exception raised again; a file already
-    at `dst` is then as it was. As in `read_hfbin`, the whole file is read into memory.
+    at `dst` is then as it was. As in `read_hfbin`, the whole waveform is read into
+    memory, which takes about the file's size at the peak, and a block of 64 MiB more.
 
     Parameters
     ----------
