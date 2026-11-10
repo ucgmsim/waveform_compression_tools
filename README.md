@@ -289,7 +289,7 @@ A path can be given as a string or as a `pathlib.Path` object.
 
 - `compress_file(src, dst, bits=32, level=5, block_stations=None, check=True, overwrite=False)` returns a `CompressResult`: `bytes_in` and `bytes_out`, `n_traces`, `n_exact` (the real stations), `bits`, `max_relative_error` (None without the check), `output_hash` (the output's content hash), the wall time spent reading, encoding, writing, checking and hashing, from `read_s` to `hash_s`, and the CPU time of the first four, from `read_cpu_s` to `check_cpu_s`. It first makes the checks of `check_compressible(src, dst, overwrite)`: DST's, its folder included, and then the refusals of SRC that need no samples; `check_compressible` can be called on its own.
 - `verify_file(original, compressed, block_stations=None)` returns a `VerifyResult`: `passed`, `max_relative_error`, `n_exact` and `verify_s`. A file that doesn't agree gives `passed=False`; it doesn't raise.
-- `decompress_file(path)` returns the original dataset, loaded into memory. `decompress_to(src, dst, overwrite=False)` writes the same dataset to a netCDF file, through a `.partial`, a block of stations at a time, so its memory doesn't grow with the file.
+- `decompress_file(path)` returns the original dataset, loaded into memory. `decompress_to(src, dst, overwrite=False)` writes the same dataset to a netCDF file, through a `.partial`, a block of stations at a time, so its memory doesn't grow with the file, and returns the waveform's shape, (component, station, time).
 - `read_bbbin(path)` reads a BB.bin file into a dataset in the standard layout, and `convert_bbbin(src, dst, overwrite=False)` writes that dataset to a netCDF file, through a `.partial`.
 - `read_hfbin(path)` and `convert_hfbin(src, dst, overwrite=False)` do the same for an HF.bin file (see [convert-hfbin](#convert-hfbin)).
 - Every function that writes a file raises `FileNotFoundError`, naming the file, if there is no folder to write it in, before it reads its input.
@@ -402,10 +402,11 @@ q = decode_flac(stream)  # any FLAC decoder, to int32 samples
 trace = (q.astype(np.float64) / gain + offset).astype(np.float32)
 ```
 
-## Limits in 1.1.0
+## Limits in 1.2.0
 
 - A file that holds an HDF5 group besides its root is refused: xarray reads only the root group, so its compressed file would go without the group.
-- `decompress_file` loads the whole waveform into memory: 4 bytes a sample, and some working space. For a file whose waveform doesn't fit there, `decompress` and `decompress_to` write it to a netCDF file a block at a time.
+- `decompress_file` holds the whole waveform in memory: 4 bytes a sample, and some working space. For a file whose waveform doesn't fit there, `decompress` and `decompress_to` write it to a netCDF file a block at a time, and `open_dataset` reads only the part that is selected (see [Reading a few stations](#reading-a-few-stations)).
+- A time coordinate in CF units, such as `seconds since 2020-01-01`, that holds fractions of a second as floats may not compress. xarray decodes such times and encodes them again, and a fraction can come back as a slightly different float. Then compress's check fails, with `CheckFailed`, and nothing is written. Times held as integers, or as whole seconds, compress.
 - A file compressed in more than one block (see [Blocks and memory](#blocks-and-memory)) holds up to 1 MiB more than its streams need. They grow a block at a time, in chunks of 1 MiB, or of the first block's streams if those are smaller, and HDF5 keeps every chunk whole, however little of it is filled. A file compressed in one block keeps its streams in exactly their size.
 
 ## Developing
