@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
+import waveform_compression_tools
 from waveform_compression_tools import codec, open_dataset
 from waveform_compression_tools.errors import NotCompressed, UnknownFormat
 from waveform_compression_tools.files import GROUP, compress_file, decompress_file
@@ -459,6 +460,12 @@ def test_xarray_opens_a_compressed_file_with_its_engine(
     assert_same(got, decompress_file(path).drop_vars("vs30").isel(station=[2, 5]))
     with pytest.raises(TypeError, match="by its path"):
         xr.open_dataset(io.BytesIO(path.read_bytes()), engine=engine)
+
+
+def test_the_package_lists_open_dataset_among_its_names() -> None:
+    # IPython offers the names that dir lists, and the package imports open_dataset
+    # only once it is used.
+    assert "open_dataset" in dir(waveform_compression_tools)
 
 
 def test_importing_the_package_and_its_engine_imports_neither_h5py_nor_pyflac(

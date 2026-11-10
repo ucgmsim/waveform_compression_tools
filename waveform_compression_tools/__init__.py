@@ -25,3 +25,11 @@ def __getattr__(name: str) -> object:
 
         return open_dataset
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """List `open_dataset` among the package's names, though it isn't imported yet.
+
+    `dir`, and with it IPython's completion, would otherwise leave it out.
+    """
+    return sorted({*globals(), "open_dataset"})

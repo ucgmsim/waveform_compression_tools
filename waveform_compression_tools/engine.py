@@ -27,6 +27,10 @@ class FlacBackendEntrypoint(BackendEntrypoint):
 
     description = "Open a compressed file, decoding only the traces read"
     url = "https://github.com/ucgmsim/waveform_compression_tools"
+    # xarray otherwise reads these from open_dataset's signature, but only as it lists
+    # its engines: until then, the class given itself as the engine fails on
+    # decode_cf=False with a TypeError that names no option.
+    open_dataset_parameters = ("filename_or_obj", "drop_variables")
 
     def open_dataset(
         self,
