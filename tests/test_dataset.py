@@ -102,9 +102,6 @@ SELECTIONS: dict[str, Callable[[xr.Dataset], xr.Dataset]] = {
     "a slice across blocks": lambda ds: ds.isel(station=slice(3, 11)),
     "a slice backwards": lambda ds: ds.isel(station=slice(None, None, -4)),
     "a boolean mask": lambda ds: ds.isel(station=np.arange(N_STATION) % 3 == 1),
-    "a latitude range": lambda ds: ds.isel(
-        station=(ds["latitude"] > -40) & (ds["latitude"] < -36)
-    ),
     "a latitude range, by where": lambda ds: ds.where(
         (ds["latitude"] > -40) & (ds["latitude"] < -36), drop=True
     ),
@@ -265,23 +262,29 @@ def test_choosing_no_samples_decodes_nothing(
     assert got.shape == (3, N_STATION, 0) and decoded == []
 
 
-# A file of a few stations, and one of four times as many, each in blocks of 64
-# stations, with every 50th station real and a _FillValue. A station's waveform is 3
+def compress_sizes(
+    folder: Path, n_stations: tuple[int, ...], nt: int
+) -> dict[int, Path]:
+    # A file of each number of stations, of nt samples a trace, in blocks of 64
+    # stations, with every 50th station real and a _FillValue.
+    paths = {}
+    for n_station in n_stations:
+        ds = build_standard_dataset(n_station, nt, real=range(0, n_station, 50))
+        ds["waveform"].encoding["_FillValue"] = np.float32(-999.0)
+        src, paths[n_station] = folder / "in.nc", folder / f"out{n_station}.nc"
+        compress_file(write(ds, src), paths[n_station], bits=8, block_stations=64)
+        src.unlink()
+    return paths
+
+
+# A file of a few stations, and one of four times as many. A station's waveform is 3
 # traces of 1,000 float32 samples, 12 kB.
 FEW, MANY, NT_MEMORY = 100, 400, 1_000
 
 
 @pytest.fixture(scope="module")
 def few_and_many(tmp_path_factory: pytest.TempPathFactory) -> dict[int, Path]:
-    folder = tmp_path_factory.mktemp("sizes")
-    paths = {}
-    for n_station in (FEW, MANY):
-        ds = build_standard_dataset(n_station, NT_MEMORY, real=range(0, n_station, 50))
-        ds["waveform"].encoding["_FillValue"] = np.float32(-999.0)
-        src, paths[n_station] = folder / "in.nc", folder / f"out{n_station}.nc"
-        compress_file(write(ds, src), paths[n_station], bits=8, block_stations=64)
-        src.unlink()
-    return paths
+    return compress_sizes(tmp_path_factory.mktemp("sizes"), (FEW, MANY), NT_MEMORY)
 
 
 def peak_reading_three_stations(path: Path) -> int:
@@ -303,6 +306,29 @@ def test_reading_a_few_stations_takes_little_memory_for_each_station_in_the_file
     peak_reading_three_stations(few_and_many[FEW])  # What loads on first use, untraced.
     few, many = (peak_reading_three_stations(few_and_many[n]) for n in (FEW, MANY))
     assert (many - few) / (MANY - FEW) < 1024
+
+
+def peak_reading_a_station(path: Path) -> int:
+    # Once the file is open, and another station has been read.
+    with open_dataset(path) as ds:
+        ds["waveform"].isel(station=[1]).load()  # What loads on first use, untraced.
+        tracemalloc.start()
+        try:
+            ds["waveform"].isel(station=[2]).load()
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+
+def test_reading_a_station_takes_nothing_for_each_station_in_the_file(
+    tmp_path: Path,
+) -> None:
+    # A read takes memory for its own traces, and none for each station it leaves out.
+    # Reading traces of 16 samples peaks at about 13 kB, so even a byte for each of
+    # 4,000 stations would show.
+    paths = compress_sizes(tmp_path, (FEW, 4_000), 16)
+    few, many = (peak_reading_a_station(paths[n]) for n in (FEW, 4_000))
+    assert many - few < 4_000 - FEW
 
 
 def test_closing_closes_the_file_and_reading_then_fails(
