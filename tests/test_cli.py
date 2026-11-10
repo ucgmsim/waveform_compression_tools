@@ -4,6 +4,7 @@ import logging
 import logging.handlers
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ from waveform_compression_tools.files import (
     is_compressed,
     verify_file,
 )
+from waveform_compression_tools.hfbin import read_hfbin
 from waveform_compression_tools.quantise import full_scale, quantise
 from waveform_compression_tools.stream import encode_stream
 
@@ -53,6 +55,7 @@ from helpers import (
     with_a_flipped_byte,
     write,
     write_bbbin,
+    write_hfbin,
 )
 
 runner = CliRunner()
@@ -61,6 +64,8 @@ runner = CliRunner()
 PROGRAM = "waveform-compression-tools"
 # The least time a hash is made to take, where the record's timings are checked.
 HASH_S = 0.02
+# The commands that write a file, each from an input of its own kind (see an_input).
+WRITING = ["compress", "decompress", "convert-bbbin", "convert-hfbin"]
 
 
 def run(*args: str | int | Path) -> Result:
@@ -121,10 +126,14 @@ def compressed_file(ds: xr.Dataset, tmp_path: Path) -> tuple[Path, Path]:
 
 def an_input(command: str, folder: Path, standard_dataset: StandardDataset) -> Path:
     # A file that the command takes: a netCDF file with a real station for compress, the
-    # file compressed from it for decompress, and a BB.bin for convert-bbbin.
+    # file compressed from it for decompress, a BB.bin for convert-bbbin, and an HF.bin
+    # for convert-hfbin.
     if command == "convert-bbbin":
         write_bbbin(folder / "BB.bin", 3, 200, names=["S000000", "S000001", "KIKS"])
         return folder / "BB.bin"
+    if command == "convert-hfbin":
+        write_hfbin(folder / "HF.bin", 3, 200, names=["S000000", "S000001", "KIKS"])
+        return folder / "HF.bin"
     src = write(standard_dataset(3, nt=200, real=(2,)), folder / "in.nc")
     if command == "compress":
         return src
@@ -146,26 +155,35 @@ def assert_complete(
     command: str, src: Path, dst: Path, rec: Path | None = None
 ) -> None:
     # The output that the command wrote from src is whole: compress's passes verify, and
-    # its record at rec, if given, says so; decompress's and convert-bbbin's hold what
+    # its record at rec, if given, says so; decompress's and the converters' hold what
     # the library reads from src.
     if command == "compress":
         assert verify_file(src, dst).passed
         assert rec is None or read_record(rec)["status"] == "ok"
         return
-    expected = decompress_file(src) if command == "decompress" else read_bbbin(src)
-    xr.testing.assert_identical(read(dst), expected)
+    reader = {
+        "decompress": decompress_file,
+        "convert-bbbin": read_bbbin,
+        "convert-hfbin": read_hfbin,
+    }[command]
+    xr.testing.assert_identical(read(dst), reader(src))
 
 
-def test_compress_then_verify(tmp_path: Path) -> None:
-    # Each command in turn, on what the one before it wrote. Each exits with status 0
-    # and says nothing on stderr; its output is at its destination; and the files it
-    # read are as they were.
-    bb, nc, packed, back = (
-        tmp_path / name for name in ("BB.bin", "BB.nc", "BB.flac.nc", "back.nc")
-    )
-    write_bbbin(bb, 3, 200, names=["S000000", "S000001", "KIKS"])
+@pytest.mark.parametrize(
+    ("convert", "stem", "write_legacy"),
+    [("convert-bbbin", "BB", write_bbbin), ("convert-hfbin", "HF", write_hfbin)],
+)
+def test_compress_then_verify(
+    tmp_path: Path, convert: str, stem: str, write_legacy: Callable[..., np.ndarray]
+) -> None:
+    # Each command in turn, on what the one before it wrote, from a BB.bin or an HF.bin.
+    # Each exits with status 0 and says nothing on stderr; its output is at its
+    # destination; and the files it read are as they were.
+    file_names = [f"{stem}.bin", f"{stem}.nc", f"{stem}.flac.nc", "back.nc"]
+    legacy, nc, packed, back = (tmp_path / name for name in file_names)
+    write_legacy(legacy, 3, 200, names=["S000000", "S000001", "KIKS"])
     steps = [
-        (("convert-bbbin", bb, nc), [bb], nc),
+        ((convert, legacy, nc), [legacy], nc),
         (("compress", nc, packed), [nc], packed),
         (("verify", nc, packed), [nc, packed], None),
         (("decompress", packed, back), [packed], back),
@@ -178,7 +196,7 @@ def test_compress_then_verify(tmp_path: Path) -> None:
         assert output is None or output.is_file(), args
         assert [path.read_bytes() for path in inputs] == before, args
     # Nothing else, no partial file included, was left behind.
-    assert names_in(tmp_path) == ["BB.bin", "BB.flac.nc", "BB.nc", "back.nc"]
+    assert names_in(tmp_path) == sorted(file_names)
 
 
 @pytest.mark.parametrize(
@@ -437,7 +455,7 @@ def test_a_record_that_cannot_be_written_fails_naming_it(
         assert not dst.exists()
 
 
-@pytest.mark.parametrize("command", ["compress", "decompress", "convert-bbbin"])
+@pytest.mark.parametrize("command", WRITING)
 def test_a_stale_partial_is_replaced_and_the_rerun_succeeds(
     tmp_path: Path, standard_dataset: StandardDataset, command: str
 ) -> None:
@@ -457,7 +475,7 @@ def test_a_stale_partial_is_replaced_and_the_rerun_succeeds(
     assert_complete(command, src, dst, rec)
 
 
-@pytest.mark.parametrize("command", ["compress", "decompress", "convert-bbbin"])
+@pytest.mark.parametrize("command", WRITING)
 def test_a_link_at_a_partial_name_is_removed_not_written_through(
     tmp_path: Path, standard_dataset: StandardDataset, command: str
 ) -> None:
@@ -486,6 +504,7 @@ def test_a_link_at_a_partial_name_is_removed_not_written_through(
         ("compress", "--record"),
         ("decompress", "DST"),
         ("convert-bbbin", "DST"),
+        ("convert-hfbin", "DST"),
     ],
 )
 def test_a_missing_destination_folder_fails_naming_the_file(
@@ -575,7 +594,7 @@ def test_bits_out_of_range_is_a_usage_error(
     assert names_in(tmp_path) == ["in.nc"]
 
 
-# What decompress, verify and convert-bbbin each refuse, as compress refuses its own:
+# What decompress, verify and the converters each refuse, as compress refuses its own:
 # which of their two arguments the line names, and a word of its reason. Their
 # failures are the damage table's and the failed write's.
 SAME_CODES = [
@@ -591,6 +610,9 @@ SAME_CODES = [
     ("verify", "an original that is a text file", 0, "isn't an HDF5 file"),
     ("convert-bbbin", "a file that isn't a BB.bin", 0, "not a BB.bin file"),
     ("convert-bbbin", "text that isn't ASCII", 0, "ASCII"),
+    ("convert-hfbin", "a file that isn't an HF.bin", 0, "not an HF.bin file"),
+    ("convert-hfbin", "text that isn't ASCII", 0, "ASCII"),
+    ("convert-hfbin", "an unfinished HF.bin", 0, "with 2 of its 3 stations unfinished"),
 ]
 
 
@@ -627,17 +649,24 @@ def test_decompress_verify_and_convert_use_the_same_codes(
         ds = standard_dataset(3, nt=100)
         ds["waveform"] = ds["waveform"].astype(np.float64)
         original = write(ds, tmp_path / "float64.nc")
-    bb = tmp_path / "BB.bin"
+    bb, hf = tmp_path / "BB.bin", tmp_path / "HF.bin"
     if case == "a file that isn't a BB.bin":
         bb.write_bytes(bytes(2000))
     else:
         write_bbbin(bb, 2, 20, names=["Ōtaki", "S000001"])
-    # Decompress and convert-bbbin take the file and where to write; verify takes the
+    if case == "a file that isn't an HF.bin":
+        hf.write_bytes(bytes(2000))
+    elif case == "an unfinished HF.bin":
+        write_hfbin(hf, 3, 20, unfinished=(0, 2))
+    else:
+        write_hfbin(hf, 2, 20, names=["Ōtaki", "S000001"])
+    # Decompress and the converters take the file and where to write; verify takes the
     # original and the compressed file.
     args = {
         "decompress": (packed, tmp_path / "out.nc"),
         "verify": (original, packed),
         "convert-bbbin": (bb, tmp_path / "BB.nc"),
+        "convert-hfbin": (hf, tmp_path / "HF.nc"),
     }[command]
     before = contents(tmp_path)
     reason = assert_stopped(run(command, *args), EXIT_REFUSED, args[named])
@@ -651,6 +680,7 @@ def test_decompress_verify_and_convert_use_the_same_codes(
         ("compress", "DST"),
         ("decompress", "DST"),
         ("convert-bbbin", "DST"),
+        ("convert-hfbin", "DST"),
         ("compress", "a record"),
         ("compress", "a finished run"),
     ],
@@ -763,7 +793,7 @@ def test_a_damaged_file_fails_the_check(
 # What each command's line gives when its write fails, or None where the failure is an
 # interruption, which isn't caught. The unexpected error's message is of two lines, as
 # some of xarray's are, which the line joins into one.
-@pytest.mark.parametrize("command", ["compress", "decompress", "convert-bbbin"])
+@pytest.mark.parametrize("command", WRITING)
 @pytest.mark.parametrize(
     ("error", "shown"),
     [
@@ -808,7 +838,7 @@ def test_a_failed_write_leaves_no_partial_file_and_keeps_the_old_one(
         # A failure, an unexpected one with its type. An OSError as the output is
         # written names the output, whichever command writes it. Compress names its
         # input for anything else that goes wrong while it compresses, but for a refusal
-        # to write or a failed check; decompress and convert-bbbin name the file they
+        # to write or a failed check; decompress and the converters name the file they
         # were writing.
         named = src if command == "compress" and not isinstance(error, OSError) else dst
         assert shown in assert_stopped(result, EXIT_FAILED, named)
@@ -817,7 +847,7 @@ def test_a_failed_write_leaves_no_partial_file_and_keeps_the_old_one(
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root can write in any folder")
-@pytest.mark.parametrize("command", ["compress", "decompress", "convert-bbbin"])
+@pytest.mark.parametrize("command", WRITING)
 def test_a_folder_that_cant_be_written_in_fails_naming_the_output(
     tmp_path: Path, standard_dataset: StandardDataset, command: str
 ) -> None:
@@ -870,6 +900,7 @@ def test_a_record_that_cant_be_written_fails_naming_the_record(
         ("compress", ["--no-check"], "at the last byte"),
         ("decompress", [], "halfway"),
         ("convert-bbbin", [], "halfway"),
+        ("convert-hfbin", [], "halfway"),
     ],
 )
 def test_a_disk_that_fills_partway_fails_the_run_naming_the_output(
@@ -942,7 +973,7 @@ def test_importing_the_command_line_leaves_logging_alone(tmp_path: Path) -> None
     assert imported.returncode == 0, imported.stderr
 
 
-@pytest.mark.parametrize("command", ["compress", "decompress", "convert-bbbin"])
+@pytest.mark.parametrize("command", WRITING)
 @pytest.mark.parametrize("src_name", ["data.nc", "data.nc.partial"])
 def test_a_command_will_not_write_over_its_source(
     tmp_path: Path,
@@ -964,8 +995,10 @@ def test_a_command_will_not_write_over_its_source(
     elif command == "decompress":
         original = write(standard_dataset(2, nt=50), tmp_path / "original.nc")
         assert_exit(run("compress", original, src), EXIT_OK)
-    else:
+    elif command == "convert-bbbin":
         write_bbbin(src, 2, 20, names=["S000000", "S000001"])
+    else:
+        write_hfbin(src, 2, 20, names=["S000000", "S000001"])
     before = src.read_bytes()
     result = run(command, src, dst, "--overwrite")
     assert "overwrite" in assert_stopped(result, EXIT_REFUSED, dst)
@@ -1002,8 +1035,9 @@ SOURCES = [
     ("verify", 0),
     ("verify", 1),
     ("convert-bbbin", 0),
+    ("convert-hfbin", 0),
 ]
-DESTINATIONS = [("compress", 1), ("decompress", 1), ("convert-bbbin", 1)]
+DESTINATIONS = [(command, 1) for command in WRITING]
 
 
 # A source that doesn't exist, and a folder where any file is named.

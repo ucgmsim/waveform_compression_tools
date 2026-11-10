@@ -1,6 +1,6 @@
-"""The command line: compress, decompress and verify waveform files, and convert BB.bin.
+"""The command line: compress, decompress and verify waveform files, and convert legacy ones.
 
-``waveform-compression-tools`` has four commands, each a thin layer over this package:
+``waveform-compression-tools`` has five commands, each a thin layer over this package:
 
 - ``compress SRC DST``: `waveform_compression_tools.files.compress_file`, which checks
   the file it writes, with a JSON record of the run if asked (see
@@ -8,7 +8,8 @@
 - ``decompress SRC DST``: `waveform_compression_tools.files.decompress_file`, written
   to a netCDF file;
 - ``verify ORIGINAL COMPRESSED``: `waveform_compression_tools.files.verify_file`;
-- ``convert-bbbin SRC DST``: `waveform_compression_tools.bbbin.convert_bbbin`.
+- ``convert-bbbin SRC DST``: `waveform_compression_tools.bbbin.convert_bbbin`;
+- ``convert-hfbin SRC DST``: `waveform_compression_tools.hfbin.convert_hfbin`.
 
 Every command exits with one of four statuses, which are published: `EXIT_OK` when it
 succeeds; `EXIT_FAILED` when the run goes wrong, as when a file can't be read or
@@ -33,7 +34,7 @@ from typing import Annotated, NoReturn
 import pyflac
 import typer
 
-from . import bbbin, destinations, files
+from . import bbbin, destinations, files, hfbin
 from .content_hash import content_hash
 from .errors import CheckFailed, Refused, SameFile
 from .record import make_record, write_record
@@ -58,7 +59,7 @@ app = typer.Typer(
     rich_markup_mode=None,
 )
 
-# The destination of decompress and convert-bbbin, and their --overwrite.
+# The destination of decompress and the converters, and their --overwrite.
 _NetcdfDst = Annotated[
     Path,
     typer.Argument(
@@ -669,6 +670,60 @@ def convert_bbbin(
     try:
         with _about(dst):
             bbbin.convert_bbbin(src, dst, overwrite)
+    except _Stop as stop:
+        stop.exit()
+    typer.echo(
+        f"converted {src} to {dst}: "
+        f"{_size(src.stat().st_size)} -> {_size(dst.stat().st_size)}"
+    )
+
+
+@app.command()
+def convert_hfbin(
+    src: Annotated[
+        Path,
+        typer.Argument(
+            metavar="SRC", exists=True, dir_okay=False, help="The HF.bin file."
+        ),
+    ],
+    dst: _NetcdfDst,
+    overwrite: _Overwrite = False,
+) -> None:
+    """Convert an HF.bin file to a netCDF file.
+
+    HF.bin is the legacy layout of a simulation's high-frequency waveforms. DST is in
+    the standard layout, which the compress command takes, with the acceleration in
+    cm/s^2, as the HF.bin holds it. The whole HF.bin file is read into memory, which
+    takes about twice its size at the peak. The file appears at DST only when it is
+    complete. A file already at DST is replaced only with --overwrite.
+
+    An HF.bin in which a station's vs is 0 is unfinished, since the run that wrote it
+    stopped before that station was done. It is refused, and the error line says how
+    many stations are unfinished.
+
+    The command exits with status 0 when the file is converted, 1 when the run fails,
+    2 for a usage error, and 3 when SRC is refused, as a file that can't be an HF.bin
+    is, or one that is unfinished. A refusal or a failure is one line on standard
+    error.
+    \f
+    Parameters
+    ----------
+    src : Path
+        The HF.bin file.
+    dst : Path
+        Where to write the netCDF file.
+    overwrite : bool, default False
+        Whether to replace a file already at `dst`.
+
+    Raises
+    ------
+    typer.Exit
+        With `EXIT_REFUSED` if SRC is not an HF.bin file or is unfinished, or if DST is
+        SRC or is there already, and with `EXIT_FAILED` if the run fails.
+    """
+    try:
+        with _about(dst):
+            hfbin.convert_hfbin(src, dst, overwrite)
     except _Stop as stop:
         stop.exit()
     typer.echo(
