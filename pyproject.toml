@@ -26,6 +26,10 @@ dev = ["ruff", "deptry", "ty"]
 [project.scripts]
 waveform-compression-tools = "waveform_compression_tools.cli:app"
 
+# xarray's engine: xr.open_dataset(path, engine="waveform_compression_tools").
+[project.entry-points."xarray.backends"]
+waveform_compression_tools = "waveform_compression_tools.dataset:FlacBackendEntrypoint"
+
 [tool.deptry]
 optional_dependencies_dev_groups = ["test", "dev"]
 
