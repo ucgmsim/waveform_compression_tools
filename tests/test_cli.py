@@ -784,7 +784,11 @@ CHECK_DAMAGE = {
     + [("verify", damage) for damage in DAMAGE | CHECK_DAMAGE],
 )
 def test_a_damaged_file_fails_the_check(
-    tmp_path: Path, standard_dataset: StandardDataset, command: str, damage: str
+    tmp_path: Path,
+    standard_dataset: StandardDataset,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    damage: str,
 ) -> None:
     # 10,000 samples are two whole frames of 4,096 and a short third.
     ds = standard_dataset(3, nt=10_000)
@@ -825,41 +829,19 @@ def test_a_damaged_file_fails_the_check(
     if damage == "an original of another shape":
         original = write(ds.isel(station=slice(0, 2)), tmp_path / "other.nc")
     back = tmp_path / "back.nc"
+    if command == "decompress":
+        # decompress writes each block as it decodes it. In blocks of 2 stations, a
+        # damaged stream of station 2 is found in the second, as the file is written,
+        # here over an earlier one. The line names SRC all the same.
+        monkeypatch.setattr(files, "BLOCK_BYTES", 2 * 3 * 10_000 * 4)
+        back.write_bytes(b"an earlier file")
     before = contents(tmp_path)
     # Decompress takes the compressed file and where to write; verify takes the
     # original and the compressed file.
-    args = {"decompress": (packed, back), "verify": (original, packed)}[command]
-    reason = assert_stopped(run(command, *args), EXIT_FAILED, packed)
+    args = {"decompress": (packed, back, "--overwrite"), "verify": (original, packed)}
+    reason = assert_stopped(run(command, *args[command]), EXIT_FAILED, packed)
     assert (DAMAGE | CHECK_DAMAGE)[damage] in reason
-    assert contents(tmp_path) == before  # Nothing at DST, nor anywhere else.
-
-
-def test_a_damaged_stream_found_as_dst_is_written_names_src(
-    tmp_path: Path, standard_dataset: StandardDataset, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # decompress writes each block as it decodes it, so a damaged stream of a later
-    # block is found partway through the write. The line names SRC all the same, and
-    # DST is left as it was.
-    _, packed = compressed_file(standard_dataset(5, nt=100), tmp_path)
-    with h5py.File(packed, "r+") as f:
-        f[GROUP]["stream_bytes"][1, 3] = 0  # Station 3 is in the second block.
-    monkeypatch.setattr(files, "BLOCK_BYTES", 2 * 3 * 100 * 4)  # Blocks of 2 stations.
-    back = tmp_path / "back.nc"
-    back.write_bytes(b"an earlier file")
-    decode = files.decode_block
-    begun: list[bool] = []
-
-    def watched(*args: Any, **kwargs: Any) -> np.ndarray:
-        begun.append(partial_of(back).exists())  # Whether the write had begun.
-        return decode(*args, **kwargs)
-
-    monkeypatch.setattr(files, "decode_block", watched)
-    reason = assert_stopped(
-        run("decompress", packed, back, "--overwrite"), EXIT_FAILED, packed
-    )
-    assert "component 1, station 3: the stream decodes to 0 samples" in reason
-    assert begun == [True, True]
-    assert back.read_bytes() == b"an earlier file" and not partial_of(back).exists()
+    assert contents(tmp_path) == before  # Nothing new anywhere, and DST as it was.
 
 
 # What each command's line gives when its write fails, or None where the failure is an

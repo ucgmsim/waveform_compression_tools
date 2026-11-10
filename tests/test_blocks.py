@@ -1,6 +1,7 @@
 import tracemalloc
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -69,12 +70,12 @@ def _peak(step: str, src: Path, dst: Path, again: Path) -> int:
             compress_file(src, again)
         elif step == "decompress":
             decompress_to(dst, again)
+            again.unlink()  # A whole waveform, and the tests' folder is in memory.
         else:
             assert verify_file(src, dst).passed
         return tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
-        again.unlink(missing_ok=True)  # The tests' folder is in memory.
 
 
 # Some stations of 2,000 samples, four times as many stations, and four times as many
@@ -148,3 +149,43 @@ def test_a_legacy_file_is_read_a_block_of_stations_at_a_time(
         tracemalloc.stop()
     assert peak < 1.25 * data.nbytes
     np.testing.assert_array_equal(waveform, np.moveaxis(data[:, :, [1, 0, 2]], 2, 0))
+
+
+@pytest.mark.parametrize(
+    "compressed", ["in one block", "from an original chunked along station"]
+)
+def test_a_block_reads_only_its_own_streams(
+    tmp_path: Path,
+    compressed_sizes: dict[tuple[int, int], tuple[Path, Path]],
+    monkeypatch: pytest.MonkeyPatch,
+    compressed: str,
+) -> None:
+    # Decompress reads a file in blocks of its own, of 21 stations here, whatever blocks
+    # it was compressed in: one block, or whole chunks of 24 stations of an original
+    # chunked 8 stations at a time. compress lays out each of its blocks' streams one
+    # component after another, and a block reads only its own, so neither what it reads
+    # nor its peak follows the blocks the file was compressed in. The peak is the one
+    # for the same file compressed in decompress's own blocks.
+    monkeypatch.setattr(files, "BLOCK_BYTES", SMALL_BLOCK_BYTES)
+    n_station, nt = SIZES[0]
+    src, in_its_blocks = compressed_sizes[n_station, nt]
+    packed = tmp_path / "out.nc"
+    if compressed == "in one block":
+        compress_file(src, packed, block_stations=n_station)
+    else:
+        chunks = {"waveform": {"chunksizes": (1, 8, nt)}}
+        ds = build_standard_dataset(n_station, nt=nt)
+        compress_file(write(ds, tmp_path / "in.nc", encoding=chunks), packed)
+        (tmp_path / "in.nc").unlink()
+    read = files._Streams.read
+    unneeded: list[int] = []
+
+    def counted(self: Any, s0: int, s1: int) -> tuple[np.ndarray, np.ndarray]:
+        data, starts = read(self, s0, s1)
+        unneeded.append(data.nbytes - int(self.nbytes[:, s0:s1].sum()))
+        return data, starts
+
+    monkeypatch.setattr(files._Streams, "read", counted)
+    peak = _peak("decompress", src, packed, tmp_path / "back.nc")
+    assert unneeded and not any(unneeded)
+    assert peak < 1.25 * _peak("decompress", src, in_its_blocks, tmp_path / "back.nc")

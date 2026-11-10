@@ -613,6 +613,8 @@ def test_decompress_to_stops_at_the_end_of_a_block_and_hdf5_carries_on(
     [
         ("cut to nothing", "the stream decodes to 0 samples"),
         ("a flipped byte", "a FLAC stream is damaged"),
+        ("a length past the end of the file", "a FLAC stream is damaged"),
+        ("a start past the end of the file", "the stream decodes to 0 samples"),
     ],
 )
 def test_a_bad_stream_is_named_by_its_station_in_the_file(
@@ -625,12 +627,18 @@ def test_a_bad_stream_is_named_by_its_station_in_the_file(
 ) -> None:
     # In blocks of 2 stations, station 3 is the second of the second block: the message
     # counts it from the file's first station, not its block's. libFLAC's own error,
-    # for a stream it can't decode, is a ValueError's cause, not raised as it is.
+    # for a stream it can't decode, is a ValueError's cause, not raised as it is. The
+    # file is in one block, so a block of 2 reads a run of streams for each component,
+    # and a stream said to run past the end of the file is read as far as it goes.
     src, dst = write_and_compress(standard_dataset(5, nt=100), tmp_path)
     with h5py.File(dst, "r+") as f:
         g = f[GROUP]
         if damage == "cut to nothing":
             g["stream_bytes"][1, 3] = 0  # Station 3's second stream.
+        elif damage == "a length past the end of the file":
+            g["stream_bytes"][1, 3] = 2**40
+        elif damage == "a start past the end of the file":
+            g["stream_starts"][1, 3] = 2**40
         else:
             start, size = int(g["stream_starts"][1, 3]), int(g["stream_bytes"][1, 3])
             g["compressed"][start + size // 2] ^= 0xFF

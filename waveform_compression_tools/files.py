@@ -1146,7 +1146,13 @@ class _Streams:
         return n_component, n_station, self.nt
 
     def read(self, s0: int, s1: int) -> tuple[np.ndarray, np.ndarray]:
-        """Read the bytes of a block of stations' streams from the file.
+        """Read the bytes of a block of stations' streams from the file, and no others.
+
+        compress lays out each of its blocks' streams one component after another. So
+        a block it compressed is one run of streams, read at once, and any other block
+        is a run for each component of each of compress's blocks that it takes in.
+        Whatever blocks the file was compressed in, a block reads and holds only its
+        own streams, as far as the file holds them.
 
         Parameters
         ----------
@@ -1158,14 +1164,30 @@ class _Streams:
         Returns
         -------
         data : np.ndarray
-            The bytes the block's streams span, as uint8.
+            The bytes of the block's streams, as uint8.
         starts : np.ndarray
             Where each of the block's streams starts in `data`, of shape
             (component, s1 - s0).
         """
         starts, nbytes = self.starts[:, s0:s1], self.nbytes[:, s0:s1]
-        first, end = int(starts.min()), int((starts + nbytes).max())
-        return self.compressed[first:end], starts - first
+        size = self.compressed.shape[0]
+        low = np.clip(starts, 0, size)
+        high = np.clip(starts + nbytes, low, size)
+        # The streams in the order they lie in the file, in runs with nothing between.
+        order = np.argsort(low, axis=None)
+        lows, reach = low.flat[order], np.maximum.accumulate(high.flat[order])
+        bounds = np.r_[0, np.flatnonzero(lows[1:] > reach[:-1]) + 1, lows.size]
+        first, end = lows[bounds[:-1]], reach[bounds[1:] - 1]
+        if first.size == 1:
+            return self.compressed[first[0] : end[0]], low - first[0]
+        lengths = end - first
+        at = np.cumsum(lengths) - lengths  # Where each run goes in data.
+        data = np.empty(int(lengths.sum()), np.uint8)
+        for a, b, i in zip(first.tolist(), end.tolist(), at.tolist(), strict=True):
+            data[i : i + b - a] = self.compressed[a:b]
+        moved = np.empty_like(lows)
+        moved[order] = lows - np.repeat(first - at, np.diff(bounds))
+        return data, moved.reshape(starts.shape)
 
     def decode(
         self,
