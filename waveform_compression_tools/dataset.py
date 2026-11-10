@@ -45,6 +45,8 @@ class _OpenFile:
         The file, as an absolute path.
     named : Path
         The file as it was given, which an error's message names.
+    mode : str
+        How h5py opens the file, as xarray's file manager gives it: ``"r"``.
 
     Attributes
     ----------
@@ -61,8 +63,10 @@ class _OpenFile:
         If its arrays don't agree with each other.
     """
 
-    def __init__(self, path: Path, named: Path) -> None:  # numpydoc ignore=GL08
-        self._file = h5py.File(path, "r")
+    def __init__(
+        self, path: Path, named: Path, mode: str
+    ) -> None:  # numpydoc ignore=GL08
+        self._file = h5py.File(path, mode)
         try:
             self.streams = _open_streams(self._file, named)
         except BaseException:
@@ -83,9 +87,10 @@ class _CompressedFile:
     opened by its absolute path, so it is the same file whatever the working folder is
     by then. A file closed by `close` stays closed.
 
-    A deep copy of the dataset reads through the same file, since xarray's deep copy
-    shares an engine's arrays, and so it is closed with the dataset. A pickled copy
-    reads the file as the original does, since xarray's file manager pickles itself.
+    A deep copy of the dataset shares the file, and is closed with it: it reads through
+    this very object, which a deep copy doesn't copy. A pickled copy is a copy of its
+    own, as xarray's pickles are: it opens the file itself, in whatever process it is
+    read, and either one can still be read once the other is closed.
 
     Parameters
     ----------
@@ -100,8 +105,29 @@ class _CompressedFile:
 
     def __init__(self, path: Path) -> None:  # numpydoc ignore=GL08
         self.path = path
-        self._manager = CachingFileManager(_OpenFile, path.absolute(), path)
+        # A mode is given, as xarray's engines give one. xarray marks a manager given
+        # none with an object of its own, and a pickled or deep copy of the manager holds
+        # a copy of that object, which xarray takes for a mode to pass to `_OpenFile`.
+        self._manager = CachingFileManager(_OpenFile, path.absolute(), path, mode="r")
         self._closed = False
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "_CompressedFile":
+        """Give a deep copy this very object, so that it shares the file.
+
+        xarray's deep copy shares an engine's array, but not once a transpose has
+        dropped the wrapper that makes it do so.
+
+        Parameters
+        ----------
+        memo : dict
+            What the deep copy has copied so far.
+
+        Returns
+        -------
+        _CompressedFile
+            This object, not a copy.
+        """
+        return self
 
     @contextmanager
     def reading(self) -> Generator[_Streams]:

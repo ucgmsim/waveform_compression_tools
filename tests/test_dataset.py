@@ -125,7 +125,6 @@ SELECTIONS: dict[str, Callable[[xr.Dataset], xr.Dataset]] = {
         station=xr.DataArray([7, 4], dims="point"),
     ),
     "a deep copy": lambda ds: ds.copy(deep=True),
-    "pickled": lambda ds: pickle.loads(pickle.dumps(ds)),
 }
 
 
@@ -311,16 +310,31 @@ def test_closing_closes_the_file_and_reading_then_fails(
 ) -> None:
     path = Path(shutil.copy(compressed, tmp_path / "out.nc"))
     ds = open_dataset(path)
-    picked, copied = ds.isel(station=[1, 2]), ds.copy(deep=True)
+    picked = ds.isel(station=[1, 2])
+    # A transpose drops xarray's wrapper that makes a deep copy share the waveform's
+    # array, so a deep copy of one copies the array itself.
+    copies = ds.copy(deep=True), ds.transpose("station", ...).copy(deep=True)
     assert held_open(path)
     ds.close()
     assert not held_open(path)
     # A selection made before the file was closed fails too, and so does a deep copy,
     # which reads through the same file.
-    for waveform in (ds["waveform"], picked["waveform"], copied["waveform"]):
+    for selection in (ds, picked, *copies):
         with pytest.raises(ValueError, match=f"{re.escape(str(path))} is closed"):
-            waveform.load()
+            selection["waveform"].load()
     ds.close()  # Again, which does nothing.
+
+
+def test_a_pickled_copy_opens_the_file_itself(compressed: Path) -> None:
+    # Once the dataset is closed, the copy opens the file itself, as it would in another
+    # process.
+    with open_dataset(compressed) as ds:
+        copied = pickle.loads(pickle.dumps(ds))
+    with copied:
+        got = copied.isel(station=[2, 3, 4]).load()
+    # Pickled too, since pickling makes an encoding's dtype print as float64, not <f8.
+    want = pickle.loads(pickle.dumps(decompress_file(compressed)))
+    assert_same(got, want.isel(station=[2, 3, 4]))
 
 
 def test_several_datasets_can_be_open_at_once(compressed: Path, tmp_path: Path) -> None:
