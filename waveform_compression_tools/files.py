@@ -2039,13 +2039,16 @@ def _new_waveform(
         if dim not in nc.dimensions:
             nc.dimensions[dim] = size
     # Every sample is written, so HDF5 needn't write the fill value first, which would
-    # write the whole waveform twice.
+    # write a contiguous waveform twice. A waveform with an unlimited dimension is
+    # chunked, and its chunks are written whole (see _decompress_to), but it can grow,
+    # and what a later writer adds and doesn't write has to read as the fill value.
+    unlimited = any(nc.dimensions[dim].isunlimited() for dim in STANDARD_DIMS)
     variable = nc.create_variable(
         "waveform",
         STANDARD_DIMS,
         np.float32,
         fillvalue=streams.encoding.get("_FillValue"),
-        fill_time="never",
+        fill_time="ifset" if unlimited else "never",
     )
     # The coordinates along the waveform's dimensions, by name, as xarray lists them.
     along = sorted(
@@ -2120,7 +2123,9 @@ def _decompress_to(
             out.raise_pending()
             with h5netcdf.File(out, "r+") as nc:
                 waveform = _new_waveform(nc, rest, streams)
-                for s0, s1 in _station_blocks(streams.shape, None):
+                # A chunked waveform is written in whole chunks of stations, so that no
+                # chunk is written twice, and read back in between.
+                for s0, s1 in _station_blocks(streams.shape, waveform.chunks):
                     with about_file(src), naming(src):
                         block = _decompressed(streams, s0, s1)
                     waveform[:, s0:s1, :] = block

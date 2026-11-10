@@ -271,24 +271,54 @@ def test_decompress_to_writes_a_block_at_a_time_the_file_written_whole(
     assert netcdf_contents(back) == netcdf_contents(whole)
 
 
+@pytest.mark.parametrize("time", ["no time coordinate", "an unlimited time"])
 def test_decompress_to_writes_each_sample_once(
-    tmp_path: Path, standard_dataset: StandardDataset, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    standard_dataset: StandardDataset,
+    monkeypatch: pytest.MonkeyPatch,
+    time: str,
 ) -> None:
     # Written in blocks, a waveform with a _FillValue, as xarray gives one by default,
     # would be filled by HDF5 first, and so written twice, which for a big file takes
-    # as long again.
-    _, packed = write_and_compress(standard_dataset(100, nt=1000), tmp_path)
-    monkeypatch.setattr(files, "BLOCK_BYTES", 10 * 3 * 1000 * 4)  # 10 stations.
-    write = HDF5Output.write
+    # as long again. With an unlimited dimension the waveform is chunked, here in
+    # chunks of 25 stations, and a block that ended within a row of chunks would have
+    # HDF5 write that row twice. So the blocks are whole rows: 25 stations, not 20.
+    ds = standard_dataset(100, nt=1000)
+    options = {}
+    if time == "an unlimited time":
+        ds = ds.assign_coords(time=np.arange(1000) * 0.005)
+        options = {"unlimited_dims": ["time"]}
+    packed = tmp_path / "out.nc"
+    compress_file(write(ds, tmp_path / "in.nc", **options), packed)
+    monkeypatch.setattr(files, "BLOCK_BYTES", 20 * 3 * 1000 * 4)  # 20 stations.
+    hdf5_write = HDF5Output.write
     written: list[int] = []
 
     def counted(self: HDF5Output, data: Any) -> int:
         written.append(memoryview(data).nbytes)
-        return write(self, data)
+        return hdf5_write(self, data)
 
     monkeypatch.setattr(HDF5Output, "write", counted)
     decompress_to(packed, tmp_path / "back.nc")
     assert sum(written) < 1.1 * (3 * 100 * 1000 * 4)
+
+
+def test_what_a_later_writer_adds_and_doesnt_write_reads_as_the_fill_value(
+    tmp_path: Path, standard_dataset: StandardDataset
+) -> None:
+    # A file with an unlimited dimension can grow. Here a station is added, and only
+    # its first component written: as in the file written whole, the others read as the
+    # waveform's fill value, NaN, and not as 0.
+    src = write(
+        standard_dataset(3, nt=50), tmp_path / "in.nc", unlimited_dims=["station"]
+    )
+    packed, back = tmp_path / "out.nc", tmp_path / "back.nc"
+    compress_file(src, packed)
+    decompress_to(packed, back)
+    with h5netcdf.File(back, "r+") as f:
+        f.resize_dimension("station", 4)
+        f["waveform"][0, 3] = np.ones(50, np.float32)
+        assert np.isnan(f["waveform"][1:, 3]).all()
 
 
 def test_a_stream_that_cant_be_read_names_the_compressed_file(
