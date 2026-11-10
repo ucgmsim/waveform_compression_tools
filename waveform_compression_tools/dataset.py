@@ -5,7 +5,8 @@ gives, but its waveform stays in the file until it is read. Selecting with ``ise
 ``sel`` reads nothing; reading a selection's values decodes only its traces, each from
 its FLAC stream, of which only its own bytes are read. A real station's trace is then
 its exact copy, as in `decompress_file`. A selection in time decodes whole traces, and
-then cuts them.
+then cuts them. A selection of points decodes every chosen component of every chosen
+station, and then picks.
 
 It is built on xarray's backend machinery, as xarray's own netCDF backends are: the
 dataset is opened by ``xr.open_dataset`` with this package's engine (see
@@ -273,8 +274,8 @@ class _LazyWaveform(BackendArray):
         Parameters
         ----------
         key : tuple
-            An integer, a slice with a positive step, or an array of indices in
-            increasing order, for each of the component, station and time dimensions.
+            An integer, a slice with a positive step, or an array of sorted indices,
+            which may repeat, for each of the component, station and time dimensions.
 
         Returns
         -------
@@ -357,9 +358,10 @@ def open_dataset(path: str | os.PathLike[str]) -> xr.Dataset:
     printing and selecting read none of it. Reading a selection's values, with
     ``.values``, ``.load()`` or a computation, decodes its traces then, and only those,
     each from its own stream; a real station's trace is then its exact copy. A
-    selection in time decodes whole traces and then cuts them. Every value read is bit
-    for bit the one `decompress_file` gives, and a damaged stream fails as it does in
-    `decompress_file`.
+    selection in time decodes whole traces and then cuts them. A selection of points
+    decodes every chosen component of every chosen station and then picks. Every value
+    read is bit for bit the one `decompress_file` gives, and a damaged stream fails as
+    it does in `decompress_file`.
 
     It is ``xr.open_dataset(path, engine="waveform_compression_tools")``, so the dataset
     behaves as the datasets of xarray's other engines do: the values read are kept with
