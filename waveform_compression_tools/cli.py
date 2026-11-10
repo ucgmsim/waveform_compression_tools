@@ -617,7 +617,13 @@ def verify(
         stop.exit()
     error = f"largest error {result.max_relative_error:.2g} of a trace's peak"
     if not result.passed:
-        _say(compressed, f"doesn't agree with {original} ({error})")
+        # However small the error, a file fails if all but its samples differ.
+        reason = (
+            ""
+            if result.same_besides_samples
+            else ": its variables, coordinates or attributes differ"
+        )
+        _say(compressed, f"doesn't agree with {original}{reason} ({error})")
         raise typer.Exit(EXIT_FAILED)
     typer.echo(
         f"verified: {compressed} agrees with {original} ({error}; "

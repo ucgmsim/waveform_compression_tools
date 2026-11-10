@@ -780,6 +780,8 @@ DAMAGE = {
 CHECK_DAMAGE = {
     "a doubled gain": "doesn't agree",
     "an original of another shape": "shape",
+    # The samples are as close as ever, so the line says what else differs.
+    "an attribute of the file changed": "its variables, coordinates or attributes differ",
 }
 
 
@@ -834,6 +836,8 @@ def test_a_damaged_file_fails_the_check(
                 streams.copy(GROUP, f)
         elif damage == "a doubled gain":
             g["stream_gains"][c, s] *= 2
+        elif damage == "an attribute of the file changed":
+            f.attrs["dt"] = 0.01
     if damage == "a file cut short, as by a download that stopped":
         os.truncate(packed, packed.stat().st_size // 2)
     original = src

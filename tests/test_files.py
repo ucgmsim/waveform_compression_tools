@@ -918,7 +918,10 @@ def test_verify_fails_when_the_fill_value_or_a_type_differs(
             if attribute == "waveform_encoding"
             else '{"scale": "float64"}'
         )
-    assert not verify_file(src, dst).passed
+    # The samples are as close as ever: what fails is all but them.
+    result = verify_file(src, dst)
+    assert not result.passed and not result.same_besides_samples
+    assert result.max_relative_error <= 1 / full_scale(32)
 
 
 def test_a_nan_fill_value_is_written_as_strict_json(

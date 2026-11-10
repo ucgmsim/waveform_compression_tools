@@ -201,7 +201,8 @@ def test_a_wrong_gain_fails_the_check(
     assert nothing_left(dst)
     # Unchecked, the file is written, and verify fails it too.
     compress_file(src, dst, check=False)
-    assert not verify_file(src, dst).passed
+    result = verify_file(src, dst)
+    assert not result.passed and result.same_besides_samples
     if encoder == "gains of 1":
         # Every sample is within one step of its own gain, so only the setting's bound
         # finds it.

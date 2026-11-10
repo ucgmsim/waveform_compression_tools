@@ -172,6 +172,11 @@ class VerifyResult:
         back exactly, and NaN if the original holds a NaN.
     passed : bool
         True if the file passes every rule of `verify_file`.
+    same_besides_samples : bool
+        True if the file holds all of its original but the waveform's samples: every
+        other variable, coordinate and attribute, the waveform's attributes and
+        encoding, and exact copies of the real stations and of no others. If it is
+        False, the file fails, however small its error.
     n_exact : int
         The number of real stations in the original.
     verify_s : float
@@ -180,6 +185,7 @@ class VerifyResult:
 
     max_relative_error: float
     passed: bool
+    same_besides_samples: bool
     n_exact: int
     verify_s: float
 
@@ -2299,8 +2305,9 @@ def verify_file(
     Returns
     -------
     VerifyResult
-        The largest error relative to a trace's peak, whether the file passed, the
-        number of real stations, and the time the check took.
+        The largest error relative to a trace's peak, whether the file passed, whether
+        it holds all of the original but the waveform's samples, the number of real
+        stations, and the time the check took.
 
     Raises
     ------
@@ -2348,7 +2355,8 @@ def verify_file(
                 f"original {original} holds one of shape {waveform.shape}"
             )
         with about(original):
-            passed = _same_besides_samples(original_rest, waveform, real, rest, streams)
+            same = _same_besides_samples(original_rest, waveform, real, rest, streams)
+        passed = same
         chunks = waveform.encoding.get("chunksizes")
         for s0, s1 in _station_blocks(waveform.shape, chunks, block_stations):
             with naming(original):
@@ -2364,6 +2372,7 @@ def verify_file(
     return VerifyResult(
         max_relative_error=float(worst),
         passed=passed,
+        same_besides_samples=same,
         n_exact=int(real.size),
         verify_s=time.perf_counter() - start,
     )

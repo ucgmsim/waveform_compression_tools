@@ -175,7 +175,7 @@ ORIGINAL comes first, then COMPRESSED. `verify` decodes COMPRESSED a block of st
 - with the exact copies in place, every real station comes back bit for bit, and the file holds exact copies of the real stations and of no others;
 - the waveform's attributes and encoding, and everything else in the file, are identical to the original's.
 
-A file that doesn't pass exits with status 1, with a line such as `waveform-compression-tools: realisation.flac.nc: doesn't agree with realisation.nc (largest error … of a trace's peak)`. Given in the wrong order, `verify` refuses the compressed file as an original that isn't in the standard layout.
+A file that doesn't pass exits with status 1, with a line such as `waveform-compression-tools: realisation.flac.nc: doesn't agree with realisation.nc (largest error … of a trace's peak)`. When anything besides the waveform's samples differs, the line says so, however small the error: `doesn't agree with realisation.nc: its variables, coordinates or attributes differ (largest error … of a trace's peak)`. Given in the wrong order, `verify` refuses the compressed file as an original that isn't in the standard layout.
 
 ### convert-bbbin
 
@@ -288,7 +288,7 @@ convert_hfbin(Path("HF.bin"), Path("hf.nc"))
 A path can be given as a string or as a `pathlib.Path` object.
 
 - `compress_file(src, dst, bits=32, level=5, block_stations=None, check=True, overwrite=False)` returns a `CompressResult`: `bytes_in` and `bytes_out`, `n_traces`, `n_exact` (the real stations), `bits`, `max_relative_error` (None without the check), `output_hash` (the output's content hash), the wall time spent reading, encoding, writing, checking and hashing, from `read_s` to `hash_s`, and the CPU time of the first four, from `read_cpu_s` to `check_cpu_s`. It first makes the checks of `check_compressible(src, dst, overwrite)`: DST's, its folder included, and then the refusals of SRC that need no samples; `check_compressible` can be called on its own.
-- `verify_file(original, compressed, block_stations=None)` returns a `VerifyResult`: `passed`, `max_relative_error`, `n_exact` and `verify_s`. A file that doesn't agree gives `passed=False`; it doesn't raise.
+- `verify_file(original, compressed, block_stations=None)` returns a `VerifyResult`: `passed`, `max_relative_error`, `same_besides_samples` (whether everything but the waveform's samples agrees, which `passed` needs too), `n_exact` and `verify_s`. A file that doesn't agree gives `passed=False`; it doesn't raise.
 - `decompress_file(path)` returns the original dataset, loaded into memory. `decompress_to(src, dst, overwrite=False)` writes the same dataset to a netCDF file, through a `.partial`, a block of stations at a time, so its memory doesn't grow with the file, and returns the waveform's shape, (component, station, time).
 - `read_bbbin(path)` reads a BB.bin file into a dataset in the standard layout, and `convert_bbbin(src, dst, overwrite=False)` writes that dataset to a netCDF file, through a `.partial`.
 - `read_hfbin(path)` and `convert_hfbin(src, dst, overwrite=False)` do the same for an HF.bin file (see [convert-hfbin](#convert-hfbin)).
