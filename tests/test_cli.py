@@ -773,6 +773,8 @@ DAMAGE = {
     "a type for an attribute that isn't there": "waveform_attr_types",
     "the streams of 2 stations of 3": "decodes to a waveform of shape (3, 2, 10000)",
     "attributes that aren't JSON": "can't be read (Expecting property name",
+    "attributes of JSON that isn't an object": "can't be read (JSON that isn't an object",
+    "an attribute outside its type's range": "out of bounds for int8",
     "a type that numpy doesn't know": "data type 'int33' not understood",
     "a file cut short, as by a download that stopped": "truncated file",
 }
@@ -824,6 +826,11 @@ def test_a_damaged_file_fails_the_check(
             g.attrs["waveform_attr_types"] = json.dumps({"gain": "float32"})
         elif damage == "attributes that aren't JSON":
             g.attrs["waveform_attrs"] = "{not json"
+        elif damage == "attributes of JSON that isn't an object":
+            g.attrs["waveform_attrs"] = "[1, 2]"
+        elif damage == "an attribute outside its type's range":
+            g.attrs["waveform_attrs"] = json.dumps({"units": 300})
+            g.attrs["waveform_attr_types"] = json.dumps({"units": "int8"})
         elif damage == "a type that numpy doesn't know":
             g.attrs["waveform_attr_types"] = json.dumps({"units": "int33"})
         elif damage == "the streams of 2 stations of 3":

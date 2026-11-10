@@ -575,6 +575,32 @@ def _comparable_fills(encoding: dict) -> dict:
     return json.loads(_encoding_json(encoding))
 
 
+def _json_object(text: str) -> dict:
+    """Read a JSON object, as each of the group's attributes of JSON holds.
+
+    Parameters
+    ----------
+    text : str
+        The JSON.
+
+    Returns
+    -------
+    dict
+        The object.
+
+    Raises
+    ------
+    ValueError
+        If `text` isn't JSON.
+    TypeError
+        If it is JSON of something other than an object, as a list.
+    """
+    value = json.loads(text)
+    if not isinstance(value, dict):
+        raise TypeError("JSON that isn't an object")
+    return value
+
+
 def _encoding_back(text: str) -> dict:
     """Read what `_encoding_json` wrote, as values for the waveform's encoding.
 
@@ -587,10 +613,17 @@ def _encoding_back(text: str) -> dict:
     -------
     dict
         Each value as a float32, the waveform's dtype, or ``None``.
+
+    Raises
+    ------
+    ValueError
+        If `text` isn't JSON, or holds a value that isn't a number.
+    TypeError
+        If it is JSON of something other than an object (see `_json_object`).
     """
     return {
         name: None if value is None else np.float32(value)
-        for name, value in json.loads(text).items()
+        for name, value in _json_object(text).items()
     }
 
 
@@ -1531,12 +1564,12 @@ def _open_streams(f: h5py.File, path: Path) -> _Streams:
         to 32, which no file can have.
     Damaged
         If the group lacks an attribute or a dataset of the format, has one that can't
-        be read as the format writes it, as JSON that doesn't parse, its
-        ``stream_bytes``, ``stream_gains`` or ``stream_offsets`` differs in shape from
-        its ``stream_starts``, its ``exact_stations`` are not stations of the file in
-        increasing order, its ``exact_waveform`` is not float32 with each of their
-        traces, or its ``waveform_attr_types`` names an attribute that its
-        ``waveform_attrs`` lacks.
+        be read as the format writes it, as JSON that doesn't parse or isn't an object,
+        or a value outside its type's range, its ``stream_bytes``, ``stream_gains`` or
+        ``stream_offsets`` differs in shape from its ``stream_starts``, its
+        ``exact_stations`` are not stations of the file in increasing order, its
+        ``exact_waveform`` is not float32 with each of their traces, or its
+        ``waveform_attr_types`` names an attribute that its ``waveform_attrs`` lacks.
     """
     group = _compressed_group(f)
     if group is None:
@@ -1590,8 +1623,8 @@ def _open_streams(f: h5py.File, path: Path) -> _Streams:
                 f"{exact_waveform.shape}, not float32 of shape {shape}",
                 path,
             )
-        waveform_attrs = json.loads(group.attrs["waveform_attrs"])
-        for name, dtype in json.loads(group.attrs["waveform_attr_types"]).items():
+        waveform_attrs = _json_object(group.attrs["waveform_attrs"])
+        for name, dtype in _json_object(group.attrs["waveform_attr_types"]).items():
             if name not in waveform_attrs:
                 raise Damaged(
                     f"{path}: waveform_attr_types names the attribute {name!r}, "
@@ -1624,9 +1657,10 @@ def _open_streams(f: h5py.File, path: Path) -> _Streams:
         raise Damaged(
             f"{path}: {GROUP} lacks a part of its format ({e.args[0]})", path
         ) from e
-    # A part that isn't as the format writes it, as JSON that doesn't parse, or the name
-    # of a type that numpy doesn't know.
-    except (ValueError, TypeError) as e:
+    # A part that isn't as the format writes it, as JSON that doesn't parse or isn't an
+    # object, the name of a type that numpy doesn't know, or a value outside its type's
+    # range.
+    except (ValueError, TypeError, OverflowError) as e:
         raise Damaged(
             f"{path}: {GROUP} has a part that can't be read ({e})", path
         ) from e
