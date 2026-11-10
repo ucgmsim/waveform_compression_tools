@@ -7,8 +7,8 @@ quantised on its own (see `waveform_compression_tools.quantise`) and written as 
 order: the first component of every station, then the second, then the third.
 
 A stream carries no sample count, so a stream that has been cut can decode without
-an error to fewer samples than it held. `decode_block`, which is told how many
-samples to expect, counts them.
+an error to fewer samples than it held. `decode_block` and `decode_trace`, which are
+told how many samples to expect, count them.
 
 `check_standard` says whether a dataset holds its waveform in the layout this
 package handles. `max_relative_error` and `within_one_step` compare a decoded block
@@ -201,19 +201,56 @@ def decode_block(
         block = out
     for c, s in np.ndindex(*starts.shape):
         start, size = int(starts[c, s]), int(nbytes[c, s])
-        trace = f"component {c}, station {s + first_station}"
-        try:
-            # The decoder needs bytes: it fails on a numpy slice of more than about
-            # 8 KB.
-            q = decode_stream(compressed[start : start + size].tobytes())
-        except (pyflac.DecoderInitException, pyflac.DecoderProcessException) as e:
-            raise ValueError(f"{trace}: a FLAC stream is damaged ({e})") from e
-        if q.size != nt:
-            raise ValueError(
-                f"{trace}: the stream decodes to {q.size} samples, expected {nt}"
-            )
-        block[c, s] = dequantise(q, gains[c, s], offsets[c, s])
+        # The decoder needs bytes: it fails on a numpy slice of more than about 8 KB.
+        stream = compressed[start : start + size].tobytes()
+        block[c, s] = decode_trace(
+            stream, gains[c, s], offsets[c, s], nt, c, s + first_station
+        )
     return block
+
+
+def decode_trace(
+    stream: bytes, gain: float, offset: float, nt: int, component: int, station: int
+) -> np.ndarray:
+    """Decode one trace from its FLAC stream.
+
+    Parameters
+    ----------
+    stream : bytes
+        The trace's stream.
+    gain : float
+        The gain the trace was quantised with.
+    offset : float
+        The value added to the trace after dividing by its gain.
+    nt : int
+        The number of samples in the trace.
+    component : int
+        The trace's component, which an error's message names.
+    station : int
+        The trace's station in its file, which an error's message names.
+
+    Returns
+    -------
+    np.ndarray
+        The trace, as float32 of shape (nt,).
+
+    Raises
+    ------
+    ValueError
+        If the stream is damaged, so that libFLAC can't decode it, or decodes to some
+        other number of samples than `nt`, as one that was cut short does, or cut to
+        nothing. The message names the trace's component and station.
+    """
+    trace = f"component {component}, station {station}"
+    try:
+        q = decode_stream(stream)
+    except (pyflac.DecoderInitException, pyflac.DecoderProcessException) as e:
+        raise ValueError(f"{trace}: a FLAC stream is damaged ({e})") from e
+    if q.size != nt:
+        raise ValueError(
+            f"{trace}: the stream decodes to {q.size} samples, expected {nt}"
+        )
+    return dequantise(q, gain, offset)
 
 
 def _check_same_block(original: np.ndarray, decoded: np.ndarray) -> None:
