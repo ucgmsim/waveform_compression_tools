@@ -100,22 +100,31 @@ def test_station_names_lose_only_their_padding(
     assert all(isinstance(name, str) for name in ds["station"].values)
 
 
+@pytest.mark.parametrize(
+    ("text", "reason"),
+    [
+        pytest.param("Ōtaki", "text that isn't ASCII", id="not ASCII"),
+        pytest.param("AB\0CD", "text with a NUL inside it", id="a NUL inside"),
+    ],
+)
 @pytest.mark.parametrize("where", ["a station's name", "a string of the header"])
-def test_text_that_is_not_ascii_is_refused(
-    tmp_path: Path, where: str, make_bbbin: MakeBbbin
+def test_text_that_is_not_ascii_or_holds_a_nul_is_refused(
+    tmp_path: Path, where: str, text: str, reason: str, make_bbbin: MakeBbbin
 ) -> None:
-    # It isn't changed into something that might differ from what the file holds.
+    # It isn't changed into something that might differ from what the file holds: it
+    # loses only the NULs that pad it.
     path = tmp_path / "BB.bin"
     if where == "a station's name":
-        make_bbbin(path, nstat=1, nt=3, endian="<", names=["Ōtaki"])
+        make_bbbin(path, nstat=1, nt=3, endian="<", names=[text])
     else:
         make_bbbin(path, nstat=1, nt=3, endian="<")
-        content, text = bytearray(path.read_bytes()), "Ōtaki".encode()
-        content[20 : 20 + len(text)] = text  # At the start of lf_dir.
+        content, raw = bytearray(path.read_bytes()), text.encode()
+        content[20 : 20 + len(raw)] = raw  # At the start of lf_dir.
         path.write_bytes(content)
-    with pytest.raises(NotBBBin, match="ASCII"):
+    message = re.escape(f"not a BB.bin file: {path} holds {reason}")
+    with pytest.raises(NotBBBin, match=f"^{message}$"):
         read_bbbin(path)
-    with pytest.raises(NotBBBin, match="ASCII"):
+    with pytest.raises(NotBBBin, match=f"^{message}$"):
         convert_bbbin(path, tmp_path / "BB.nc")
     assert names_in(tmp_path) == ["BB.bin"]
 

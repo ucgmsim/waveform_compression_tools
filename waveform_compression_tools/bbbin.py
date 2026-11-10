@@ -143,11 +143,11 @@ def read_bbbin(path: str | os.PathLike[str]) -> xr.Dataset:
         If `path` is not a BB.bin file: if it is shorter than a header, if neither
         byte order makes the header's numbers of stations and samples, both at least
         1, fit its size exactly, or if a station's name, or a string of the header, is
-        not ASCII. If the file's size doesn't fit its header, but it holds the whole
-        header and every record, the message adds that it may be one cut short. A
-        file that shrinks while it is read, so that by the time its records or its
-        traces are read it is shorter than its header says, is refused as a file of
-        its new size would be.
+        not ASCII or has a NUL inside it. If the file's size doesn't fit its header,
+        but it holds the whole header and every record, the message adds that it may
+        be one cut short. A file that shrinks while it is read, so that by the time its
+        records or its traces are read it is shorter than its header says, is refused
+        as a file of its new size would be.
     """
     path = Path(path)
     with path.open("rb") as f:
@@ -163,17 +163,12 @@ def read_bbbin(path: str | os.PathLike[str]) -> xr.Dataset:
         if len(records) < nstat * _STATION_BYTES:
             raise _not_bbbin(path, f, head)
         stations = np.frombuffer(records, _station_dtype(endian), count=nstat)
-        # Text that isn't ASCII isn't changed into something that might differ from
-        # what the file holds.
         try:
-            names = stations["name"].astype(str)
-            lf_dir, lf_vm, hf_file = (
-                np.frombuffer(head, "S256", count=3, offset=20).astype(str).tolist()
-            )
-        except UnicodeDecodeError as e:
-            raise NotBBBin(
-                f"not a BB.bin file: {path} holds text that isn't ASCII", path
-            ) from e
+            names = legacy.decode(stations["name"])
+            texts = legacy.decode(np.frombuffer(head, "S256", count=3, offset=20))
+        except ValueError as e:
+            raise NotBBBin(f"not a BB.bin file: {path} holds {e}", path) from e
+        lf_dir, lf_vm, hf_file = texts.tolist()
         waveform = legacy.standard_waveform(f, endian, nstat, nt)
         if waveform is None:
             raise _not_bbbin(path, f, head)

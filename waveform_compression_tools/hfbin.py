@@ -185,11 +185,11 @@ def read_hfbin(path: str | os.PathLike[str]) -> xr.Dataset:
         If `path` is not an HF.bin file: if it is shorter than a header, if neither
         byte order makes the header's numbers of stations and samples, both at least
         1, fit its size exactly, or if a station's name, or a string of the header, is
-        not ASCII. If the file's size doesn't fit its header, but it holds the whole
-        header and every record, the message adds that it may be one cut short. A
-        file that shrinks while it is read, so that by the time its records or its
-        traces are read it is shorter than its header says, is refused as a file of
-        its new size would be.
+        not ASCII or has a NUL inside it. If the file's size doesn't fit its header,
+        but it holds the whole header and every record, the message adds that it may
+        be one cut short. A file that shrinks while it is read, so that by the time its
+        records or its traces are read it is shorter than its header says, is refused
+        as a file of its new size would be.
     IncompleteHFBin
         If a station's vs is 0, so the run that wrote the file stopped before that
         station was done. The message says how many stations are unfinished.
@@ -208,17 +208,13 @@ def read_hfbin(path: str | os.PathLike[str]) -> xr.Dataset:
         if len(records) < nstat * _STATION_BYTES:
             raise _not_hfbin(path, f, head)
         stations = np.frombuffer(records, _station_dtype(endian), count=nstat)
-        # Text that isn't ASCII isn't changed into something that might differ from
-        # what the file holds.
         try:
-            names = stations["name"].astype(str)
-            texts = np.frombuffer(
-                head, "S64", count=len(_TEXT_FIELDS), offset=_TEXTS_AT
-            ).astype(str)
-        except UnicodeDecodeError as e:
-            raise NotHFBin(
-                f"not an HF.bin file: {path} holds text that isn't ASCII", path
-            ) from e
+            names = legacy.decode(stations["name"])
+            texts = legacy.decode(
+                np.frombuffer(head, "S64", count=len(_TEXT_FIELDS), offset=_TEXTS_AT)
+            )
+        except ValueError as e:
+            raise NotHFBin(f"not an HF.bin file: {path} holds {e}", path) from e
         unfinished = int(np.count_nonzero(stations["vs"] == 0))
         if unfinished:
             raise IncompleteHFBin(

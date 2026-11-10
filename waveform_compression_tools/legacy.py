@@ -106,6 +106,40 @@ def cut_short(head: bytes, size: int, head_bytes: int, station_bytes: int) -> bo
     return False
 
 
+def decode(strings: np.ndarray) -> np.ndarray:
+    """Turn a file's names or strings into text, as the file holds them.
+
+    Each is padded with NULs to its size, and loses only the NULs that end it. Text
+    that isn't ASCII, or that holds a NUL before its end, would have to be changed to
+    be kept, into something that might differ from what the file holds, so it is
+    refused instead.
+
+    Parameters
+    ----------
+    strings : np.ndarray
+        Strings of one size, of a numpy bytes type such as ``S8``.
+
+    Returns
+    -------
+    np.ndarray
+        The text, of the numpy str type of that size, such as ``<U8``.
+
+    Raises
+    ------
+    ValueError
+        If any of it isn't ASCII, with the message ``text that isn't ASCII``, or holds
+        a NUL before its end, with the message ``text with a NUL inside it``.
+    """
+    try:
+        text = strings.astype(str)
+    except UnicodeDecodeError as e:
+        raise ValueError("text that isn't ASCII") from e
+    # numpy leaves out the NULs that end each string, so a NUL left is inside one.
+    if any("\0" in s for s in text.tolist()):
+        raise ValueError("text with a NUL inside it")
+    return text
+
+
 def standard_waveform(
     f: io.BufferedIOBase, endian: str, nstat: int, nt: int
 ) -> np.ndarray | None:
