@@ -242,6 +242,22 @@ def test_an_unfinished_file_is_refused(tmp_path: Path, make_hfbin: MakeHfbin) ->
     assert names_in(tmp_path) == ["HF.bin"]
 
 
+def test_a_station_at_the_epicentre_is_finished(
+    tmp_path: Path, make_hfbin: MakeHfbin
+) -> None:
+    # Only a vs of 0 marks a station unfinished: vs comes from the velocity model, and
+    # is never 0 for a station that is done, while e_dist, its distance from the
+    # epicentre, is 0 for a station there.
+    path = tmp_path / "HF.bin"
+    make_hfbin(path, nstat=3, nt=7)
+    content = bytearray(path.read_bytes())
+    # The second station's e_dist, in bytes 16 to 20 of its record.
+    at = 0x200 + 0x18 + 16
+    content[at : at + 4] = bytes(4)
+    path.write_bytes(content)
+    np.testing.assert_array_equal(read_hfbin(path)["e_dist"].values, [44.5, 0.0, 46.5])
+
+
 @pytest.mark.parametrize("endian", ["<", ">"])
 def test_convert_hfbin_writes_a_netcdf_file(
     tmp_path: Path, endian: str, make_hfbin: MakeHfbin
