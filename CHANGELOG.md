@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.0
+
+The file format is unchanged, at version 1: every release decodes the files that 1.3.0 writes, and 1.3.0 decodes every release's.
+
+- **A second way to round,** `compress --rounding carried`, or `rounding="carried"` in `compress_file` and `encode_block`, which takes 24 bits or fewer. What a sample's rounding leaves out is carried into the next sample, so the errors cancel over time, and the running total of a trace stays within one step of the original's at 24 bits. It is for waveforms that will be integrated: on the BB traces in `tests/real_traces`, the largest error of a running total falls from 96.5 steps to 0.94. In return, each sample's limit is up to twice as wide, the error above about a sixth of the sampling rate is up to about 2 times larger, the file is a few percent larger at 24 bits, and encoding takes longer. The default is still `nearest`, whose streams are byte for byte as 1.2.0 wrote them. See "Choosing how to round" in the README.
+- **A file records how it was rounded,** in the group attribute `rounding`, and is held to that promise by `verify` and by `compress`'s check. A file without it, as every earlier release wrote, was rounded to nearest. Decoding doesn't depend on it. For a carried file, both hold every sample and the running total of every trace to their limits. `verify` refuses a file that records a rounding it doesn't know, with `UnknownFormat` and status 3. 1.2.0 and earlier decode a carried file, but their `verify` holds it to nearest's promise, and so may fail it.
+- **The record names the rounding,** as `rounding`, after `level`, so `record_version` is 3. `CompressResult` and `VerifyResult` have the new field `rounding`.
+
 ## 1.2.0
 
 - **An HF.bin converter,** `convert-hfbin`, and `read_hfbin` and `convert_hfbin` in Python, beside `convert-bbbin`. It keeps the acceleration in cm/s², as stored, and every field of the header as an attribute in its own type. A file that isn't an HF.bin is refused with `NotHFBin`, as is one cut short by a run that stopped early, whose error line adds `or one cut short`. A full-size file that its run left unfinished, with a station's `vs` of 0, is refused with `IncompleteHFBin`. Both exit with status 3.

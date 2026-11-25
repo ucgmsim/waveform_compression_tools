@@ -425,8 +425,8 @@ def compress(
     into the next sample, so that the errors cancel over time. That keeps slow motion,
     such as displacement, far better, and fast motion a little worse: the running total
     of a trace stays within one step of the original's, and every sample within two. It
-    takes 24 bits or fewer, and makes a file a few percent larger. The README says when
-    to choose it.
+    takes 24 bits or fewer, and makes a file larger, by a few percent at 24 bits and by
+    more at fewer. The README says when to choose it.
 
     A station whose name is not exactly 7 characters long is real, and its traces are
     also kept exactly as they were. A file whose stations are all real is not
