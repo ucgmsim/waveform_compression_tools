@@ -1073,7 +1073,7 @@ def compress_file(
     # Refuse a setting outside 8 to 32, or a rounding that doesn't take it, before the
     # file is opened.
     full_scale(bits)
-    check_rounding(rounding, bits)
+    rounding = check_rounding(rounding, bits)
     src, dst = Path(src), Path(dst)
     stopwatch = _Stopwatch()
     with (
@@ -1634,12 +1634,11 @@ def _refuse_unknown_rounding(streams: _Streams, path: Path) -> str:
         carried rounding doesn't take.
     """
     try:
-        check_rounding(streams.rounding, streams.bits)
+        return check_rounding(streams.rounding, streams.bits)
     except ValueError as e:
         raise UnknownFormat(
             f"{path} has a rounding that can't be verified: {e}", path
         ) from e
-    return str(streams.rounding)
 
 
 def _open_streams(f: h5py.File, path: Path) -> _Streams:

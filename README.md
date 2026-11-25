@@ -54,8 +54,8 @@ What `carried` costs:
   | 24 | 3.7% larger | 0.1% larger | 2.2% larger |
   | 16 | 24% larger | 7% larger | 14% larger |
 
-  Two things add to it. A constant stretch that doesn't fall on a step, such as padding with a trace's last value, comes back as a fast jitter of one step, at up to about a bit a sample: 5% on synthetic traces that were two-thirds padding. Padding with zeros costs nothing. And a quiet stretch below half a step, which `nearest` makes zeros, becomes sparse single steps.
-- **It takes longer to encode,** and more so for longer traces: on synthetic random walks, 1.2 times as long at 10,000 samples a trace, 1.4 times at 40,000 and 3.6 times at 400,000. Checking takes 1.2 times as long. Memory is the same.
+  Two things add to it. A constant stretch that doesn't fall on a step, such as padding with a trace's last value, comes back as a fast jitter of one step, at up to about a bit a sample: at 24 bits, 5% on synthetic traces that were two-thirds padding. Padding with zeros costs nothing. And a quiet stretch below half a step, which `nearest` makes zeros, becomes sparse single steps.
+- **It takes longer to encode,** and more so for longer traces: on synthetic random walks, 1.2 times as long at 10,000 samples a trace, 1.4 times at 40,000 and 3.6 times at 400,000. Checking takes 1.2 times as long. Memory is the same for traces of tens of thousands of samples, and more for short ones: a file of 64 samples a trace took 0.90 GB rather than 0.74 GB.
 - **It takes 24 bits or fewer.** With more, the spacing of float32 values at the peak is wider than a step, so there is little left to carry.
 
 The file records how it was rounded, and `compress` and `verify` hold it to that promise. Decoding is the same for both, so any release decodes either. `verify` in releases before 1.3.0 doesn't know `carried`: it holds a file to `nearest`'s promise, and so may fail one that `verify` in this release passes. A file can't prove which way it was rounded, as at low settings a trace rounded one way can keep the other's promise too. Either way, a file that passes keeps the promise of the rounding it records.

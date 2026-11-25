@@ -30,7 +30,7 @@ CARRIED_MAX_BITS = 24
 _STRETCH = 256
 
 
-def check_rounding(rounding: object, bits: int) -> None:
+def check_rounding(rounding: object, bits: int) -> str:
     """Check that a rounding is one of `ROUNDINGS`, and takes the given bits.
 
     Parameters
@@ -40,6 +40,12 @@ def check_rounding(rounding: object, bits: int) -> None:
         can hold anything in the place of one.
     bits : int
         Bits per sample.
+
+    Returns
+    -------
+    str
+        The one of `ROUNDINGS` that it is: a plain string, which a file can hold,
+        whatever kind of string was given.
 
     Raises
     ------
@@ -52,6 +58,7 @@ def check_rounding(rounding: object, bits: int) -> None:
         raise ValueError(
             f"carried rounding takes {CARRIED_MAX_BITS} bits or fewer, got {bits}"
         )
+    return ROUNDINGS[ROUNDINGS.index(rounding)]
 
 
 def full_scale(bits: int) -> int:

@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from waveform_compression_tools import files, open_dataset
+from waveform_compression_tools.cli import Rounding
 from waveform_compression_tools.codec import EncodedBlock, encode_block
 from waveform_compression_tools.errors import (
     CheckFailed,
@@ -79,6 +80,20 @@ def test_a_file_is_rounded_to_nearest_unless_asked(
     with h5py.File(dst, "r") as f, h5py.File(asked, "r") as g:
         for name in f[GROUP]:
             np.testing.assert_array_equal(f[GROUP][name][...], g[GROUP][name][...])
+
+
+@pytest.mark.parametrize(
+    "asked",
+    [np.str_("nearest"), np.str_("carried"), Rounding.NEAREST, Rounding.CARRIED],
+)
+def test_any_string_of_a_rounding_will_do(
+    standard_dataset: StandardDataset, tmp_path: Path, asked: str
+) -> None:
+    src, dst = tmp_path / "in.nc", tmp_path / "out.nc"
+    write(standard_dataset(3, nt=500), src)
+    result = compress_file(src, dst, bits=24, rounding=asked)
+    for said in (result.rounding, label_of(dst), verify_file(src, dst).rounding):
+        assert type(said) is str and said == str(asked)
 
 
 def test_the_results_say_the_rounding_beside_the_bits_and_the_verdict() -> None:
