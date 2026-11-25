@@ -2,7 +2,8 @@
 
 A block is a float32 array of shape (3, n, nt): n stations, each with three
 components (such as 000, 090 and ver) of nt time samples. Each of its 3n traces is
-quantised on its own (see `waveform_compression_tools.quantise`) and written as one FLAC stream
+quantised on its own, rounded in one of two ways (see
+`waveform_compression_tools.quantise`), and written as one FLAC stream
 (see `waveform_compression_tools.stream`). The streams are in row-major (component, station)
 order: the first component of every station, then the second, then the third.
 
@@ -13,8 +14,8 @@ told how many samples to expect, count them, and raise
 decode.
 
 `check_standard` says whether a dataset holds its waveform in the layout this
-package handles. `max_relative_error` and `within_one_step` compare a decoded block
-with the original.
+package handles. `max_relative_error`, `within_one_step` and `within_carried_limits`
+compare a decoded block with the original.
 """
 
 from dataclasses import dataclass
@@ -24,7 +25,15 @@ import pyflac
 import xarray as xr
 
 from .errors import Damaged, NotStandardLayout
-from .quantise import dequantise, gain_for, quantise
+from .quantise import (
+    check_rounding,
+    dequantise,
+    float32_spacing,
+    full_scale,
+    gain_for,
+    quantise,
+    quantise_carried,
+)
 from .stream import decode_stream, encode_stream
 
 STANDARD_DIMS = ("component", "station", "time")
@@ -35,6 +44,12 @@ STANDARD_COMPONENTS = ("000", "090", "ver")
 # How far past one quantisation step, relative to the step, a decoded sample may be
 # without failing the check. It allows for rounding in float64.
 STEP_SLACK = 1e-9
+
+# The same for carried rounding's two limits, relative to each: a sample's own, whose
+# step and spacing of float32 values can be as far apart as float64 goes, and the
+# running total's, which adds up the rounding of every sample before it.
+SAMPLE_SLACK = 1e-8
+TOTAL_SLACK = 1e-6
 
 
 def check_standard(ds: xr.Dataset) -> None:
@@ -88,12 +103,14 @@ class EncodedBlock:
     gains: np.ndarray
 
 
-def encode_block(waveform: np.ndarray, bits: int = 32, level: int = 5) -> EncodedBlock:
+def encode_block(
+    waveform: np.ndarray, bits: int = 32, level: int = 5, rounding: str = "nearest"
+) -> EncodedBlock:
     """Compress a block of stations, one FLAC stream per trace.
 
     Each trace is scaled by its own gain, so that its largest absolute sample lands
-    on full scale for `bits`, and rounded to the nearest integer. A trace of zeros
-    has a gain of 1.
+    on full scale for `bits`, and rounded to integers. A trace of zeros has a gain
+    of 1.
 
     Parameters
     ----------
@@ -103,6 +120,10 @@ def encode_block(waveform: np.ndarray, bits: int = 32, level: int = 5) -> Encode
         The quantisation setting, from 8 to 32.
     level : int, default 5
         The FLAC compression level, from 0 (fastest) to 8 (smallest).
+    rounding : str, default "nearest"
+        How to round: ``nearest``, each sample to the nearest integer, or ``carried``,
+        with what a sample's rounding left out carried into the next. ``carried`` takes
+        24 bits or fewer.
 
     Returns
     -------
@@ -115,7 +136,8 @@ def encode_block(waveform: np.ndarray, bits: int = 32, level: int = 5) -> Encode
         If a trace holds a NaN or an infinity.
     ValueError
         If `waveform` is not a float32 array of three dimensions with at least one
-        sample per trace, or if `bits` is outside 8 to 32.
+        sample per trace, if `bits` is outside 8 to 32, or if `rounding` is neither
+        ``nearest`` nor ``carried``, or is ``carried`` with `bits` above 24.
     pyflac.EncoderInitException
         If libFLAC can't start a trace's stream.
     pyflac.EncoderProcessException
@@ -127,13 +149,19 @@ def encode_block(waveform: np.ndarray, bits: int = 32, level: int = 5) -> Encode
             f"with at least one sample per trace, got {waveform.dtype} with "
             f"shape {waveform.shape}"
         )
-    streams: list[bytes] = []
+    check_rounding(rounding, bits)
     gains = np.empty(waveform.shape[:2], dtype=np.float64)
     # Each trace's largest absolute sample, exactly: a NaN or an infinity stays.
     peaks = np.maximum(-waveform.min(axis=2), waveform.max(axis=2))
     for c, s in np.ndindex(*gains.shape):
         gains[c, s] = gain_for(peaks[c, s], bits)
-        streams.append(encode_stream(quantise(waveform[c, s], gains[c, s]), level))
+    traces = waveform.reshape(-1, waveform.shape[2])
+    if rounding == "carried":
+        # All of the traces at once, as each sample needs the one before it.
+        quantised = iter(quantise_carried(traces, gains.reshape(-1), bits))
+    else:
+        quantised = map(quantise, traces, gains.flat)
+    streams = [encode_stream(q, level) for q in quantised]
     nbytes = np.array([len(stream) for stream in streams], dtype=np.int64)
     return EncodedBlock(streams, nbytes.reshape(gains.shape), gains)
 
@@ -332,6 +360,34 @@ def max_relative_error(original: np.ndarray, decoded: np.ndarray) -> np.ndarray:
     return error
 
 
+def _gains_are_right(original: np.ndarray, gains: np.ndarray) -> bool:
+    """Say whether every gain of a block is finite and positive.
+
+    Parameters
+    ----------
+    original : np.ndarray
+        The block before compression, of shape (3, n, nt).
+    gains : np.ndarray
+        The gain each trace was quantised with, of shape (3, n).
+
+    Returns
+    -------
+    bool
+        True if they all are, as every gain `encode_block` gives is.
+
+    Raises
+    ------
+    ValueError
+        If `gains` does not have a gain for each trace.
+    """
+    if gains.shape != original.shape[:2]:
+        raise ValueError(
+            f"gains has shape {gains.shape}, but the original has "
+            f"{original.shape[:2]} traces"
+        )
+    return bool(np.all(np.isfinite(gains) & (gains > 0)))
+
+
 def within_one_step(
     original: np.ndarray, decoded: np.ndarray, gains: np.ndarray
 ) -> bool:
@@ -366,16 +422,71 @@ def within_one_step(
         for each trace.
     """
     _check_same_block(original, decoded)
-    if gains.shape != original.shape[:2]:
-        raise ValueError(
-            f"gains has shape {gains.shape}, but the original has "
-            f"{original.shape[:2]} traces"
-        )
-    if not np.all(np.isfinite(gains) & (gains > 0)):
+    if not _gains_are_right(original, gains):
         return False
     for c, s in np.ndindex(*gains.shape):
         trace = original[c, s].astype(np.float64)
         step = 1.0 / gains[c, s] if np.any(trace != 0) else 0.0
         if not np.all(np.abs(trace - decoded[c, s]) <= step * (1 + STEP_SLACK)):
+            return False
+    return True
+
+
+def within_carried_limits(
+    original: np.ndarray, decoded: np.ndarray, gains: np.ndarray, bits: int
+) -> bool:
+    """Check that a decoded block keeps both limits of carried rounding.
+
+    The limits of a trace come from the step its setting promises, its peak over
+    ``full_scale(bits)``, and from the spacing of float32 values at its peak:
+
+    - every sample is within the step and the spacing, together, of its original,
+      and so too with the step of the trace's own gain, ``1 / gain``;
+    - the running total of the decoded samples is within half of the step and the
+      spacing, together, of the original's, at every sample.
+
+    The check allows a relative slack of 1e-8 on the first and 1e-6 on the second for
+    rounding in float64. A trace whose original is all zeros has to decode to exact
+    zeros. The check fails if any gain is not finite and positive, as every gain
+    `encode_block` gives is. A NaN never passes.
+
+    Parameters
+    ----------
+    original : np.ndarray
+        The block before compression, of shape (3, n, nt).
+    decoded : np.ndarray
+        The block after decoding, of the same shape.
+    gains : np.ndarray
+        The gain each trace was quantised with, of shape (3, n).
+    bits : int
+        The quantisation setting, from 8 to 24.
+
+    Returns
+    -------
+    bool
+        True if every gain is finite and positive, and every trace keeps both limits.
+
+    Raises
+    ------
+    ValueError
+        If the arrays are not blocks of one shape, or `gains` does not have a gain
+        for each trace, or `bits` is outside 8 to 24.
+    """
+    check_rounding("carried", bits)
+    scale = full_scale(bits)
+    _check_same_block(original, decoded)
+    if not _gains_are_right(original, gains):
+        return False
+    for c, s in np.ndindex(*gains.shape):
+        trace = original[c, s].astype(np.float64)
+        peak = np.abs(trace).max()
+        spacing = float(float32_spacing(peak))
+        promised = peak / scale
+        step = min(promised, 1.0 / gains[c, s])
+        error = trace - decoded[c, s]
+        if not np.all(np.abs(error) <= (step + spacing) * (1 + SAMPLE_SLACK)):
+            return False
+        total = np.abs(np.cumsum(error))
+        if not np.all(total <= (promised + spacing) / 2 * (1 + TOTAL_SLACK)):
             return False
     return True

@@ -1,3 +1,5 @@
+import hashlib
+
 import numpy as np
 import pyflac
 import pytest
@@ -9,11 +11,18 @@ from waveform_compression_tools.codec import (
     decode_block,
     encode_block,
     max_relative_error,
+    within_carried_limits,
     within_one_step,
 )
-from waveform_compression_tools.errors import Damaged
+from waveform_compression_tools.errors import Damaged, NonFiniteSamples
+from waveform_compression_tools.stream import decode_stream, encode_stream
 
-from helpers import RealTraces, hard_traces, within_one_step_of_the_setting
+from helpers import (
+    RealTraces,
+    hard_traces,
+    within_carried_limits_of_the_setting,
+    within_one_step_of_the_setting,
+)
 
 # Total FLAC bytes of each set of real traces at each setting, as measured with an
 # independent implementation of this encoder (level 5, float64 gains).
@@ -22,6 +31,18 @@ REAL_TRACE_FLAC_BYTES = {
     "hf": {32: 881_307, 24: 514_114, 17: 253_797},
     "bb": {32: 1_264_501, 24: 615_835, 17: 297_263},
 }
+
+# The SHA-256 of the integers and then the gains that 1.2.0 made of each set of real
+# traces at 24 bits, as little-endian int32 and float64.
+PLAIN_AT_24_BITS_SHA256 = {
+    "lf": "50cd4a16cc36409fd98e7311be0e2713cd780acc0eb16bc799bf6e6887ca753f",
+    "hf": "5e152f298c96fc1b47d74a060672142580a979ba7093c0f8b5d82a21c1641a84",
+    "bb": "37aa965ea432dded02dcce205519ca7f524a5f8ed4751a13ac5c106ad1590e6a",
+}
+
+# How much bigger the real traces' streams are at 24 bits with the rounding error
+# carried, in percent.
+CARRIED_PERCENT_BIGGER = {"lf": 3.7, "hf": 0.1, "bb": 2.2}
 
 # The largest error over the peak that each setting can report: one step, which is
 # 1 / full_scale(bits) of the peak, rounded up.
@@ -38,9 +59,11 @@ def pack(
     return compressed, starts.reshape(shape), nbytes.reshape(shape)
 
 
-def round_trip(w: np.ndarray, bits: int) -> tuple[np.ndarray, np.ndarray]:
+def round_trip(
+    w: np.ndarray, bits: int, rounding: str = "nearest"
+) -> tuple[np.ndarray, np.ndarray]:
     """Encode a block, lay its streams end to end, and decode it, with its gains."""
-    block = encode_block(w, bits)
+    block = encode_block(w, bits, rounding=rounding)
     compressed, starts, nbytes = pack(block.streams, block.gains.shape)
     offsets = np.zeros_like(block.gains)
     decoded = decode_block(compressed, starts, nbytes, block.gains, offsets, w.shape[2])
@@ -67,6 +90,185 @@ def test_real_trace_sizes_match_the_reference(
     assert sum(map(len, block.streams)) == pytest.approx(
         REAL_TRACE_FLAC_BYTES[name][bits], rel=0.01
     )
+
+
+@pytest.mark.parametrize("name", PLAIN_AT_24_BITS_SHA256)
+@pytest.mark.parametrize("level", [5, 8])
+def test_plain_streams_are_as_1_2_0_wrote_them(
+    real_traces: RealTraces, name: str, level: int
+) -> None:
+    # The integers and the gains by their hash, and each stream byte for byte what
+    # libFLAC makes of its integers here. The streams' own hash can't be pinned, as
+    # libFLAC's arithmetic differs from one processor to another.
+    block = encode_block(real_traces(name), 24, level)
+    q = np.stack([decode_stream(stream) for stream in block.streams])
+    held = q.astype("<i4").tobytes() + block.gains.astype("<f8").tobytes()
+    assert hashlib.sha256(held).hexdigest() == PLAIN_AT_24_BITS_SHA256[name]
+    assert block.streams == [encode_stream(row, level) for row in q]
+
+
+@pytest.mark.parametrize("name", CARRIED_PERCENT_BIGGER)
+def test_carried_sizes(real_traces: RealTraces, name: str) -> None:
+    w = real_traces(name)
+    plain, carried = (
+        sum(map(len, encode_block(w, 24, rounding=rounding).streams))
+        for rounding in ("nearest", "carried")
+    )
+    bigger = 100 * (carried / plain - 1)
+    assert bigger == pytest.approx(CARRIED_PERCENT_BIGGER[name], abs=0.5)
+
+
+@pytest.mark.parametrize("name", REAL_TRACE_FLAC_BYTES)
+@pytest.mark.parametrize("bits", [24, 17, 8])
+def test_carried_real_traces_keep_both_limits(
+    real_traces: RealTraces, name: str, bits: int
+) -> None:
+    w = real_traces(name)
+    back, gains = round_trip(w, bits, "carried")
+    assert within_carried_limits(w, back, gains, bits)
+    assert within_carried_limits_of_the_setting(w, back, bits).all()
+
+
+def test_carried_holds_the_running_total(real_traces: RealTraces) -> None:
+    # What it is for: the largest running total of the errors, over the traces, in
+    # steps.
+    w = real_traces("bb")
+    step = np.abs(w).max(axis=2, keepdims=True) / (2.0**23 - 1)
+    largest = {
+        rounding: np.abs(
+            np.cumsum(w.astype(np.float64) - round_trip(w, 24, rounding)[0], axis=2)
+            / step
+        ).max()
+        for rounding in ("nearest", "carried")
+    }
+    assert largest["carried"] < 1 and largest["nearest"] > 50 * largest["carried"]
+
+
+@pytest.mark.parametrize("bits", range(8, 25))
+def test_hard_traces_come_back_within_the_carried_limits(bits: int) -> None:
+    # Each station holds one of the hard traces, in all three of its components. The
+    # check's own rules agree with the helper's, made from the README's words.
+    traces = hard_traces(nt=300, bits=bits)
+    block = np.stack([np.stack(list(traces.values()))] * 3)
+    back, gains = round_trip(block, bits, "carried")
+    ok = within_carried_limits_of_the_setting(block, back, bits)
+    assert ok.all(), [name for name, good in zip(traces, ok.all(axis=0)) if not good]
+    assert within_carried_limits(block, back, gains, bits)
+
+
+def test_carried_traces_don_t_depend_on_those_beside_them(
+    real_traces: RealTraces,
+) -> None:
+    # In a block of their own or not, and wherever a block's memory is.
+    w = real_traces("bb")[..., :3000]
+    whole = encode_block(w, 16, rounding="carried")
+    for s in range(w.shape[1]):
+        one = encode_block(w[:, s : s + 1], 16, rounding="carried")
+        assert one.streams == whole.streams[s :: w.shape[1]]
+    fortran = encode_block(np.asfortranarray(w), 16, rounding="carried")
+    assert fortran.streams == whole.streams
+
+
+def carrying_the_float64_value(trace: np.ndarray, gain: float) -> np.ndarray:
+    # What carried rounding would be if it left float32 out of what it carries.
+    owed, back = 0.0, []
+    for x in trace.tolist():
+        q = np.rint((x + owed) * gain)
+        owed += x - q / gain
+        back.append(q / gain)
+    return np.array(back, np.float32)
+
+
+CARRIED_FAULTS = [
+    "a sample three steps off",
+    "a drift of 0.002 steps a sample",
+    "a step twice what the setting promises",
+    "a doubled gain",
+    "a sample of a trace of zeros",
+    "a NaN",
+    "the float64 value carried",
+    "rounded to nearest",
+]
+
+
+@pytest.mark.parametrize("fault", CARRIED_FAULTS)
+def test_within_carried_limits_fails(real_traces: RealTraces, fault: str) -> None:
+    w = real_traces("bb").copy()
+    w[:, 4] = 0.0
+    bits = {"the float64 value carried": 8, "a drift of 0.002 steps a sample": 16}.get(
+        fault, 24
+    )
+    back, gains = round_trip(w, bits, "carried")
+    assert within_carried_limits(w, back, gains, bits)
+    trace, step = w[1, 2].astype(np.float64), 1 / gains[1, 2]
+    if fault == "a sample three steps off":
+        # At a sample too small for float32 to round the three steps away.
+        back[1, 2, np.abs(trace).argmin()] += 3 * step
+    elif fault == "a drift of 0.002 steps a sample":
+        # Only of samples whose error is small, so that each one keeps its own limit.
+        error = np.abs(trace - back[1, 2])
+        back[1, 2, error < 0.5 * step] += 0.002 * step
+        assert np.abs(trace - back[1, 2]).max() <= max(error.max(), 0.51 * step)
+    elif fault == "a step twice what the setting promises":
+        # A gain of half the setting's, which the samples were rounded with.
+        back, gains = round_trip(w, 23, "carried")
+    elif fault == "a doubled gain":
+        gains = gains.copy()
+        gains[1, 2] *= 2
+    elif fault == "a sample of a trace of zeros":
+        back[1, 4, 100] = 1e-30
+    elif fault == "a NaN":
+        back[1, 2, 100] = np.nan
+    elif fault == "the float64 value carried":
+        # At 8 bits it wanders just past its limit, and only in some of the traces.
+        back[0, 3] = carrying_the_float64_value(w[0, 3], gains[0, 3])
+    else:
+        back, _ = round_trip(w, 24)
+    assert not within_carried_limits(w, back, gains, bits)
+
+
+@pytest.mark.parametrize("bad", [0.0, -2.0, np.inf, -np.inf, np.nan])
+def test_within_carried_limits_fails_with_a_gain_that_is_not_finite_and_positive(
+    bad: float,
+) -> None:
+    original = random_walks((3, 2, 50))
+    gains = encode_block(original, 24).gains.copy()
+    assert within_carried_limits(original, original.copy(), gains, 24)
+    gains[2, 1] = bad
+    assert not within_carried_limits(original, original.copy(), gains, 24)
+
+
+@pytest.mark.parametrize("rounding", ["nearest", "carried"])
+@pytest.mark.parametrize(
+    "case",
+    ["a NaN", "an infinity", "float64", "two dimensions", "no samples", "7 bits"],
+)
+def test_what_encode_block_refuses(rounding: str, case: str) -> None:
+    w, bits, error, message = random_walks((3, 2, 600)), 24, ValueError, "float32 array"
+    if case in ("a NaN", "an infinity"):
+        w[2, 1, 400] = np.nan if case == "a NaN" else np.inf
+        error, message = NonFiniteSamples, "trace has 1 non-finite samples"
+    elif case == "float64":
+        w = w.astype(np.float64)
+    elif case == "two dimensions":
+        w = w[0]
+    elif case == "no samples":
+        w = w[:, :, :0]
+    else:
+        bits, message = 7, "bits must be from 8 to 32, got 7"
+    with pytest.raises(error, match=message):
+        encode_block(w, bits, rounding=rounding)
+
+
+@pytest.mark.parametrize(
+    ("rounding", "bits", "message"),
+    [("carried", 25, "24 bits or fewer, got 25"), ("other", 24, "got 'other'")],
+)
+def test_encode_block_refuses_a_rounding(
+    rounding: str, bits: int, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        encode_block(random_walks((3, 2, 50)), bits, rounding=rounding)
 
 
 @pytest.mark.parametrize("bits", [32, 24, 17])
