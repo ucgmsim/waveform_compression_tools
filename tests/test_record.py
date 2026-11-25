@@ -39,6 +39,7 @@ def a_result(**changes: Any) -> CompressResult:
         "n_traces": 30,
         "n_exact": 2,
         "bits": 16,
+        "rounding": "nearest",
         "max_relative_error": 1e-5,
         "output_hash": "ab" * 32,
         "read_s": 0.5,

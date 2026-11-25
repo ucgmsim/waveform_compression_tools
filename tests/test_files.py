@@ -455,16 +455,18 @@ def test_a_file_whose_components_are_x_y_z_comes_back_with_its_labels(
     assert verify_file(src, dst).passed
 
 
+@pytest.mark.parametrize("rounding", ["nearest", "carried"])
 @pytest.mark.parametrize("decoder", DECODERS)
 def test_a_file_decodes_by_the_readme_alone(
-    tmp_path: Path, standard_dataset: StandardDataset, decoder: str
+    tmp_path: Path, standard_dataset: StandardDataset, decoder: str, rounding: str
 ) -> None:
     # The README describes the file well enough to decode it with h5py and any FLAC
-    # decoder, without this package. Traces of 5,000 samples take two frames each.
+    # decoder, without this package, however it was rounded. Traces of 5,000 samples
+    # take two frames each.
     if decoder == "ffmpeg" and shutil.which("ffmpeg") is None:
         pytest.skip("ffmpeg is not on the PATH")
     _, dst = write_and_compress(
-        standard_dataset(4, nt=5_000, real=(1,)), tmp_path, bits=24
+        standard_dataset(4, nt=5_000, real=(1,)), tmp_path, bits=24, rounding=rounding
     )
     with h5py.File(dst, "r") as f:
         assert "waveform" not in f
@@ -485,6 +487,7 @@ def test_a_file_decodes_by_the_readme_alone(
         assert list(g.attrs["dims"]) == ["component", "station", "time"]
         assert g.attrs["dtype"] == "float32"
         assert g.attrs["bits"] == 24
+        assert g.attrs["rounding"] == rounding
         assert json.loads(g.attrs["waveform_attrs"]) == {"units": "g"}
         assert json.loads(g.attrs["waveform_encoding"]) == {"_FillValue": "NaN"}
         assert json.loads(g.attrs["waveform_attr_types"]) == {}
@@ -526,12 +529,14 @@ def test_failure_mid_write_leaves_nothing(
     dst = tmp_path / "out.nc"
     encoded: list[tuple[int, ...]] = []
 
-    def encode_then_fail(waveform: np.ndarray, bits: int, level: int) -> EncodedBlock:
+    def encode_then_fail(
+        waveform: np.ndarray, bits: int, level: int, rounding: str
+    ) -> EncodedBlock:
         if encoded:
             assert partial_of(dst).exists()  # The first block is in it.
             raise error("encoding failed")
         encoded.append(waveform.shape)
-        return encode_block(waveform, bits, level)
+        return encode_block(waveform, bits, level, rounding)
 
     monkeypatch.setattr(files, "encode_block", encode_then_fail)
     with pytest.raises(error, match="encoding failed"):

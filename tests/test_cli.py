@@ -394,9 +394,9 @@ def test_a_failed_check_exits_1_and_leaves_nothing(
     dst.write_bytes(b"an earlier file")
 
     def encode_then_flip_a_byte(
-        waveform: np.ndarray, bits: int, level: int
+        waveform: np.ndarray, bits: int, level: int, rounding: str
     ) -> EncodedBlock:
-        return with_a_flipped_byte(encode_block(waveform, bits, level))
+        return with_a_flipped_byte(encode_block(waveform, bits, level, rounding))
 
     def hash_all_but_the_output(path: Path) -> str:
         if path == partial_of(dst):

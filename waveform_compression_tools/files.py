@@ -26,8 +26,12 @@ The group's attributes are ``format_version`` (1), ``dims``
 ``waveform_attrs`` (the waveform's attributes, as JSON),
 ``waveform_encoding`` (its ``_FillValue`` and ``missing_value``, as JSON) and
 ``waveform_attr_types`` (the dtype of each numpy-typed attribute), ``bits`` (the quantisation
-setting), ``encoder`` (``"waveform_compression_tools"`` and the package's version) and
-``exact_rule`` (which stations have exact copies, in words).
+setting), ``rounding`` (``"nearest"`` or ``"carried"``: how the traces were rounded),
+``encoder`` (``"waveform_compression_tools"`` and the package's version) and
+``exact_rule`` (which stations have exact copies, in words). A file without
+``rounding``, as every one from before it was added, was rounded to nearest. Decoding
+doesn't depend on it, so a file decodes whatever it says. It decides which promise
+`verify_file` holds the file to.
 
 A file whose stations are all real is not compressed, so it stays exact as it is.
 
@@ -64,6 +68,7 @@ from .codec import (
     decode_block,
     encode_block,
     max_relative_error,
+    within_carried_limits,
     within_one_step,
 )
 from .content_hash import content_hash
@@ -79,7 +84,7 @@ from .errors import (
     UnknownFormat,
     about,
 )
-from .quantise import full_scale
+from .quantise import check_rounding, float32_spacing, full_scale
 from .stations import REAL_STATION_RULE, is_real_station
 
 GROUP = "_flac_compressed_waveform"
@@ -113,6 +118,8 @@ class CompressResult:
         The number of real stations, whose traces were also copied exactly.
     bits : int
         The quantisation setting.
+    rounding : str
+        How the traces were rounded: ``nearest`` or ``carried``.
     max_relative_error : float or None
         The largest error the check found in a trace that isn't kept exactly, as a
         fraction of that trace's peak: 0.0 if every such trace came back exactly or is
@@ -147,6 +154,7 @@ class CompressResult:
     n_traces: int
     n_exact: int
     bits: int
+    rounding: str
     max_relative_error: float | None
     output_hash: str
     read_s: float
@@ -172,6 +180,9 @@ class VerifyResult:
         back exactly, and NaN if the original holds a NaN.
     passed : bool
         True if the file passes every rule of `verify_file`.
+    rounding : str
+        How the file says its traces were rounded, and so which rules it was held to:
+        ``nearest`` or ``carried``.
     same_besides_samples : bool
         True if the file holds all of its original but the waveform's samples: every
         other variable, coordinate and attribute, the waveform's attributes and
@@ -185,6 +196,7 @@ class VerifyResult:
 
     max_relative_error: float
     passed: bool
+    rounding: str
     same_besides_samples: bool
     n_exact: int
     verify_s: float
@@ -487,12 +499,14 @@ def _written_dtypes(attrs: dict) -> dict[str, str]:
 
 
 def _refuse_fill_in_range(
-    block: np.ndarray, fills: list[float], bits: int, src: Path
+    block: np.ndarray, fills: list[float], bits: int, src: Path, rounding: str
 ) -> None:
     """Refuse a block with a trace that reaches a finite fill value.
 
-    A lossy sample within one step of a fill value could decode to exactly it, and
-    then read back as missing.
+    A lossy sample that may move as far as a fill value could decode to exactly it, and
+    then read back as missing. Rounded to nearest, a sample moves by one step at most,
+    and with the error carried, by a step and the spacing of float32 values at the
+    trace's peak.
 
     Parameters
     ----------
@@ -504,20 +518,25 @@ def _refuse_fill_in_range(
         The quantisation setting.
     src : Path
         The file the block is read from, for the message.
+    rounding : str
+        How the traces are to be rounded: ``nearest`` or ``carried``.
 
     Raises
     ------
     NotStandardLayout
-        If a fill value lies within one quantisation step of a trace's range.
+        If a fill value lies that near a trace's range.
     """
     if not fills:
         return
     lowest, highest = block.min(axis=2), block.max(axis=2)
     low, high = lowest.astype(np.float64), highest.astype(np.float64)
     # A trace's peak is the larger of -lowest and highest, with no copy of the block.
-    step = np.maximum(-lowest, highest) / full_scale(bits)
+    peak = np.maximum(-lowest, highest)
+    reach = peak / full_scale(bits)
+    if rounding == "carried":
+        reach = reach + float32_spacing(peak)
     for fill in fills:
-        if np.any((low - step <= fill) & (fill <= high + step)):
+        if np.any((low - reach <= fill) & (fill <= high + reach)):
             raise NotStandardLayout(
                 f"{src} has the finite fill value {fill} inside the data's range, "
                 "which can't survive lossy compression",
@@ -945,6 +964,8 @@ def compress_file(
     block_stations: int | None = None,
     check: bool = True,
     overwrite: bool = False,
+    *,
+    rounding: str = "nearest",
 ) -> CompressResult:
     """Compress a netCDF file in the standard layout, one FLAC stream per trace.
 
@@ -966,9 +987,11 @@ def compress_file(
     - During the pass, as soon as a block is written, the bytes of its streams are read
       back from the file, once, and decoded with the starts, sizes and gains recorded
       for them, and its exact copies are read back. The block has to pass
-      `verify_file`'s rules against the block still in memory: each trace within one
-      step of its own gain, and within the bound the setting promises, of its peak; a
-      trace of zeros as exact zeros; and each exact copy bit for bit. A CRC-32 is taken
+      `verify_file`'s rules against the block still in memory. Rounded to nearest, each
+      trace has to be within one step of its own gain, and within the bound the setting
+      promises, of its peak. With the error carried, each has to keep both of its limits
+      (see `waveform_compression_tools.codec.within_carried_limits`). Either way, a
+      trace of zeros has to come back as exact zeros, and each exact copy bit for bit. A CRC-32 is taken
       of each stream, from the bytes decoded, and of each exact copy, from the bytes
       compared.
     - When the pass is done, the closed partial file is reopened read-only. Its group
@@ -1006,6 +1029,10 @@ def compress_file(
         Whether to check the compressed file as it is written.
     overwrite : bool, default False
         Whether to replace a file already at `dst`. `src` itself is never replaced.
+    rounding : str, default "nearest"
+        How to round: ``nearest``, each sample to the nearest integer, or ``carried``,
+        with what a sample's rounding left out carried into the next (see
+        `waveform_compression_tools.quantise`). ``carried`` takes 24 bits or fewer.
 
     Returns
     -------
@@ -1021,15 +1048,18 @@ def compress_file(
         As `check_compressible` raises them, before any sample is read.
     NotStandardLayout
         As `check_compressible` raises it, or if `src` has a finite ``_FillValue`` or
-        ``missing_value`` within one quantisation step of a trace's range.
+        ``missing_value`` so near a trace's range that a sample could decode to it:
+        within one quantisation step or, with the error carried, within the step and
+        the spacing of float32 values at the trace's peak.
     NonFiniteSamples
         If a trace holds a NaN or an infinity.
     CheckFailed
         If `check` is true and the compressed file fails the check, a stream that
         doesn't decode included.
     ValueError
-        If `bits` is outside 8 to 32, which is checked first, or if `block_stations`
-        is less than 1.
+        If `bits` is outside 8 to 32, or `rounding` is neither ``nearest`` nor
+        ``carried``, or is ``carried`` with `bits` above 24, which are checked first, or
+        if `block_stations` is less than 1.
     FileNotFoundError
         As `check_compressible` raises it, before `src` is read.
     OSError
@@ -1040,7 +1070,10 @@ def compress_file(
     pyflac.EncoderProcessException
         If libFLAC fails to encode a trace, or to finish its stream.
     """
-    full_scale(bits)  # Refuses a setting outside 8 to 32 before the file is opened.
+    # Refuse a setting outside 8 to 32, or a rounding that doesn't take it, before the
+    # file is opened.
+    full_scale(bits)
+    check_rounding(rounding, bits)
     src, dst = Path(src), Path(dst)
     stopwatch = _Stopwatch()
     with (
@@ -1058,6 +1091,7 @@ def compress_file(
             "dtype": "float32",
             **kept,
             "bits": bits,
+            "rounding": rounding,
             "encoder": ENCODER,
             "exact_rule": REAL_STATION_RULE,
         }
@@ -1092,8 +1126,8 @@ def compress_file(
                     with naming(src):
                         block = waveform[:, s0:s1, :].values
                     stopwatch.lap("read")
-                    _refuse_fill_in_range(block, fills, bits, src)
-                    encoded = encode_block(block, bits, level)
+                    _refuse_fill_in_range(block, fills, bits, src, rounding)
+                    encoded = encode_block(block, bits, level, rounding)
                     stopwatch.lap("encode")
                     if s0 == 0:  # The first block, whose streams the group is made for.
                         group, written = _new_group(
@@ -1101,6 +1135,7 @@ def compress_file(
                             waveform,
                             exact,
                             bits,
+                            rounding,
                             kept["waveform_encoding"],
                             first_bytes=int(encoded.nbytes.sum()),
                             one_block=len(blocks) == 1,
@@ -1145,6 +1180,7 @@ def compress_file(
         n_traces=n_component * n_station,
         n_exact=int(exact.size),
         bits=bits,
+        rounding=rounding,
         max_relative_error=worst if check else None,
         output_hash=output_hash,
         read_s=stopwatch.seconds["read"],
@@ -1182,6 +1218,9 @@ class _Streams:
         The number of samples in every trace.
     bits : int
         The quantisation setting the file declares, from 8 to 32.
+    rounding : object
+        How the file says its traces were rounded, as it holds it: ``nearest`` if it
+        doesn't say, or None if what it holds can't be read. Decoding doesn't need it.
     waveform_attrs : dict
         The original waveform's attributes, each numpy value in its own type.
     encoding : dict
@@ -1200,6 +1239,7 @@ class _Streams:
     offsets: np.ndarray
     nt: int
     bits: int
+    rounding: object
     waveform_attrs: dict
     encoding: dict
     exact_stations: np.ndarray
@@ -1392,6 +1432,7 @@ def _new_group(
     waveform: xr.DataArray,
     exact: np.ndarray,
     bits: int,
+    rounding: str,
     waveform_encoding: str,
     first_bytes: int,
     one_block: bool,
@@ -1417,6 +1458,8 @@ def _new_group(
         The real stations, in increasing order.
     bits : int
         The quantisation setting.
+    rounding : str
+        How the traces are rounded: ``nearest`` or ``carried``.
     waveform_encoding : str
         The waveform's ``_FillValue`` and ``missing_value``, as `_encoding_json` wrote
         them.
@@ -1458,6 +1501,7 @@ def _new_group(
         offsets=np.zeros(traces),
         nt=nt,
         bits=bits,
+        rounding=rounding,
         waveform_attrs=dict(waveform.attrs),
         encoding=_encoding_back(waveform_encoding),
         exact_stations=exact,
@@ -1539,6 +1583,63 @@ def _without_chunk_cache(group: h5py.Group, name: str) -> h5py.Dataset:
     access = h5py.h5p.create(h5py.h5p.DATASET_ACCESS)
     access.set_chunk_cache(0, 0, 1.0)
     return h5py.Dataset(h5py.h5d.open(group.id, name.encode(), access))
+
+
+def _rounding(group: h5py.Group) -> object:
+    """Read how a compressed file says its traces were rounded, whatever it holds.
+
+    Decoding doesn't depend on it, so this never fails. It doesn't check what it reads
+    either (see `_refuse_unknown_rounding`).
+
+    Parameters
+    ----------
+    group : h5py.Group
+        The compressed waveform's group.
+
+    Returns
+    -------
+    object
+        The group's ``rounding``, or ``"nearest"`` if it has none, as a file from
+        before it was added hasn't, or None if it can't be read.
+    """
+    if "rounding" not in group.attrs:
+        return "nearest"
+    try:
+        return group.attrs["rounding"]
+    # h5py's errors for one of a type it has nothing to read as, one whose value can't
+    # be converted, and one that can't be read from the file at all.
+    except (TypeError, ValueError, KeyError, OSError, RuntimeError):
+        return None
+
+
+def _refuse_unknown_rounding(streams: _Streams, path: Path) -> str:
+    """Refuse to judge a file that doesn't say its rounding in a way known here.
+
+    Parameters
+    ----------
+    streams : _Streams
+        The file's streams.
+    path : Path
+        The file, which the error names.
+
+    Returns
+    -------
+    str
+        How the file says its traces were rounded: ``nearest`` or ``carried``.
+
+    Raises
+    ------
+    UnknownFormat
+        If it says anything else, or ``carried`` with a setting above 24 bits, which
+        carried rounding doesn't take.
+    """
+    try:
+        check_rounding(streams.rounding, streams.bits)
+    except ValueError as e:
+        raise UnknownFormat(
+            f"{path} has a rounding that can't be verified: {e}", path
+        ) from e
+    return str(streams.rounding)
 
 
 def _open_streams(f: h5py.File, path: Path) -> _Streams:
@@ -1646,6 +1747,7 @@ def _open_streams(f: h5py.File, path: Path) -> _Streams:
             offsets=group["stream_offsets"][...],
             nt=nt,
             bits=bits,
+            rounding=_rounding(group),
             waveform_attrs=waveform_attrs,
             encoding=_encoding_back(group.attrs["waveform_encoding"]),
             exact_stations=exact_stations,
@@ -1735,12 +1837,17 @@ def _compare_block(
     """Judge a decoded block of stations by verify's rules, against the original's.
 
     Every trace's FLAC stream counts, a real station's too, since a reader that ignores
-    the exact copies decodes it. Each trace's largest error has to be within the bound
-    the file's setting promises, ``1 / full_scale(bits)`` of its peak with a relative
-    slack of 1e-9, whatever its gain says; and every sample has to be within one step of
-    its own gain (see `waveform_compression_tools.codec.within_one_step`), so a trace of
-    zeros has to come back as exact zeros. Then, with the file's exact copies put back,
-    every real station has to come back bit for bit.
+    the exact copies decodes it. How the file says it was rounded decides the rules.
+
+    Rounded to nearest, each trace's largest error has to be within the bound the file's
+    setting promises, ``1 / full_scale(bits)`` of its peak with a relative slack of 1e-9,
+    whatever its gain says; and every sample has to be within one step of its own gain
+    (see `waveform_compression_tools.codec.within_one_step`). With the error carried,
+    every trace has to keep both of its limits, on its samples and on their running
+    total (see `waveform_compression_tools.codec.within_carried_limits`).
+
+    Either way, a trace of zeros has to come back as exact zeros. Then, with the file's
+    exact copies put back, every real station has to come back bit for bit.
 
     Parameters
     ----------
@@ -1768,16 +1875,19 @@ def _compare_block(
         Whether the block passes.
     """
     error = max_relative_error(block, decoded)
+    gains = streams.gains[:, s0:s1]
     # Each check covers what the others can't. The bound holds every stream to what the
     # file's setting promises, whatever its gains say, so it fails an encoder that wrote
     # wrong gains consistently. One step holds a trace of zeros to exact zeros, where
-    # the bound sees no error at all. With the exact copies back, a real station has to
-    # come back bit for bit, though neither of the others would see a sample of it
-    # moved by less than a step.
-    bound = (1 + STEP_SLACK) / full_scale(streams.bits)
-    passed = bool(np.all(error <= bound)) and within_one_step(
-        block, decoded, streams.gains[:, s0:s1]
-    )
+    # the bound sees no error at all. The carried limits do both, and hold the running
+    # total, which neither sees. With the exact copies back, a real station has to come
+    # back bit for bit, though none of the others would see a sample of it moved by less
+    # than a step.
+    if streams.rounding == "carried":
+        passed = within_carried_limits(block, decoded, gains, streams.bits)
+    else:
+        bound = (1 + STEP_SLACK) / full_scale(streams.bits)
+        passed = bool(np.all(error <= bound)) and within_one_step(block, decoded, gains)
     copies, put_back = _in_block(streams.exact_stations, s0, s1)
     decoded[:, put_back] = streams.exact_waveform[:, copies]
     # The error reported is of the file as it decompresses.
@@ -2129,9 +2239,10 @@ def decompress_file(path: str | os.PathLike[str]) -> xr.Dataset:
         attribute is in its own type again, and the waveform's encoding has its
         ``_FillValue`` and ``missing_value`` as the original had them, so the dataset
         is written to a file as the original was. The real stations' traces are the
-        exact copies the file holds; every other sample is within one quantisation
-        step of the original. The whole waveform is decoded, so it has to fit in
-        memory.
+        exact copies the file holds. Every other sample is within one quantisation step
+        of the original or, in a file with the error carried, within the step and the
+        spacing of float32 values at its trace's peak. The whole waveform is decoded, so
+        it has to fit in memory.
 
     Raises
     ------
@@ -2314,17 +2425,30 @@ def verify_file(
     The compressed file is decoded as it was written, from its own streams, gains
     and offsets, and each block is compared with the same stations of the original.
     Every trace's FLAC stream is checked, a real station's too, since a reader that
-    ignores the exact copies decodes it. Each trace's largest error has to be within
-    the bound the file's setting promises: ``1 / full_scale(bits)`` of the trace's
-    peak, with the same relative slack of 1e-9 as a step, whatever gains the file
-    holds. Every sample also has to be within one quantisation step of the original
-    (see `waveform_compression_tools.codec.within_one_step`), so a trace of zeros has to come back
-    as exact zeros. Then, with the exact copies put back, every real station (see
-    `waveform_compression_tools.stations`) has to come back bit for bit, and the file has to hold
-    exact copies of the real stations and of no others. The waveform's attributes,
-    and everything besides the waveform (every other variable, coordinate and
-    attribute), have to be identical to the original's. So do the types the waveform's
-    attributes come back in, and its ``_FillValue`` and ``missing_value``.
+    ignores the exact copies decodes it. The file is held to the promise of the rounding
+    it says it has:
+
+    - ``nearest``, or no ``rounding`` at all, as in a file from before it was added: each
+      trace's largest error has to be within the bound the file's setting promises,
+      ``1 / full_scale(bits)`` of the trace's peak, with the same relative slack of 1e-9
+      as a step, whatever gains the file holds. Every sample also has to be within one
+      quantisation step of the original (see
+      `waveform_compression_tools.codec.within_one_step`).
+    - ``carried``: every sample, and the running total of the samples, has to be within
+      its limit of the original's (see
+      `waveform_compression_tools.codec.within_carried_limits`).
+
+    Either way, a trace of zeros has to come back as exact zeros. Then, with the exact
+    copies put back, every real station (see `waveform_compression_tools.stations`) has
+    to come back bit for bit, and the file has to hold exact copies of the real stations
+    and of no others. The waveform's attributes, and everything besides the waveform
+    (every other variable, coordinate and attribute), have to be identical to the
+    original's. So do the types the waveform's attributes come back in, and its
+    ``_FillValue`` and ``missing_value``.
+
+    A file can't prove which way it was rounded. With few bits a trace rounded one way
+    can keep the other's promise too, and either way a file that passes keeps the
+    promise of the rounding it says it has.
 
     Parameters
     ----------
@@ -2341,9 +2465,9 @@ def verify_file(
     Returns
     -------
     VerifyResult
-        The largest error relative to a trace's peak, whether the file passed, whether
-        it holds all of the original but the waveform's samples, the number of real
-        stations, and the time the check took.
+        The largest error relative to a trace's peak, whether the file passed, the
+        rounding it says it has, whether it holds all of the original but the waveform's
+        samples, the number of real stations, and the time the check took.
 
     Raises
     ------
@@ -2354,8 +2478,9 @@ def verify_file(
     NotCompressed
         If `compressed` is a file that isn't HDF5, or holds no compressed waveform.
     UnknownFormat
-        If `compressed` is in a format version other than 1, or has a setting outside
-        8 to 32.
+        If `compressed` is in a format version other than 1, has a setting outside 8 to
+        32, or has a ``rounding`` that is neither ``nearest`` nor ``carried``, or is
+        ``carried`` with a setting above 24.
     Damaged
         If `compressed` lacks a part of the format, its parts disagree with each other,
         or a stream is damaged or decodes to the wrong number of samples. It names
@@ -2383,6 +2508,7 @@ def verify_file(
             _refuse_unless_hdf5(compressed, NotCompressed)
             f = open_files.enter_context(h5py.File(compressed, "r"))
             streams = _open_streams(f, compressed)
+            rounding = _refuse_unknown_rounding(streams, compressed)
             rest = xr.load_dataset(compressed, engine="h5netcdf")
         waveform = ds["waveform"]
         if streams.shape != waveform.shape:
@@ -2410,6 +2536,7 @@ def verify_file(
     return VerifyResult(
         max_relative_error=float(worst),
         passed=passed,
+        rounding=rounding,
         same_besides_samples=same,
         n_exact=int(real.size),
         verify_s=time.perf_counter() - start,

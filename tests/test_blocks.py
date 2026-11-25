@@ -69,6 +69,8 @@ def _peak(step: str, src: Path, dst: Path, again: Path) -> int:
     try:
         if step == "compress":
             compress_file(src, again)
+        elif step == "compress carried":
+            compress_file(src, again, bits=24, rounding="carried")
         elif step == "decompress":
             decompress_to(dst, again)
             again.unlink()  # A whole waveform, and the tests' folder is in memory.
@@ -104,7 +106,9 @@ def compressed_sizes(
     return written
 
 
-@pytest.mark.parametrize("step", ["compress", "verify", "decompress"])
+@pytest.mark.parametrize(
+    "step", ["compress", "compress carried", "verify", "decompress"]
+)
 def test_peak_memory_stays_flat(
     tmp_path: Path,
     compressed_sizes: dict[tuple[int, int], tuple[Path, Path]],

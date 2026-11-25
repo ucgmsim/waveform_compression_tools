@@ -117,8 +117,10 @@ def test_a_corrupted_stream_fails_the_check_and_leaves_nothing(
     monkeypatch: pytest.MonkeyPatch,
     damage: str,
 ) -> None:
-    def encode_then_damage(waveform: np.ndarray, bits: int, level: int) -> EncodedBlock:
-        encoded = encode_block(waveform, bits, level)
+    def encode_then_damage(
+        waveform: np.ndarray, bits: int, level: int, rounding: str
+    ) -> EncodedBlock:
+        encoded = encode_block(waveform, bits, level, rounding)
         if damage == "a flipped byte":
             return with_a_flipped_byte(encoded)
         # Component 1 of station 2's stream is replaced.
@@ -158,16 +160,18 @@ def test_a_corrupted_stream_fails_the_check_and_leaves_nothing(
 
 
 def encode_with_a_doubled_gain(
-    waveform: np.ndarray, bits: int, level: int
+    waveform: np.ndarray, bits: int, level: int, rounding: str
 ) -> EncodedBlock:
     # One trace's stream as encode_block writes it, but with twice its gain.
-    encoded = encode_block(waveform, bits, level)
+    encoded = encode_block(waveform, bits, level, rounding)
     gains = encoded.gains.copy()
     gains[1, 2] *= 2
     return EncodedBlock(encoded.streams, encoded.nbytes, gains)
 
 
-def encode_with_gains_of_1(waveform: np.ndarray, bits: int, level: int) -> EncodedBlock:
+def encode_with_gains_of_1(
+    waveform: np.ndarray, bits: int, level: int, rounding: str
+) -> EncodedBlock:
     # As an encoder that wrote gains of 1 would: every trace rounded to whole units, so
     # every sample is within one step, 1, of the original, and far outside the bound of
     # the setting the file declares.
@@ -253,6 +257,7 @@ DAMAGE_AFTER_THE_PASS = [
     "a byte more of streams",
     "another trace length",
     "a finer setting claimed",
+    "another rounding claimed",
     "another waveform_encoding",
     "no waveform_attr_types",
     "a dataset more",
@@ -294,6 +299,8 @@ def test_damage_after_the_pass_fails_the_structure_check(
                 g["stream_starts"].attrs["stream_size"] = 399
             elif damage == "a finer setting claimed":
                 g.attrs["bits"] = 32
+            elif damage == "another rounding claimed":
+                g.attrs["rounding"] = "carried"
             elif damage == "another waveform_encoding":
                 g.attrs["waveform_encoding"] = '{"_FillValue": -999.0}'
             elif damage == "no waveform_attr_types":

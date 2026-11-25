@@ -30,13 +30,14 @@ CARRIED_MAX_BITS = 24
 _STRETCH = 256
 
 
-def check_rounding(rounding: str, bits: int) -> None:
+def check_rounding(rounding: object, bits: int) -> None:
     """Check that a rounding is one of `ROUNDINGS`, and takes the given bits.
 
     Parameters
     ----------
-    rounding : str
-        How to round: ``nearest`` or ``carried``.
+    rounding : object
+        How to round: ``nearest`` or ``carried``. Anything else is refused, as a file
+        can hold anything in the place of one.
     bits : int
         Bits per sample.
 
@@ -45,7 +46,7 @@ def check_rounding(rounding: str, bits: int) -> None:
     ValueError
         If `rounding` is neither, or is ``carried`` with `bits` above 24.
     """
-    if rounding not in ROUNDINGS:
+    if not isinstance(rounding, str) or rounding not in ROUNDINGS:
         raise ValueError(f"rounding must be 'nearest' or 'carried', got {rounding!r}")
     if rounding == "carried" and bits > CARRIED_MAX_BITS:
         raise ValueError(
