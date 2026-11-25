@@ -328,9 +328,11 @@ def _block_done(out: HDF5Output | None = None) -> None:
     The arrays go first so that they aren't kept while the next block is read, nor by
     an error raised here. pyflac's encoders and decoders keep their output in
     reference cycles, which would otherwise wait for the next collection and add up;
-    they are all young, so a young collection frees them, without walking the whole
-    heap. Then a write that failed, or a Ctrl-C, stops the run, before what HDF5
-    writes from then on, held in memory, adds up.
+    they are all young, so collecting the young frees them, without walking the whole
+    heap. Some may have reached the second generation, and Python 3.14.4's collector
+    frees nothing that is new when asked for the second, so both are collected. Then a
+    write that failed, or a Ctrl-C, stops the run, before what HDF5 writes from then
+    on, held in memory, adds up.
 
     Parameters
     ----------
@@ -345,6 +347,7 @@ def _block_done(out: HDF5Output | None = None) -> None:
     OSError
         If a write to `out` failed.
     """
+    gc.collect(0)
     gc.collect(1)
     if out is not None:
         out.raise_pending()
