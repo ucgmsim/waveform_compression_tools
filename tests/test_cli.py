@@ -37,7 +37,7 @@ from waveform_compression_tools.files import (
     verify_file,
 )
 from waveform_compression_tools.hfbin import read_hfbin
-from waveform_compression_tools.quantise import full_scale, quantise
+from waveform_compression_tools.quantise import full_scale, quantise_carried
 from waveform_compression_tools.stream import encode_stream
 
 from helpers import (
@@ -203,28 +203,24 @@ def test_compress_then_verify(
 @pytest.mark.parametrize(
     ("options", "bits", "level", "rounding", "checked"),
     [
-        pytest.param([], 32, 5, "nearest", True, id="the default"),
+        pytest.param([], 24, 5, "carried", True, id="the default"),
         pytest.param(
-            ["--bits", "8", "--level", "0"], 8, 0, "nearest", True, id="8 bits"
+            ["--bits", "8", "--level", "0"], 8, 0, "carried", True, id="8 bits"
         ),
         pytest.param(
-            ["--bits", "24", "--level", "8", "--no-check"],
-            24,
-            8,
-            "nearest",
-            False,
-            id="24 bits unchecked",
+            ["--level", "8", "--no-check"], 24, 8, "carried", False, id="unchecked"
         ),
         pytest.param(
-            ["--bits", "24", "--rounding", "carried"],
-            24,
+            ["--rounding", "carried"], 24, 5, "carried", True, id="carried, asked for"
+        ),
+        pytest.param(["--rounding", "nearest"], 24, 5, "nearest", True, id="nearest"),
+        pytest.param(
+            ["--bits", "32", "--rounding", "nearest"],
+            32,
             5,
-            "carried",
+            "nearest",
             True,
-            id="24 bits carried",
-        ),
-        pytest.param(
-            ["--rounding", "nearest"], 32, 5, "nearest", True, id="nearest, asked for"
+            id="nearest at 32 bits",
         ),
     ],
 )
@@ -383,7 +379,7 @@ def test_each_refusal_exits_3_with_one_line_and_a_record(
         record["level"],
         record["checked"],
         record["max_relative_error"],
-    ) == (32, 5, False, None)
+    ) == (24, 5, False, None)
     assert (record["n_traces"], record["n_exact_stations"]) == (None, None)
     assert (record["seconds"]["hash"] > 0) is after_the_hash
 
@@ -631,20 +627,22 @@ def test_an_unknown_rounding_is_a_usage_error(
     assert names_in(tmp_path) == ["in.nc"]
 
 
-@pytest.mark.parametrize("bits", [[], ["--bits", "25"], ["--bits", "32"]])
+@pytest.mark.parametrize("bits", ["25", "32"])
+@pytest.mark.parametrize("asked", [[], ["--rounding", "carried"]])
 def test_carried_needs_24_bits_or_fewer(
-    tmp_path: Path, standard_dataset: StandardDataset, bits: list[str]
+    tmp_path: Path, standard_dataset: StandardDataset, bits: str, asked: list[str]
 ) -> None:
     # Before the record's destination is looked at: one is there already, which would
     # be refused.
     src = write(standard_dataset(2, nt=50), tmp_path / "in.nc")
     dst, rec = tmp_path / "out.nc", tmp_path / "rec.json"
     rec.write_text("an earlier record")
-    result = run("compress", src, dst, "--record", rec, "--rounding", "carried", *bits)
+    result = run("compress", src, dst, "--record", rec, "--bits", bits, *asked)
     assert_exit(result, EXIT_USAGE)
     # Typer wraps its message, in a box of its own.
     words = " ".join(result.stderr.replace("│", " ").split())
-    assert "--rounding" in words and "--bits 24 or fewer" in words
+    assert "'--bits' and '--rounding'" in words and f"got {bits}" in words
+    assert "give --bits 24 or fewer, or --rounding nearest" in words
     assert result.stdout == "" and names_in(tmp_path) == ["in.nc", "rec.json"]
     assert rec.read_text() == "an earlier record"
 
@@ -654,13 +652,13 @@ def test_compress_and_verify_say_the_rounding_if_it_is_carried(
 ) -> None:
     src = write(standard_dataset_of(real_traces("bb")), tmp_path / "in.nc")
     plain, carried = tmp_path / "plain.nc", tmp_path / "carried.nc"
-    result = run("compress", src, plain, "--bits", "24")
+    result = run("compress", src, plain, "--rounding", "nearest")
     assert_exit(result, EXIT_OK)
     assert result.stdout.startswith(
         f"compressed {src} to {plain} at 24 bits: 30 traces, 0 real stations also "
         "kept exactly\n"
     )
-    result = run("compress", src, carried, "--bits", "24", "--rounding", "carried")
+    result = run("compress", src, carried)
     assert_exit(result, EXIT_OK)
     assert result.stdout.startswith(
         f"compressed {src} to {carried} at 24 bits with carried rounding: 30 traces, "
@@ -919,7 +917,8 @@ def test_a_damaged_file_fails_the_check(
             # libFLAC decodes them without an error: only a count of the samples finds
             # the cut.
             gain = g["stream_gains"][c, s]
-            frames = encode_stream(quantise(ds["waveform"].values[c, s, :8192], gain))
+            first = ds["waveform"].values[c, s : s + 1, :8192]
+            frames = encode_stream(quantise_carried(first, np.array([gain]), 24)[0])
             assert g["compressed"][start : start + size].tobytes().startswith(frames)
             g["stream_bytes"][c, s] = len(frames)
         elif damage == "a cut to nothing":

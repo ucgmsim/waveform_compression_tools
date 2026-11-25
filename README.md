@@ -1,6 +1,6 @@
 # waveform_compression_tools
 
-Compresses the float32 seismic waveforms in netCDF files to FLAC, one stream per trace (one component at one station), and checks what it writes. Every sample comes back within one quantisation step of the original, at a setting from 8 to 32 bits, or within two with an optional way to round that keeps slow motion far better, and the traces of real stations come back exactly. Everything else in the file is kept as it was. A compressed file is still an ordinary netCDF-4 file, and its streams decode with any FLAC tool that handles 32-bit samples.
+Compresses the float32 seismic waveforms in netCDF files to FLAC, one stream per trace (one component at one station), and checks what it writes. Every sample comes back within two quantisation steps of the original, at a setting of 24 bits unless you choose another, and a trace's running total within one, which keeps slow motion too. Rounded another way, every sample comes back within one step, at a setting of up to 32 bits. The traces of real stations come back exactly. Everything else in the file is kept as it was. A compressed file is still an ordinary netCDF-4 file, and its streams decode with any FLAC tool that handles 32-bit samples.
 
 ## What it is
 
@@ -14,36 +14,36 @@ A Python package, `waveform_compression_tools`, and a command, `waveform-compres
 
 An input has to be in the standard layout: a float32 data variable `waveform` with exactly the dimensions (component, station, time), a `station` coordinate that names the stations, and no HDF5 group besides the root. The components can be named anything, such as `x`, `y`, `z` or `000`, `090`, `ver`.
 
-`compress`, `verify` and `decompress` work a block of stations at a time, so their memory doesn't grow with the file. On a synthetic file of 36.4 GiB, `compress` peaked at 0.74 GB of resident memory, and `verify` at 0.76 GB. `decompress` peaked at 0.34 GB for 3.5 GiB of waveform, and at 0.35 GB for 10.6 GiB.
+`compress`, `verify` and `decompress` work a block of stations at a time, so their memory doesn't grow with the file. On a synthetic file of 36.4 GiB, `compress --rounding nearest` peaked at 0.74 GB of resident memory, and `verify` at 0.76 GB. `decompress` peaked at 0.34 GB for 3.5 GiB of waveform, and at 0.35 GB for 10.6 GiB.
 
 ### Choosing a setting
 
-The setting, `--bits` on the command line or `bits` in Python, is from 8 to 32, and 32 by default. A trace's gain is `full_scale / peak`, where `peak` is its largest absolute sample and `full_scale = 2**(bits - 1) - 1`, in float64; a trace of zeros has a gain of 1. Each sample is multiplied by the gain and rounded to an integer. One quantisation step is `1 / gain`, which is `peak / full_scale`, so every decoded sample is within `1 / full_scale` of its trace's peak, with a relative slack of 1e-9 for rounding in float64, unless you choose the other way to round (see [Choosing how to round](#choosing-how-to-round)). A trace of zeros comes back as exact zeros.
+The setting, `--bits` on the command line or `bits` in Python, is from 8 to 32, and 24 by default. More than 24 takes `--rounding nearest` (see [Choosing how to round](#choosing-how-to-round)). A trace's gain is `full_scale / peak`, where `peak` is its largest absolute sample and `full_scale = 2**(bits - 1) - 1`, in float64; a trace of zeros has a gain of 1. Each sample is multiplied by the gain and rounded to an integer. One quantisation step is `1 / gain`, which is `peak / full_scale`. Rounded to the nearest integer, every decoded sample is within a step, so within `1 / full_scale` of its trace's peak, with a relative slack of 1e-9 for rounding in float64; rounded with the error carried, which is the default, within about two (see [Choosing how to round](#choosing-how-to-round)). A trace of zeros comes back as exact zeros.
 
-| `bits` | One step, as a fraction of the trace's peak | Random walks: N× smaller |
+| `bits` | One step, as a fraction of the trace's peak | Random walks, rounded to nearest: N× smaller |
 |---|---|---|
-| 32, the default | 4.7e-10 | 1.25× |
-| 24 | 1.2e-7 | 1.8× |
+| 32 | 4.7e-10 | 1.25× |
+| 24, the default | 1.2e-7 | 1.8× |
 | 16 | 3.1e-5 | 3.4× |
 | 8 | 7.9e-3 | 16× |
 
 - At 24 bits, a step is about the spacing of float32 values at the trace's peak. At 32 bits it is 256 times finer.
 - The bound is relative to the trace's peak, not to each sample, so a sample far below the peak has a larger relative error.
 - A lower setting makes smaller files: the streams hold 32-bit integers at every setting, and a lower setting makes the integers smaller.
-- How much smaller depends on the waveforms. The factors above are for synthetic random walks like the tests' (300 stations of 39,629 samples, each trace the cumulative sum of unit normal steps), in which every step is new noise; on them, each bit fewer took about one bit off each sample in the streams. To choose, compress a typical file at the settings you are weighing, and compare the factors that `compress` prints.
+- How much smaller depends on the waveforms. The factors above are for synthetic random walks like the tests' (300 stations of 39,629 samples, each trace the cumulative sum of unit normal steps), in which every step is new noise; on them, each bit fewer took about one bit off each sample in the streams. With the error carried they are the same at 24 and 16 bits, though real waveforms come out a little larger (see [Choosing how to round](#choosing-how-to-round)). To choose, compress a typical file at the settings you are weighing, and compare the factors that `compress` prints.
 
 `--level`, from 0 (fastest) to 8 (smallest) and 5 by default, is FLAC's compression level. It changes only the size of the streams and the time taken, never the samples. The compressed file doesn't record it; the record does (see [The record](#the-record)).
 
 ### Choosing how to round
 
-`--rounding` on the command line, or `rounding` in Python, is `nearest`, the default, or `carried`.
+`--rounding` on the command line, or `rounding` in Python, is `carried`, the default, or `nearest`.
 
-- **`nearest`** rounds each sample to the nearest integer, so every decoded sample is within one step of the original. A trace's rounding errors needn't cancel, so its running total can wander many steps from the original's.
 - **`carried`** adds what a sample's rounding left out to the next sample, before that one is rounded. (It is also called error feedback, or first-order noise shaping.) Every decoded sample is within `step + spacing` of the original, and its trace's running total is within `(step + spacing) / 2` of the original's, at every sample. `spacing` is that of float32 values at the trace's peak: `2**(e - 23)` for a peak in `[2**e, 2**(e + 1))`, and never less than `2**-149`. For any peak above 1.2e-38, the limits are at most two steps and one step at 24 bits, and 1.004 steps and 0.502 at 16. The relative slack is 1e-8 on the first and 1e-6 on the second. A trace of zeros comes back as exact zeros either way.
+- **`nearest`** rounds each sample to the nearest integer, so every decoded sample is within one step of the original. A trace's rounding errors needn't cancel, so its running total can wander many steps from the original's.
 
-`nearest` suits most uses. `carried` is for waveforms that will be integrated: velocity is the running total of acceleration, and displacement is velocity's, so it helps peak ground displacement, response spectra at long periods, and Fourier amplitudes at low frequencies. On the BB traces in `tests/real_traces` at 24 bits, the largest error of a running total is 96.5 steps with `nearest` and 0.94 with `carried`.
+`carried` suits waveforms that intensity measures will be computed from. Velocity is the running total of acceleration, and displacement is velocity's, so with `nearest`, peak ground displacement, response spectra at long periods and Fourier amplitudes at low frequencies can be many times further from the original's than peak acceleration is, above all for small or distant earthquakes. `carried` keeps them all close, and puts peak acceleration and response spectra at short periods up to about twice as far, which in the files measured at 24 bits was still about a millionth of their value. Choose `nearest` for more than 24 bits, or where each sample's own limit, or the size of the file, matters more than slow motion. On the BB traces in `tests/real_traces` at 24 bits, the largest error of a running total is 96.5 steps with `nearest` and 0.94 with `carried`.
 
-What `carried` costs:
+What `carried` costs, against `nearest`:
 
 - **It moves the rounding error from slow motion to fast.** On a busy trace the error is smaller below about a sixth of the sampling rate, which is 33 Hz at 200 samples a second, 17 Hz at 100 and 8 Hz at 50. Above that it is larger, by up to about 2 times. On a smooth trace only a few steps high, the crossing is lower and the factor larger, though each sample still keeps its limit.
 - **Each sample's limit is up to twice as wide,** which is what a peak sees.
@@ -88,7 +88,7 @@ In a container, the image's build runs the same pip line, so the build needs git
 ## The command line
 
 ```text
-waveform-compression-tools compress SRC DST [--bits 32] [--level 5] [--rounding nearest] [--no-check] [--record PATH] [--overwrite]
+waveform-compression-tools compress SRC DST [--bits 24] [--level 5] [--rounding carried] [--no-check] [--record PATH] [--overwrite]
 waveform-compression-tools decompress SRC DST [--overwrite]
 waveform-compression-tools verify ORIGINAL COMPRESSED
 waveform-compression-tools convert-bbbin SRC DST [--overwrite]
@@ -100,14 +100,14 @@ Each command handles one file, and its `--help` says more.
 ### compress
 
 ```bash
-waveform-compression-tools compress realisation.nc realisation.flac.nc --bits 24 --record realisation.json
+waveform-compression-tools compress realisation.nc realisation.flac.nc --record realisation.json
 ```
 
 | Option | Default | What it does |
 |---|---|---|
-| `--bits N` | 32 | the setting, from 8 to 32 |
+| `--bits N` | 24 | the setting, from 8 to 32; more than 24 takes `--rounding nearest` |
 | `--level N` | 5 | FLAC's compression level, from 0 (fastest) to 8 (smallest) |
-| `--rounding HOW` | `nearest` | how to round: `nearest`, or `carried`, which takes 24 bits or fewer (see [Choosing how to round](#choosing-how-to-round)) |
+| `--rounding HOW` | `carried` | how to round: `carried`, which takes 24 bits or fewer, or `nearest` (see [Choosing how to round](#choosing-how-to-round)) |
 | `--no-check` | | leaves out the check |
 | `--record PATH` | | writes a JSON record of the run to PATH, whatever its outcome |
 | `--overwrite` | | replaces a file already at DST, or at the record's PATH |
@@ -118,18 +118,18 @@ waveform-compression-tools compress realisation.nc realisation.flac.nc --bits 24
 2. DST is refused if it is SRC, or if a file is at DST already, and DST's folder has to exist.
 3. The refusals of SRC that need no samples: SRC isn't an HDF5 file, is compressed already, holds an HDF5 group besides its root, isn't in the standard layout, or has only real stations. Only metadata and station names are read.
 4. With `--record`, SRC is hashed.
-5. SRC is read, encoded, written and checked, a block of stations at a time. Two refusals need the samples, so they come here: a trace that holds a NaN or an infinity, and a finite fill value so near a trace's range that a sample could decode to it: within one step, or within `step + spacing` with `--rounding carried`.
+5. SRC is read, encoded, written and checked, a block of stations at a time. Two refusals need the samples, so they come here: a trace that holds a NaN or an infinity, and a finite fill value so near a trace's range that a sample could decode to it: within `step + spacing`, or within one step with `--rounding nearest`.
 6. DST is hashed, under its `.partial` name, and then renamed into place.
 7. The record is written.
 
 On success it prints what it did, such as:
 
 ```text
-compressed realisation.nc to realisation.flac.nc at 24 bits: 246000 traces, 41 real stations also kept exactly
-36.4 GiB -> 19.7 GiB, 1.8x smaller (read 23.1 s, encode 150.8 s, write 15.0 s, check 139.3 s)
+compressed realisation.nc to realisation.flac.nc at 24 bits with carried rounding: 24600 traces, 0 real stations also kept exactly
+3.6 GiB -> 2.0 GiB, 1.8x smaller (read 0.5 s, encode 20.0 s, write 1.3 s, check 14.9 s)
 ```
 
-With `--rounding carried`, the first line says `at 24 bits with carried rounding`.
+With `--rounding nearest`, the first line says only `at 24 bits`.
 
 #### Blocks and memory
 
@@ -139,7 +139,7 @@ A block holds about `BLOCK_BYTES` (128 MiB) of float32 samples, so a block has f
 
 `compress` checks its output by default, against the samples it has just read, so the original is read only once:
 
-- As soon as a block is written, its streams are read back from the file and decoded with the gains recorded for them. Every sample has to be within one step of the original, and every trace within the setting's bound of its peak, or, with `--rounding carried`, every trace has to keep both of its limits; a trace of zeros has to come back as exact zeros, and each exact copy bit for bit. A CRC-32 is taken of each stream, from the bytes decoded, and of each exact copy.
+- As soon as a block is written, its streams are read back from the file and decoded with the gains recorded for them. Every trace has to keep both of `carried`'s limits, or, with `--rounding nearest`, every sample has to be within one step of the original, and every trace within the setting's bound of its peak; a trace of zeros has to come back as exact zeros, and each exact copy bit for bit. A CRC-32 is taken of each stream, from the bytes decoded, and of each exact copy.
 - When every block is written, the closed file is reopened. It has to hold just what was written, every stream and every exact copy with the CRC-32 it had when it was judged. It also has to agree with the original in everything but the waveform's samples, as `verify` compares them: every other variable, coordinate and attribute identical, the waveform's attributes and encoding as a reader gets them back, and exact copies of the real stations and of no others.
 
 Only then is the file renamed to DST. A file that fails the check is deleted, and the run fails; a stream that can't be decoded fails the check too.
@@ -191,7 +191,7 @@ A content hash is computed as Dropbox's is: each 4 MiB block of the file is hash
 waveform-compression-tools decompress realisation.flac.nc back.nc
 ```
 
-Writes the netCDF file that SRC was made from: every variable, coordinate and attribute of the original, and its waveform as float32 with the dimensions (component, station, time), with its attributes in their types, and its `_FillValue` and `missing_value`. The real stations' traces are exactly as they were; every other sample is within one step of the original, or within its limit in a file compressed with `--rounding carried` (see [Choosing how to round](#choosing-how-to-round)). The waveform is decoded and written a block of stations at a time (see [Blocks and memory](#blocks-and-memory)), so a file of any size can be decompressed.
+Writes the netCDF file that SRC was made from: every variable, coordinate and attribute of the original, and its waveform as float32 with the dimensions (component, station, time), with its attributes in their types, and its `_FillValue` and `missing_value`. The real stations' traces are exactly as they were; every other sample keeps the promise of the file's rounding: within about two steps of the original, or within one if it was rounded to nearest (see [Choosing how to round](#choosing-how-to-round)). The waveform is decoded and written a block of stations at a time (see [Blocks and memory](#blocks-and-memory)), so a file of any size can be decompressed.
 
 ### verify
 
@@ -300,7 +300,7 @@ from waveform_compression_tools.files import (
 from waveform_compression_tools.hfbin import convert_hfbin, read_hfbin
 
 src, dst = Path("realisation.nc"), Path("realisation.flac.nc")
-result = compress_file(src, dst, bits=24)  # checks dst as it writes it
+result = compress_file(src, dst)  # checks dst as it writes it
 print(result.bytes_in / result.bytes_out, result.max_relative_error)
 
 check = verify_file(src, dst)  # the original first
@@ -317,7 +317,7 @@ convert_hfbin(Path("HF.bin"), Path("hf.nc"))
 
 A path can be given as a string or as a `pathlib.Path` object.
 
-- `compress_file(src, dst, bits=32, level=5, block_stations=None, check=True, overwrite=False, *, rounding="nearest")` returns a `CompressResult`: `bytes_in` and `bytes_out`, `n_traces`, `n_exact` (the real stations), `bits`, `rounding`, `max_relative_error` (None without the check), `output_hash` (the output's content hash), the wall time spent reading, encoding, writing, checking and hashing, from `read_s` to `hash_s`, and the CPU time of the first four, from `read_cpu_s` to `check_cpu_s`. It first makes the checks of `check_compressible(src, dst, overwrite)`: DST's, its folder included, and then the refusals of SRC that need no samples; `check_compressible` can be called on its own.
+- `compress_file(src, dst, bits=24, level=5, block_stations=None, check=True, overwrite=False, *, rounding="carried")` returns a `CompressResult`: `bytes_in` and `bytes_out`, `n_traces`, `n_exact` (the real stations), `bits`, `rounding`, `max_relative_error` (None without the check), `output_hash` (the output's content hash), the wall time spent reading, encoding, writing, checking and hashing, from `read_s` to `hash_s`, and the CPU time of the first four, from `read_cpu_s` to `check_cpu_s`. It first makes the checks of `check_compressible(src, dst, overwrite)`: DST's, its folder included, and then the refusals of SRC that need no samples; `check_compressible` can be called on its own.
 - `verify_file(original, compressed, block_stations=None)` returns a `VerifyResult`: `passed`, `rounding` (what the file records, `nearest` if nothing, and so what it was held to), `max_relative_error`, `same_besides_samples` (whether everything but the waveform's samples agrees, which `passed` needs too), `n_exact` and `verify_s`. A file that doesn't agree gives `passed=False`; it doesn't raise.
 - `decompress_file(path)` returns the original dataset, loaded into memory. `decompress_to(src, dst, overwrite=False)` writes the same dataset to a netCDF file, through a `.partial`, a block of stations at a time, so its memory doesn't grow with the file, and returns the waveform's shape, (component, station, time).
 - `read_bbbin(path)` reads a BB.bin file into a dataset in the standard layout, and `convert_bbbin(src, dst, overwrite=False)` writes that dataset to a netCDF file, through a `.partial`.
@@ -417,7 +417,7 @@ To rebuild the trace of component `c` at station `s`:
 1. Read its stream: the bytes `compressed[start : start + size]`, with `start = stream_starts[c, s]` and `size = stream_bytes[c, s]`. That is a complete FLAC file of one channel, with 32 bits per sample at every setting, in frames of 4096 samples. Its sample-rate field says 44100, which means nothing here. It was written in one pass, so its header leaves the number of samples (`nt`) and the MD5 checksum unset.
 2. Decode it to signed 32-bit integers, `q`, with a decoder that handles 32 bits per sample. libFLAC and the `flac` tool do from version 1.4 (2022) on, and older versions may not. ffmpeg does too: `ffmpeg -i trace.flac -f s32le trace.raw` writes little-endian integers. In Python, `decode_stream` in `waveform_compression_tools.stream` decodes a stream's bytes.
 3. The trace is `float32(q / gain + offset)`, with `gain = stream_gains[c, s]` and `offset = stream_offsets[c, s]`, the division and the addition done in float64.
-4. If `s` is in `exact_stations`, at position `k`, the trace is `exact_waveform[c, k]` instead, exactly as it was. Its stream decodes to within one step of the same trace, or within `carried`'s limits, so a reader that ignores the exact copies still gets a valid waveform.
+4. If `s` is in `exact_stations`, at position `k`, the trace is `exact_waveform[c, k]` instead, exactly as it was. Its stream keeps the promise of the file's rounding for the same trace, so a reader that ignores the exact copies still gets a valid waveform.
 
 ```python
 import h5py

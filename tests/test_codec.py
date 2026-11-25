@@ -86,7 +86,7 @@ def test_real_trace_sizes_match_the_reference(
     # The only check of the streams' size: a change that made them bigger, such as to
     # pyflac or to the encoder's settings, fails here and nowhere else. test_files
     # checks what a compressed file holds besides them.
-    block = encode_block(real_traces(name), bits)
+    block = encode_block(real_traces(name), bits, rounding="nearest")
     assert sum(map(len, block.streams)) == pytest.approx(
         REAL_TRACE_FLAC_BYTES[name][bits], rel=0.01
     )
@@ -100,7 +100,7 @@ def test_plain_streams_are_as_1_2_0_wrote_them(
     # The integers and the gains by their hash, and each stream byte for byte what
     # libFLAC makes of its integers here. The streams' own hash can't be pinned, as
     # libFLAC's arithmetic differs from one processor to another.
-    block = encode_block(real_traces(name), 24, level)
+    block = encode_block(real_traces(name), 24, level, "nearest")
     q = np.stack([decode_stream(stream) for stream in block.streams])
     held = q.astype("<i4").tobytes() + block.gains.astype("<f8").tobytes()
     assert hashlib.sha256(held).hexdigest() == PLAIN_AT_24_BITS_SHA256[name]
@@ -238,6 +238,17 @@ def test_within_carried_limits_fails(real_traces: RealTraces, fault: str) -> Non
 
 
 @pytest.mark.parametrize("sign", [1, -1])
+@pytest.mark.parametrize(("steps", "keeps"), [(0.999, True), (1.001, False)])
+def test_the_limit_of_one_step(steps: float, keeps: bool, sign: int) -> None:
+    # A trace with a peak of 1, then zeros of which one decodes to the error.
+    original = np.zeros((1, 1, 10), np.float32)
+    original[0, 0, 0] = 1
+    decoded = original.copy()
+    decoded[0, 0, 5] = sign * steps * 2.0**-23
+    assert within_one_step(original, decoded, np.full((1, 1), 2.0**23)) == keeps
+
+
+@pytest.mark.parametrize("sign", [1, -1])
 @pytest.mark.parametrize(
     ("errors", "gain", "keeps"),
     [
@@ -300,6 +311,13 @@ def test_what_encode_block_refuses(rounding: str, case: str) -> None:
         bits, message = 7, "bits must be from 8 to 32, got 7"
     with pytest.raises(error, match=message):
         encode_block(w, bits, rounding=rounding)
+
+
+def test_encode_block_carries_at_24_bits_unless_asked() -> None:
+    w = random_walks((3, 2, 50))
+    default, asked = encode_block(w), encode_block(w, 24, 5, "carried")
+    assert default.streams == asked.streams
+    np.testing.assert_array_equal(default.gains, asked.gains)
 
 
 @pytest.mark.parametrize(

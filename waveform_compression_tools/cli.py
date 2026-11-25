@@ -371,7 +371,7 @@ def compress(
         typer.Option(
             min=8, max=32, help="Bits of quantisation, from 8 to 32. 24 is FLAC-24."
         ),
-    ] = 32,
+    ] = 24,
     level: Annotated[
         int,
         typer.Option(
@@ -383,10 +383,10 @@ def compress(
     rounding: Annotated[
         Rounding,
         typer.Option(
-            help="How to round: each sample to the nearest integer, or with the error "
-            "carried into the next sample, which takes 24 bits or fewer."
+            help="How to round: with each sample's error carried into the next, which "
+            "takes 24 bits or fewer, or each to the nearest integer."
         ),
-    ] = Rounding.NEAREST,
+    ] = Rounding.CARRIED,
     no_check: Annotated[
         bool,
         typer.Option(
@@ -420,13 +420,13 @@ def compress(
     The waveform is read, encoded and written a block of stations at a time, so memory
     holds one block, however big the file is.
 
-    With --rounding nearest, the default, every decoded sample is within one step of the
-    original. With --rounding carried, what a sample's rounding leaves out is carried
-    into the next sample, so that the errors cancel over time. That keeps slow motion,
-    such as displacement, far better, and fast motion a little worse: the running total
-    of a trace stays within one step of the original's, and every sample within two. It
-    takes 24 bits or fewer, and makes a file larger, by a few percent at 24 bits and by
-    more at fewer. The README says when to choose it.
+    With --rounding carried, the default, what a sample's rounding leaves out is carried
+    into the next sample, so that the errors cancel over time: the running total of a
+    trace stays within one step of the original's, and every sample within two. It takes
+    24 bits or fewer. With --rounding nearest, every decoded sample is within one step
+    of the original, and the file is smaller, by a few percent at 24 bits and by more at
+    fewer, but slow motion, such as displacement, comes back far worse. The README says
+    when to choose it.
 
     A station whose name is not exactly 7 characters long is real, and its traces are
     also kept exactly as they were. A file whose stations are all real is not
@@ -454,11 +454,11 @@ def compress(
         The netCDF file to compress, in the standard layout.
     dst : Path
         Where to write the compressed file.
-    bits : int, default 32
+    bits : int, default 24
         Bits of quantisation, from 8 to 32.
     level : int, default 5
         FLAC compression level, from 0 (fastest) to 8 (smallest).
-    rounding : Rounding, default Rounding.NEAREST
+    rounding : Rounding, default Rounding.CARRIED
         How to round. `Rounding.CARRIED` takes 24 bits or fewer.
     no_check : bool, default False
         Whether to leave out the check.
@@ -481,8 +481,8 @@ def compress(
         check_rounding(rounding, bits)
     except ValueError as error:
         raise typer.BadParameter(
-            f"{error}: give --bits {CARRIED_MAX_BITS} or fewer",
-            param_hint="'--rounding'",
+            f"{error}: give --bits {CARRIED_MAX_BITS} or fewer, or --rounding nearest",
+            param_hint="'--bits' and '--rounding'",
         ) from error
     if record is not None:
         # The record is a destination too, checked before the input is read. One that

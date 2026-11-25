@@ -959,13 +959,13 @@ def check_compressible(
 def compress_file(
     src: str | os.PathLike[str],
     dst: str | os.PathLike[str],
-    bits: int = 32,
+    bits: int = 24,
     level: int = 5,
     block_stations: int | None = None,
     check: bool = True,
     overwrite: bool = False,
     *,
-    rounding: str = "nearest",
+    rounding: str = "carried",
 ) -> CompressResult:
     """Compress a netCDF file in the standard layout, one FLAC stream per trace.
 
@@ -991,9 +991,9 @@ def compress_file(
       trace has to be within one step of its own gain, and within the bound the setting
       promises, of its peak. With the error carried, each has to keep both of its limits
       (see `waveform_compression_tools.codec.within_carried_limits`). Either way, a
-      trace of zeros has to come back as exact zeros, and each exact copy bit for bit. A CRC-32 is taken
-      of each stream, from the bytes decoded, and of each exact copy, from the bytes
-      compared.
+      trace of zeros has to come back as exact zeros, and each exact copy bit for bit. A
+      CRC-32 is taken of each stream, from the bytes decoded, and of each exact copy,
+      from the bytes compared.
     - When the pass is done, the closed partial file is reopened read-only. Its group
       has to hold just what the pass wrote: the datasets and attributes written, each
       with the value written, and every stream and every exact copy with the CRC-32 it
@@ -1017,7 +1017,7 @@ def compress_file(
         coordinate that names its stations, and no HDF5 group besides its root.
     dst : str or os.PathLike
         Where to write the compressed file.
-    bits : int, default 32
+    bits : int, default 24
         The quantisation setting, from 8 to 32.
     level : int, default 5
         The FLAC compression level, from 0 (fastest) to 8 (smallest).
@@ -1029,10 +1029,10 @@ def compress_file(
         Whether to check the compressed file as it is written.
     overwrite : bool, default False
         Whether to replace a file already at `dst`. `src` itself is never replaced.
-    rounding : str, default "nearest"
-        How to round: ``nearest``, each sample to the nearest integer, or ``carried``,
-        with what a sample's rounding left out carried into the next (see
-        `waveform_compression_tools.quantise`). ``carried`` takes 24 bits or fewer.
+    rounding : str, default "carried"
+        How to round: ``carried``, with what a sample's rounding left out carried into
+        the next, which takes 24 bits or fewer, or ``nearest``, each sample to the
+        nearest integer (see `waveform_compression_tools.quantise`).
 
     Returns
     -------

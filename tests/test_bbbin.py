@@ -19,6 +19,7 @@ from waveform_compression_tools.files import (
     decompress_file,
     verify_file,
 )
+from waveform_compression_tools.quantise import full_scale
 
 from helpers import MakeBbbin, names_in, read
 
@@ -245,8 +246,8 @@ def test_converted_file_compresses(tmp_path: Path, make_bbbin: MakeBbbin) -> Non
     assert (result.n_traces, result.n_exact) == (15, 1)
     assert verify_file(nc, tmp_path / "BB.flac.nc").passed
     # What comes out is the BB.bin's waveform: the real station exactly, and the rest to
-    # within the setting's bound.
+    # within two steps at 24 bits.
     expected = np.moveaxis(data[:, :, [1, 0, 2]], 2, 0)
     got = decompress_file(tmp_path / "BB.flac.nc")["waveform"].values
-    assert max_relative_error(expected, got).max() <= 4.7e-10
+    assert max_relative_error(expected, got).max() <= 2 / full_scale(24)
     np.testing.assert_array_equal(got[:, 2], expected[:, 2])

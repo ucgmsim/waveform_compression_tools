@@ -104,7 +104,7 @@ class EncodedBlock:
 
 
 def encode_block(
-    waveform: np.ndarray, bits: int = 32, level: int = 5, rounding: str = "nearest"
+    waveform: np.ndarray, bits: int = 24, level: int = 5, rounding: str = "carried"
 ) -> EncodedBlock:
     """Compress a block of stations, one FLAC stream per trace.
 
@@ -116,14 +116,14 @@ def encode_block(
     ----------
     waveform : np.ndarray
         The block: a float32 array of shape (3, n, nt), with nt at least 1.
-    bits : int, default 32
+    bits : int, default 24
         The quantisation setting, from 8 to 32.
     level : int, default 5
         The FLAC compression level, from 0 (fastest) to 8 (smallest).
-    rounding : str, default "nearest"
-        How to round: ``nearest``, each sample to the nearest integer, or ``carried``,
-        with what a sample's rounding left out carried into the next. ``carried`` takes
-        24 bits or fewer.
+    rounding : str, default "carried"
+        How to round: ``carried``, with what a sample's rounding left out carried into
+        the next, which takes 24 bits or fewer, or ``nearest``, each sample to the
+        nearest integer.
 
     Returns
     -------

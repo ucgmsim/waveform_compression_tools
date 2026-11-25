@@ -67,15 +67,16 @@ def change_as_written(
     monkeypatch.setattr(h5py.Dataset, "__setitem__", changed)
 
 
+@pytest.mark.parametrize(("rounding", "steps"), [("nearest", 1), ("carried", 2)])
 def test_compress_checks_and_reports(
-    tmp_path: Path, standard_dataset: StandardDataset
+    tmp_path: Path, standard_dataset: StandardDataset, rounding: str, steps: int
 ) -> None:
     src = write(standard_dataset(5, nt=500, real=(1,)), tmp_path / "in.nc")
-    res = compress_file(src, tmp_path / "out.nc", bits=24)
+    res = compress_file(src, tmp_path / "out.nc", bits=24, rounding=rounding)
     # The output's content hash, taken before it was renamed into place.
     assert res.output_hash == content_hash(tmp_path / "out.nc") and res.hash_s > 0
     error = res.max_relative_error
-    assert error is not None and 0 < error <= (1 + STEP_SLACK) / full_scale(24)
+    assert error is not None and 0 < error <= steps * (1 + STEP_SLACK) / full_scale(24)
     # The error of the file as it decompresses, which verify reports too: the real
     # station's exact copy comes back as it was.
     assert error == verify_file(src, tmp_path / "out.nc").max_relative_error
@@ -300,7 +301,7 @@ def test_damage_after_the_pass_fails_the_structure_check(
             elif damage == "a finer setting claimed":
                 g.attrs["bits"] = 32
             elif damage == "another rounding claimed":
-                g.attrs["rounding"] = "carried"
+                g.attrs["rounding"] = "nearest"
             elif damage == "another waveform_encoding":
                 g.attrs["waveform_encoding"] = '{"_FillValue": -999.0}'
             elif damage == "no waveform_attr_types":

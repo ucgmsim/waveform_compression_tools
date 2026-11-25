@@ -18,6 +18,7 @@ from waveform_compression_tools.files import (
     verify_file,
 )
 from waveform_compression_tools.hfbin import convert_hfbin, read_hfbin
+from waveform_compression_tools.quantise import full_scale
 
 from helpers import (
     HFBIN_FLOATS,
@@ -291,10 +292,10 @@ def test_converted_file_compresses(tmp_path: Path, make_hfbin: MakeHfbin) -> Non
     assert (result.n_traces, result.n_exact) == (15, 1)
     assert verify_file(nc, tmp_path / "HF.flac.nc").passed
     # What comes out is the HF.bin's waveform: the real station exactly, and the rest to
-    # within the setting's bound.
+    # within two steps at 24 bits.
     expected = np.moveaxis(data[:, :, [1, 0, 2]], 2, 0)
     got = decompress_file(tmp_path / "HF.flac.nc")["waveform"].values
-    assert max_relative_error(expected, got).max() <= 4.7e-10
+    assert max_relative_error(expected, got).max() <= 2 / full_scale(24)
     np.testing.assert_array_equal(got[:, 2], expected[:, 2])
 
 

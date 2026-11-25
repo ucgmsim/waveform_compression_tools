@@ -66,20 +66,34 @@ def test_a_carried_file_verifies_and_says_so(
     assert within_carried_limits_of_the_setting(original, back, bits).all()
 
 
-def test_a_file_is_rounded_to_nearest_unless_asked(
+def test_a_file_is_carried_at_24_bits_unless_asked(
     tmp_path: Path, standard_dataset: StandardDataset
 ) -> None:
     src = write(standard_dataset(3, nt=500), tmp_path / "in.nc")
     dst, asked = tmp_path / "out.nc", tmp_path / "asked.nc"
-    assert compress_file(src, dst, bits=24).rounding == "nearest"
-    compress_file(src, asked, bits=24, rounding="nearest")
+    result = compress_file(src, dst)
+    assert result.bits == 24 and result.rounding == "carried"
+    compress_file(src, asked, bits=24, rounding="carried")
     for path in (dst, asked):
-        assert label_of(path) == "nearest"
+        assert label_of(path) == "carried"
         check = verify_file(src, path)
-        assert check.passed and check.rounding == "nearest"
+        assert check.passed and check.rounding == "carried"
     with h5py.File(dst, "r") as f, h5py.File(asked, "r") as g:
         for name in f[GROUP]:
             np.testing.assert_array_equal(f[GROUP][name][...], g[GROUP][name][...])
+
+
+@pytest.mark.parametrize("bits", [32, 25, 24, 8])
+def test_a_file_is_rounded_to_nearest_if_asked(
+    tmp_path: Path, standard_dataset: StandardDataset, bits: int
+) -> None:
+    src = write(standard_dataset(3, nt=500), tmp_path / "in.nc")
+    dst = tmp_path / "out.nc"
+    result = compress_file(src, dst, bits, rounding="nearest")
+    assert result.bits == bits and result.rounding == "nearest"
+    assert label_of(dst) == "nearest"
+    check = verify_file(src, dst)
+    assert check.passed and check.rounding == "nearest"
 
 
 @pytest.mark.parametrize(
@@ -174,9 +188,9 @@ UNKNOWN_LABELS = [
 def test_verify_refuses_a_label_it_doesnt_know_but_the_file_still_decodes(
     tmp_path: Path, standard_dataset: StandardDataset, label: str
 ) -> None:
-    bits = 25 if label == "carried at 25 bits" else 24
+    bits, rounding = (25, "nearest") if "25 bits" in label else (24, "carried")
     ds = standard_dataset(3, nt=400, real=(1,))
-    src, dst = write_and_compress(ds, tmp_path, bits=bits)
+    src, dst = write_and_compress(ds, tmp_path, bits=bits, rounding=rounding)
     before = decompress_file(dst)["waveform"].values
     values = {
         "another word": "other",
@@ -208,7 +222,7 @@ def test_verify_refuses_a_label_it_doesnt_know_but_the_file_still_decodes(
 def rounded_to_nearest(
     waveform: np.ndarray, bits: int, level: int, rounding: str
 ) -> EncodedBlock:
-    return encode_block(waveform, bits, level)
+    return encode_block(waveform, bits, level, "nearest")
 
 
 def at_one_bit_fewer(
@@ -216,6 +230,17 @@ def at_one_bit_fewer(
 ) -> EncodedBlock:
     # Steps twice as long as the setting promises, which the gains agree with.
     return encode_block(waveform, bits - 1, level, rounding)
+
+
+def test_the_check_fails_a_nearest_file_of_longer_steps(
+    tmp_path: Path, real_traces: RealTraces, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = write(standard_dataset_of(real_traces("bb")), tmp_path / "in.nc")
+    dst = tmp_path / "out.nc"
+    monkeypatch.setattr(files, "encode_block", at_one_bit_fewer)
+    with pytest.raises(CheckFailed):
+        compress_file(src, dst, bits=24, rounding="nearest")
+    assert nothing_left(dst)
 
 
 @pytest.mark.parametrize("encoder", [rounded_to_nearest, at_one_bit_fewer])

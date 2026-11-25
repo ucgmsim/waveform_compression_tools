@@ -50,9 +50,8 @@ from waveform_compression_tools.files import (
     is_compressed,
     verify_file,
 )
-from waveform_compression_tools.quantise import full_scale, gain_for, quantise
+from waveform_compression_tools.quantise import full_scale
 from waveform_compression_tools.record import write_record
-from waveform_compression_tools.stream import encode_stream
 
 from helpers import (
     MakeBbbin,
@@ -68,6 +67,7 @@ from helpers import (
     rewrite,
     run_python,
     standard_dataset_of,
+    within_carried_limits_of_the_setting,
     within_one_step_of_the_setting,
     write,
     write_and_compress,
@@ -131,27 +131,34 @@ DECODERS = {"pyflac's StreamDecoder": decode_with_pyflac, "ffmpeg": decode_with_
 
 # Station counts on both sides of a multiple of 344, the stations in a block, and an
 # odd number of samples: every station has to be compressed exactly once. The blocks
-# never see the setting, so each count is tried at 24 bits, and each other setting at
-# 345 stations, which still crosses a block boundary.
+# never see the setting, so each count is tried at 24 bits with the error carried, and
+# each other setting and rounding at 345 stations, which still crosses a block boundary.
 @pytest.mark.parametrize(
-    ("n_station", "bits"),
+    ("n_station", "bits", "rounding"),
     [
-        (1, 24),
-        (343, 24),
-        (344, 24),
-        (345, 24),
-        (700, 24),
-        (345, 8),
-        (345, 17),
-        (345, 32),
+        (1, 24, "carried"),
+        (343, 24, "carried"),
+        (344, 24, "carried"),
+        (345, 24, "carried"),
+        (700, 24, "carried"),
+        (345, 8, "carried"),
+        (345, 17, "carried"),
+        (345, 8, "nearest"),
+        (345, 17, "nearest"),
+        (345, 24, "nearest"),
+        (345, 32, "nearest"),
     ],
 )
 def test_round_trip_every_station(
-    tmp_path: Path, standard_dataset: StandardDataset, n_station: int, bits: int
+    tmp_path: Path,
+    standard_dataset: StandardDataset,
+    n_station: int,
+    bits: int,
+    rounding: str,
 ) -> None:
     src = write(standard_dataset(n_station, nt=1001), tmp_path / "realisation.bb")
     dst = tmp_path / "out.bb"
-    res = compress_file(src, dst, bits=bits, block_stations=344)
+    res = compress_file(src, dst, bits=bits, block_stations=344, rounding=rounding)
     assert res.n_traces == 3 * n_station
     assert dst.exists() and not partial_of(dst).exists()
     back, orig = decompress_file(dst), read(src)
@@ -160,7 +167,12 @@ def test_round_trip_every_station(
     assert back["waveform"].attrs == {"units": "g"}
     xr.testing.assert_identical(back.drop_vars("waveform"), orig.drop_vars("waveform"))
     original, decoded = orig["waveform"].values, back["waveform"].values
-    assert within_one_step_of_the_setting(original, decoded, bits).all()
+    kept = (
+        within_carried_limits_of_the_setting
+        if rounding == "carried"
+        else within_one_step_of_the_setting
+    )
+    assert kept(original, decoded, bits).all()
     check = verify_file(src, dst, block_stations=344)
     assert check.passed
     assert check.max_relative_error == max_relative_error(original, decoded).max()
@@ -808,7 +820,9 @@ def test_verify_holds_a_file_to_the_bound_its_setting_promises(
 ) -> None:
     # Quantised at 24 bits but labelled 32: every sample is within one step of its own
     # gain, but not within the 1 / full_scale(32) of its peak that 32 bits promise.
-    src, dst = write_and_compress(standard_dataset(3, nt=400), tmp_path, bits=24)
+    src, dst = write_and_compress(
+        standard_dataset(3, nt=400), tmp_path, bits=24, rounding="nearest"
+    )
     assert verify_file(src, dst).passed
     with h5py.File(dst, "r+") as f:
         f[GROUP].attrs["bits"] = 32
@@ -817,21 +831,22 @@ def test_verify_holds_a_file_to_the_bound_its_setting_promises(
     assert 1 / full_scale(32) < check.max_relative_error <= 1 / full_scale(24)
 
 
+@pytest.mark.parametrize("rounding", ["nearest", "carried"])
 def test_verify_fails_a_station_that_never_moved_but_decodes_to_something(
-    tmp_path: Path, standard_dataset: StandardDataset
+    tmp_path: Path, standard_dataset: StandardDataset, rounding: str
 ) -> None:
-    # Its peak is 0, so the setting's bound sees no error in it, whatever it decodes
-    # to: only the one-step check, which wants exact zeros, catches it.
+    # Its peak is 0, so no error in it is seen over its peak, whatever it decodes to:
+    # only the check of its samples, which wants exact zeros, catches it.
     ds = standard_dataset(3, nt=200)
     ds["waveform"][:, 1] = 0.0
-    src, dst = write_and_compress(ds, tmp_path)
+    src, dst = write_and_compress(ds, tmp_path, rounding=rounding)
     assert verify_file(src, dst).passed
     with h5py.File(dst, "r+") as f:
         for name in ("stream_starts", "stream_bytes"):
             index = f[GROUP][name]
             index[0, 1] = index[0, 0]  # Station 1's first trace gets station 0's.
     check = verify_file(src, dst)
-    assert not check.passed and check.max_relative_error <= 1 / full_scale(32)
+    assert not check.passed and check.max_relative_error <= 2 / full_scale(24)
 
 
 def test_a_nan_in_the_original_fails_verification_and_is_reported(
@@ -926,7 +941,7 @@ def test_verify_fails_when_the_fill_value_or_a_type_differs(
     # The samples are as close as ever: what fails is all but them.
     result = verify_file(src, dst)
     assert not result.passed and not result.same_besides_samples
-    assert result.max_relative_error <= 1 / full_scale(32)
+    assert result.max_relative_error <= 2 / full_scale(24)
 
 
 def test_a_nan_fill_value_is_written_as_strict_json(
@@ -1340,39 +1355,42 @@ def test_verify_fails_a_file_whose_other_content_changed(
     assert not verify_file(src, dst).passed
 
 
+@pytest.mark.parametrize("rounding", ["nearest", "carried"])
 @pytest.mark.parametrize(
     "fault",
     [
         pytest.param("a doubled gain", id="a doubled gain"),
-        pytest.param("a stream at 24 bits", id="a stream at 24 bits"),
+        pytest.param("a stream at fewer bits", id="a stream at fewer bits"),
         pytest.param("another station's stream", id="another station's stream"),
     ],
 )
 def test_verify_checks_the_flac_streams_of_real_stations_too(
-    tmp_path: Path, standard_dataset: StandardDataset, fault: str
+    tmp_path: Path, standard_dataset: StandardDataset, fault: str, rounding: str
 ) -> None:
     # A reader that ignores the exact copies decodes a real station's FLAC streams, so
     # they have to pass as any other station's do, though decompressing puts the exact
-    # traces in their place. A doubled gain fails both checks. A stream quantised at
-    # 24 bits in a 32-bit file is within one step of its own gain, but not within the
-    # setting's bound. A station that never moved, given another station's stream,
-    # shows no error over its peak of 0, but doesn't come back as exact zeros.
+    # traces in their place. A doubled gain fails every check. A stream quantised at 8
+    # bits fewer than the file's keeps the promise of its own gain, but not of the
+    # setting. A station that never moved, given another station's stream, shows no
+    # error over its peak of 0, but doesn't come back as exact zeros.
     ds = standard_dataset(4, nt=300, real=(1,))
     if fault == "another station's stream":
         ds["waveform"][:, 1] = 0.0
-    src, dst = write_and_compress(ds, tmp_path)
+    bits = 32 if rounding == "nearest" else 24
+    src, dst = write_and_compress(ds, tmp_path, bits=bits, rounding=rounding)
     assert verify_file(src, dst).passed
     original = ds["waveform"].values
     with h5py.File(dst, "r+") as f:
         g = f[GROUP]
         if fault == "a doubled gain":
             g["stream_gains"][0, 1] = 2 * g["stream_gains"][0, 1]
-        elif fault == "a stream at 24 bits":
-            gain = gain_for(np.abs(original[0, 1].astype(np.float64)).max(), 24)
-            stream = np.frombuffer(
-                encode_stream(quantise(original[0, 1], gain)), np.uint8
+        elif fault == "a stream at fewer bits":
+            coarse = encode_block(original[:, 1:2], bits - 8, rounding=rounding)
+            gain, stream = (
+                coarse.gains[0, 0],
+                np.frombuffer(coarse.streams[0], np.uint8),
             )
-            # In the place of the 32-bit stream, which is longer.
+            # In the place of the file's own stream, which is longer.
             start = int(g["stream_starts"][0, 1])
             assert stream.size < g["stream_bytes"][0, 1]
             g["compressed"][start : start + stream.size] = stream
