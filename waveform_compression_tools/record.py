@@ -9,7 +9,7 @@ from waveform_compression_tools import __version__
 from waveform_compression_tools.destinations import writing
 from waveform_compression_tools.files import _FORMAT_VERSION, CompressResult
 
-RECORD_VERSION = 2
+RECORD_VERSION = 3
 
 
 def make_record(
@@ -18,6 +18,7 @@ def make_record(
     input_hash: str | None,
     bits: int,
     level: int,
+    rounding: str,
     result: CompressResult | None,
     output_path: Path,
     failure: tuple[str, str] | None,
@@ -36,6 +37,8 @@ def make_record(
         The quantisation setting asked for.
     level : int
         The FLAC compression level asked for.
+    rounding : str
+        The rounding asked for: ``nearest`` or ``carried``.
     result : CompressResult or None
         What compressing made, if it finished: the record's check, its largest error,
         the numbers of traces and of real stations, the output's size and content hash,
@@ -82,6 +85,7 @@ def make_record(
         },
         "bits": bits,
         "level": level,
+        "rounding": rounding,
         "format_version": _FORMAT_VERSION,
         "checked": result is not None and result.max_relative_error is not None,
         "max_relative_error": None if result is None else result.max_relative_error,

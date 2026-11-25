@@ -28,6 +28,7 @@ import logging
 import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, NoReturn
 
@@ -37,6 +38,7 @@ import typer
 from . import bbbin, destinations, files, hfbin
 from .content_hash import content_hash
 from .errors import CheckFailed, Refused, SameFile
+from .quantise import CARRIED_MAX_BITS, check_rounding
 from .record import make_record, write_record
 
 EXIT_OK = 0
@@ -51,6 +53,14 @@ _PROGRAM = "waveform-compression-tools"
 _EXPECTED = (OSError, ValueError, CheckFailed)
 # libFLAC's errors as it encodes a trace.
 _ENCODING = (pyflac.EncoderInitException, pyflac.EncoderProcessException)
+
+
+class Rounding(StrEnum):
+    """How to round, as ``--rounding`` takes it."""
+
+    NEAREST = "nearest"
+    CARRIED = "carried"
+
 
 # Plain help and error text: the paragraphs of a command's help are reflowed, and the
 # output is the same whether or not Rich is installed.
@@ -213,6 +223,7 @@ def _write_compress_record(
     dst: Path,
     bits: int,
     level: int,
+    rounding: str,
     start: float,
     hash_s: float,
     input_hash: str | None,
@@ -232,6 +243,8 @@ def _write_compress_record(
         The setting asked for.
     level : int
         The FLAC compression level asked for.
+    rounding : str
+        The rounding asked for.
     start : float
         When the command started, by `time.perf_counter`.
     hash_s : float
@@ -258,6 +271,7 @@ def _write_compress_record(
             input_hash=input_hash,
             bits=bits,
             level=level,
+            rounding=rounding,
             result=result,
             output_path=dst,
             failure=failure,
@@ -366,6 +380,13 @@ def compress(
             help="FLAC compression level, from 0 (fastest) to 8 (smallest).",
         ),
     ] = 5,
+    rounding: Annotated[
+        Rounding,
+        typer.Option(
+            help="How to round: each sample to the nearest integer, or with the error "
+            "carried into the next sample, which takes 24 bits or fewer."
+        ),
+    ] = Rounding.NEAREST,
     no_check: Annotated[
         bool,
         typer.Option(
@@ -394,11 +415,18 @@ def compress(
     """Compress a netCDF file of waveforms to FLAC, and check it.
 
     Each trace is scaled so that its largest sample is full scale for BITS, rounded to
-    an integer and written as one FLAC stream. Every decoded sample is then within one
-    quantisation step of the original, which is 1 / (2**(BITS - 1) - 1) of its trace's
-    peak: 4.7e-10 at 32 bits and 1.2e-7 at 24. The waveform is read, encoded and
-    written a block of stations at a time, so memory holds one block, however big the
-    file is.
+    integers and written as one FLAC stream. A quantisation step is
+    1 / (2**(BITS - 1) - 1) of its trace's peak: 4.7e-10 at 32 bits and 1.2e-7 at 24.
+    The waveform is read, encoded and written a block of stations at a time, so memory
+    holds one block, however big the file is.
+
+    With --rounding nearest, the default, every decoded sample is within one step of the
+    original. With --rounding carried, what a sample's rounding leaves out is carried
+    into the next sample, so that the errors cancel over time. That keeps slow motion,
+    such as displacement, far better, and fast motion a little worse: the running total
+    of a trace stays within one step of the original's, and every sample within two. It
+    takes 24 bits or fewer, and makes a file a few percent larger. The README says when
+    to choose it.
 
     A station whose name is not exactly 7 characters long is real, and its traces are
     also kept exactly as they were. A file whose stations are all real is not
@@ -411,10 +439,10 @@ def compress(
 
     With --record, a JSON record of the run is written to PATH whether the file is
     compressed, refused or fails: the input's and the output's paths, sizes and content
-    hashes, the setting, the check's largest error, and the time spent. A file already
-    at PATH is refused first, before the input is read, unless --overwrite is given;
-    that refusal writes no record, so the earlier one stays as it was. If the record
-    can't be written, the run fails, though a compressed file stays at DST.
+    hashes, the setting, the rounding, the check's largest error, and the time spent. A
+    file already at PATH is refused first, before the input is read, unless --overwrite
+    is given; that refusal writes no record, so the earlier one stays as it was. If the
+    record can't be written, the run fails, though a compressed file stays at DST.
 
     The command exits with status 0 when the file is compressed, 1 when the run fails,
     2 for a usage error, and 3 when the file is refused. A refusal or a failure is one
@@ -430,6 +458,8 @@ def compress(
         Bits of quantisation, from 8 to 32.
     level : int, default 5
         FLAC compression level, from 0 (fastest) to 8 (smallest).
+    rounding : Rounding, default Rounding.NEAREST
+        How to round. `Rounding.CARRIED` takes 24 bits or fewer.
     no_check : bool, default False
         Whether to leave out the check.
     record : Path, optional
@@ -439,11 +469,21 @@ def compress(
 
     Raises
     ------
+    typer.BadParameter
+        If `rounding` doesn't take `bits`, or the record would be written over the input
+        or the output, which are usage errors.
     typer.Exit
         With `EXIT_REFUSED` if the file, or a file already at `record`, is refused,
         and `EXIT_FAILED` if the run fails or the record can't be written.
     """
     start = time.perf_counter()
+    try:
+        check_rounding(rounding, bits)
+    except ValueError as error:
+        raise typer.BadParameter(
+            f"{error}: give --bits {CARRIED_MAX_BITS} or fewer",
+            param_hint="'--rounding'",
+        ) from error
     if record is not None:
         # The record is a destination too, checked before the input is read. One that
         # would be written over the input or the output is a usage error. Refusing it,
@@ -473,7 +513,13 @@ def compress(
                 finally:
                     hash_s = time.perf_counter() - hashing
             outcome = files.compress_file(
-                src, dst, bits, level, check=not no_check, overwrite=overwrite
+                src,
+                dst,
+                bits,
+                level,
+                check=not no_check,
+                overwrite=overwrite,
+                rounding=rounding.value,
             )
     except _Stop as stop:
         outcome = stop
@@ -484,6 +530,7 @@ def compress(
             dst=dst,
             bits=bits,
             level=level,
+            rounding=rounding.value,
             start=start,
             hash_s=hash_s,
             input_hash=input_hash,
@@ -491,8 +538,9 @@ def compress(
         )
     if isinstance(outcome, _Stop):
         outcome.exit()
+    how = " with carried rounding" if outcome.rounding == "carried" else ""
     typer.echo(
-        f"compressed {src} to {dst} at {outcome.bits} bits: "
+        f"compressed {src} to {dst} at {outcome.bits} bits{how}: "
         f"{_count(outcome.n_traces, 'trace')}, "
         f"{_count(outcome.n_exact, 'real station')} also kept exactly"
     )
@@ -522,8 +570,9 @@ def decompress(
 
     DST is a netCDF file in the standard layout: every variable, coordinate and
     attribute of the original, and its waveform as float32 with the dimensions
-    (component, station, time). The real stations' traces are exactly as they were;
-    every other sample is within one quantisation step of the original.
+    (component, station, time). The real stations' traces are exactly as they were.
+    Every other sample is within one quantisation step of the original or, in a file
+    compressed with --rounding carried, within two.
 
     The waveform is decoded and written a block of stations at a time, so memory
     holds one block, however big the file is. The file appears at DST only when it is
@@ -587,10 +636,14 @@ def verify(
     """Check a compressed file against its original.
 
     The compressed file is decoded a block of stations at a time and compared with the
-    original. It passes if every trace decodes within the bound its setting promises
-    and within one quantisation step of the original, the real stations come back bit
-    for bit, and everything else in the file, the waveform's attributes included, is
-    identical to the original's.
+    original. It passes if every trace keeps the promise of the rounding the file says
+    it has, the real stations come back bit for bit, and everything else in the file,
+    the waveform's attributes included, is identical to the original's.
+
+    Rounded to nearest, as every file is unless --rounding carried was asked for, every
+    trace has to decode within the bound its setting promises and within one quantisation
+    step of the original. With carried rounding, every sample of a trace, and the running
+    total of its samples, has to be within its own limit of the original's.
 
     The command exits with status 0 if the file passes, 1 if it fails or can't be
     checked, 2 for a usage error, and 3 if either file is refused, as an original that
@@ -616,6 +669,8 @@ def verify(
     except _Stop as stop:
         stop.exit()
     error = f"largest error {result.max_relative_error:.2g} of a trace's peak"
+    if result.rounding == "carried":
+        error += ", held to carried rounding's limits"
     if not result.passed:
         # However small the error, a file fails if all but its samples differ.
         reason = (

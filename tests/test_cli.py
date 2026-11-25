@@ -3,6 +3,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -200,16 +201,30 @@ def test_compress_then_verify(
 
 
 @pytest.mark.parametrize(
-    ("options", "bits", "level", "checked"),
+    ("options", "bits", "level", "rounding", "checked"),
     [
-        pytest.param([], 32, 5, True, id="the default"),
-        pytest.param(["--bits", "8", "--level", "0"], 8, 0, True, id="8 bits"),
+        pytest.param([], 32, 5, "nearest", True, id="the default"),
+        pytest.param(
+            ["--bits", "8", "--level", "0"], 8, 0, "nearest", True, id="8 bits"
+        ),
         pytest.param(
             ["--bits", "24", "--level", "8", "--no-check"],
             24,
             8,
+            "nearest",
             False,
             id="24 bits unchecked",
+        ),
+        pytest.param(
+            ["--bits", "24", "--rounding", "carried"],
+            24,
+            5,
+            "carried",
+            True,
+            id="24 bits carried",
+        ),
+        pytest.param(
+            ["--rounding", "nearest"], 32, 5, "nearest", True, id="nearest, asked for"
         ),
     ],
 )
@@ -220,6 +235,7 @@ def test_compress_ok_writes_a_record(
     options: list[str],
     bits: int,
     level: int,
+    rounding: str,
     checked: bool,
 ) -> None:
     src = write(standard_dataset(4, nt=300, real=(1,)), tmp_path / "in.nc")
@@ -259,11 +275,13 @@ def test_compress_ok_writes_a_record(
         "bytes": sizes[1],
         "content_hash": content_hash(dst),
     }
-    # The setting given, or 32, reaches the file and the record, and the level given,
-    # or 5, the record.
+    # The setting given, or 32, and the rounding given, or nearest, reach the file and
+    # the record, and the level given, or 5, the record.
     with h5py.File(dst, "r") as f:
         assert int(f[GROUP].attrs["bits"]) == bits
+        assert f[GROUP].attrs["rounding"] == rounding
     assert record["bits"] == compressed.bits == bits
+    assert record["rounding"] == compressed.rounding == rounding
     assert record["level"] == level
     # Four stations of three traces, one of them real.
     assert (record["n_traces"], record["n_exact_stations"]) == (12, 1)
@@ -271,7 +289,10 @@ def test_compress_ok_writes_a_record(
     # setting promises.
     verified = verify_file(src, dst)
     assert verified.passed and verified.verify_s > 0
-    assert 0 < verified.max_relative_error <= (1 + STEP_SLACK) / full_scale(bits)
+    # With the error carried, a sample may be up to two steps off at 24 bits.
+    steps = 2 if rounding == "carried" else 1
+    largest = steps * (1 + STEP_SLACK) / full_scale(bits)
+    assert 0 < verified.max_relative_error <= largest
     assert record["checked"] is checked
     assert record["max_relative_error"] == (
         verified.max_relative_error if checked else None
@@ -598,6 +619,81 @@ def test_bits_out_of_range_is_a_usage_error(
     assert names_in(tmp_path) == ["in.nc"]
 
 
+def test_an_unknown_rounding_is_a_usage_error(
+    tmp_path: Path, standard_dataset: StandardDataset
+) -> None:
+    src = write(standard_dataset(2, nt=50), tmp_path / "in.nc")
+    dst, rec = tmp_path / "out.nc", tmp_path / "rec.json"
+    result = run("compress", src, dst, "--record", rec, "--rounding", "up")
+    assert_exit(result, EXIT_USAGE)
+    assert "--rounding" in result.stderr and result.stdout == ""
+    assert "nearest" in result.stderr and "carried" in result.stderr
+    assert names_in(tmp_path) == ["in.nc"]
+
+
+@pytest.mark.parametrize("bits", [[], ["--bits", "25"], ["--bits", "32"]])
+def test_carried_needs_24_bits_or_fewer(
+    tmp_path: Path, standard_dataset: StandardDataset, bits: list[str]
+) -> None:
+    # Before the record's destination is looked at: one is there already, which would
+    # be refused.
+    src = write(standard_dataset(2, nt=50), tmp_path / "in.nc")
+    dst, rec = tmp_path / "out.nc", tmp_path / "rec.json"
+    rec.write_text("an earlier record")
+    result = run("compress", src, dst, "--record", rec, "--rounding", "carried", *bits)
+    assert_exit(result, EXIT_USAGE)
+    # Typer wraps its message, in a box of its own.
+    words = " ".join(result.stderr.replace("│", " ").split())
+    assert "--rounding" in words and "--bits 24 or fewer" in words
+    assert result.stdout == "" and names_in(tmp_path) == ["in.nc", "rec.json"]
+    assert rec.read_text() == "an earlier record"
+
+
+def test_compress_and_verify_say_the_rounding_if_it_is_carried(
+    tmp_path: Path, real_traces: RealTraces
+) -> None:
+    src = write(standard_dataset_of(real_traces("bb")), tmp_path / "in.nc")
+    plain, carried = tmp_path / "plain.nc", tmp_path / "carried.nc"
+    result = run("compress", src, plain, "--bits", "24")
+    assert_exit(result, EXIT_OK)
+    assert result.stdout.startswith(
+        f"compressed {src} to {plain} at 24 bits: 30 traces, 0 real stations also "
+        "kept exactly\n"
+    )
+    result = run("compress", src, carried, "--bits", "24", "--rounding", "carried")
+    assert_exit(result, EXIT_OK)
+    assert result.stdout.startswith(
+        f"compressed {src} to {carried} at 24 bits with carried rounding: 30 traces, "
+        "0 real stations also kept exactly\n"
+    )
+    result = run("verify", src, plain)
+    assert_exit(result, EXIT_OK)
+    assert re.fullmatch(
+        rf"verified: {re.escape(str(plain))} agrees with {re.escape(str(src))} "
+        r"\(largest error \S+ of a trace's peak; 0 real stations exact; "
+        r"checked in \S+ s\)\n",
+        result.stdout,
+    )
+    result = run("verify", src, carried)
+    assert_exit(result, EXIT_OK)
+    assert re.fullmatch(
+        rf"verified: {re.escape(str(carried))} agrees with {re.escape(str(src))} "
+        r"\(largest error \S+ of a trace's peak, held to carried rounding's limits; "
+        r"0 real stations exact; checked in \S+ s\)\n",
+        result.stdout,
+    )
+    # A plain file that says it's carried keeps every sample's limit, so its largest
+    # error doesn't say what is wrong with it.
+    with h5py.File(plain, "r+") as f:
+        f[GROUP].attrs["rounding"] = "carried"
+    reason = assert_stopped(run("verify", src, plain), EXIT_FAILED, plain)
+    assert re.fullmatch(
+        rf"doesn't agree with {re.escape(str(src))} \(largest error \S+ of a "
+        r"trace's peak, held to carried rounding's limits\)",
+        reason,
+    )
+
+
 # What decompress, verify and the converters each refuse, as compress refuses its own:
 # which of their two arguments the line names, and a word of its reason. Their
 # failures are the damage table's and the failed write's.
@@ -610,6 +706,7 @@ SAME_CODES = [
     ("verify", "a dataset with the group's name", 1, "not compressed"),
     ("verify", "a text file", 1, "isn't an HDF5 file, so it is not compressed"),
     ("verify", "an unknown setting", 1, "bits must be from 8 to 32"),
+    ("verify", "an unknown rounding", 1, "rounding must be 'nearest' or 'carried'"),
     ("verify", "an original that isn't in the standard layout", 0, "float32"),
     ("verify", "an original that is a text file", 0, "isn't an HDF5 file"),
     ("convert-bbbin", "a file that isn't a BB.bin", 0, "BB.bin file (2000 bytes)"),
@@ -637,6 +734,8 @@ def test_decompress_verify_and_convert_use_the_same_codes(
             f[GROUP].attrs["format_version"] = 2
         elif case == "an unknown setting":
             f[GROUP].attrs["bits"] = 33
+        elif case == "an unknown rounding":
+            f[GROUP].attrs["rounding"] = "other"
     text = tmp_path / "notes.nc"
     text.write_text("station,pga\nS000000,0.12\n")
     if case == "a file that isn't compressed":
