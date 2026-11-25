@@ -182,6 +182,7 @@ def carrying_the_float64_value(trace: np.ndarray, gain: float) -> np.ndarray:
 CARRIED_FAULTS = [
     "a sample three steps off",
     "a drift of 0.002 steps a sample",
+    "a drift of -0.002 steps a sample",
     "a step twice what the setting promises",
     "a doubled gain",
     "a sample of a trace of zeros",
@@ -195,19 +196,20 @@ CARRIED_FAULTS = [
 def test_within_carried_limits_fails(real_traces: RealTraces, fault: str) -> None:
     w = real_traces("bb").copy()
     w[:, 4] = 0.0
-    bits = {"the float64 value carried": 8, "a drift of 0.002 steps a sample": 16}.get(
-        fault, 24
-    )
+    bits = 8 if fault == "the float64 value carried" else 24
+    if "drift" in fault:
+        bits = 16
     back, gains = round_trip(w, bits, "carried")
     assert within_carried_limits(w, back, gains, bits)
     trace, step = w[1, 2].astype(np.float64), 1 / gains[1, 2]
     if fault == "a sample three steps off":
         # At a sample too small for float32 to round the three steps away.
         back[1, 2, np.abs(trace).argmin()] += 3 * step
-    elif fault == "a drift of 0.002 steps a sample":
+    elif "drift" in fault:
         # Only of samples whose error is small, so that each one keeps its own limit.
         error = np.abs(trace - back[1, 2])
-        back[1, 2, error < 0.5 * step] += 0.002 * step
+        drift = -0.002 if "-" in fault else 0.002
+        back[1, 2, error < 0.5 * step] += drift * step
         assert np.abs(trace - back[1, 2]).max() <= max(error.max(), 0.51 * step)
     elif fault == "a step twice what the setting promises":
         # A gain of half the setting's, which the samples were rounded with.
@@ -225,6 +227,38 @@ def test_within_carried_limits_fails(real_traces: RealTraces, fault: str) -> Non
     else:
         back, _ = round_trip(w, 24)
     assert not within_carried_limits(w, back, gains, bits)
+
+
+@pytest.mark.parametrize("sign", [1, -1])
+@pytest.mark.parametrize(
+    ("errors", "gain", "keeps"),
+    [
+        # A step at 24 bits, of a peak of 1, and the spacing of float32 values at it are
+        # both 2 ** -23, within 2e-7 of each. So a sample's limit is 2 steps, and the
+        # running total's 1.
+        pytest.param([0.999, -1.998, 1.998], 1, True, id="both limits, nearly"),
+        pytest.param([0.999, -2.003], 1, False, id="past both"),
+        pytest.param([0.5, 0.505], 1, False, id="half a percent past the total's"),
+        pytest.param([0.5, 0.505, -0.9], 1, False, id="past it, and back"),
+        # With twice the setting's gain, a sample's limit is 1.5 steps, half a step of
+        # its own and the spacing. The total's is still the setting's.
+        pytest.param([0.95, -1.498], 2, True, id="twice the gain, nearly"),
+        pytest.param([0.95, -1.508], 2, False, id="past its own gain's"),
+        # With half the setting's gain, they are the setting's.
+        pytest.param([0.999, -1.998], 0.5, True, id="half the gain, nearly"),
+        pytest.param([0.999, -2.003], 0.5, False, id="past the setting's"),
+    ],
+)
+def test_the_carried_limits(
+    errors: list[float], gain: float, keeps: bool, sign: int
+) -> None:
+    # A trace with a peak of 1, then zeros that decode to the errors, in steps.
+    original = np.zeros((1, 1, 10), np.float32)
+    original[0, 0, 0] = sign
+    decoded = original.copy()
+    decoded[0, 0, 1 : 1 + len(errors)] = -sign * np.array(errors) * 2.0**-23
+    gains = np.full((1, 1), gain * (2.0**23 - 1))
+    assert within_carried_limits(original, decoded, gains, 24) == keeps
 
 
 @pytest.mark.parametrize("bad", [0.0, -2.0, np.inf, -np.inf, np.nan])

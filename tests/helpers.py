@@ -253,7 +253,7 @@ def write_hfbin(
 def hard_traces(nt: int, bits: int = 24) -> dict[str, np.ndarray]:
     """Return the traces most likely to come back wrong, each of nt float32 samples.
 
-    Two of them are made of fractions of a step at `bits`.
+    Some of them are made of fractions of a step at `bits`.
     """
     rng = np.random.default_rng(0)
     walk = np.cumsum(rng.normal(size=nt))
@@ -264,9 +264,13 @@ def hard_traces(nt: int, bits: int = 24) -> dict[str, np.ndarray]:
     peak_first, peak_last = walk.copy(), walk.copy()
     peak_first[0] = -2.0
     peak_last[-1] = 2.0
-    step = 1.0 / (2 ** (bits - 1) - 1)  # Of a trace with a peak of 1.
+    top = 2 ** (bits - 1) - 1
+    step = 1.0 / top  # Of a trace with a peak of 1.
     under_half = np.full(nt, 0.499999 * step)
     under_half[0] = 1.0
+    # A gain of 1, and every other sample halfway between two integers.
+    halves = rng.integers(-100, 100, nt) + 0.5
+    halves[0] = top
     noise = rng.normal(size=nt)
     noise /= np.abs(noise).max()
     # A signal in the first half, then zeros, or its last value, to the end.
@@ -287,6 +291,8 @@ def hard_traces(nt: int, bits: int = 24) -> dict[str, np.ndarray]:
         "1e30 beside 1e-30": np.where(np.arange(nt) % 2 == 0, 1e30, 1e-30),
         "a constant just under half a step": under_half,
         "within 1e-7 of the peak": 1.0 - 1e-7 * rng.random(nt),
+        "within 1e-7 of minus the peak": 1e-7 * rng.random(nt) - 1.0,
+        "halves of a step": halves,
         "noise on one side of zero": np.abs(noise),
         "the peak and minus the peak": np.sign(noise),
         "noise of a few steps": np.where(np.arange(nt) == 0, 1.0, 3 * step * noise),
