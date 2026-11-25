@@ -13,7 +13,7 @@ from waveform_compression_tools.codec import (
 )
 from waveform_compression_tools.errors import Damaged
 
-from helpers import RealTraces, within_one_step_of_the_setting
+from helpers import RealTraces, hard_traces, within_one_step_of_the_setting
 
 # Total FLAC bytes of each set of real traces at each setting, as measured with an
 # independent implementation of this encoder (level 5, float64 gains).
@@ -53,32 +53,6 @@ def random_walks(shape: tuple[int, int, int], seed: int = 0) -> np.ndarray:
     walks = np.cumsum(rng.normal(size=shape), axis=2)
     scales = 10.0 ** rng.uniform(-3, 2, shape[:2])
     return (walks * scales[..., None]).astype(np.float32)
-
-
-def hard_traces(nt: int) -> dict[str, np.ndarray]:
-    """Return the traces most likely to come back wrong, each of nt float32 samples."""
-    rng = np.random.default_rng(0)
-    walk = np.cumsum(rng.normal(size=nt))
-    walk /= np.abs(walk).max()  # A peak of 1.
-    spike = np.zeros(nt)
-    spike[nt // 2] = -7.0
-    # Peaks that no other sample of their trace matches, of either sign.
-    peak_first, peak_last = walk.copy(), walk.copy()
-    peak_first[0] = -2.0
-    peak_last[-1] = 2.0
-    traces = {
-        "all zeros": np.zeros(nt),
-        "a positive constant": np.full(nt, 2.5),
-        "a negative constant": np.full(nt, -3.5),
-        "a single spike": spike,
-        "a peak at the first sample": peak_first,
-        "a peak at the last sample": peak_last,
-        "a peak of 3.4e38": 3.4e38 * walk,
-        "about 1e-39, below float32's normal numbers": 1e-39 * walk,
-        "subnormal multiples of 1.4e-45": rng.integers(-5, 6, nt) * 1.4e-45,
-        "1e30 beside 1e-30": np.where(np.arange(nt) % 2 == 0, 1e30, 1e-30),
-    }
-    return {name: trace.astype(np.float32) for name, trace in traces.items()}
 
 
 @pytest.mark.parametrize("name", REAL_TRACE_FLAC_BYTES)

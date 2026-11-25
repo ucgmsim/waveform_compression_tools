@@ -1,5 +1,6 @@
 """What several test files share: plain functions, where conftest.py has the fixtures."""
 
+import math
 import os
 import struct
 import subprocess
@@ -249,6 +250,52 @@ def write_hfbin(
     return data
 
 
+def hard_traces(nt: int, bits: int = 24) -> dict[str, np.ndarray]:
+    """Return the traces most likely to come back wrong, each of nt float32 samples.
+
+    Two of them are made of fractions of a step at `bits`.
+    """
+    rng = np.random.default_rng(0)
+    walk = np.cumsum(rng.normal(size=nt))
+    walk /= np.abs(walk).max()  # A peak of 1.
+    spike = np.zeros(nt)
+    spike[nt // 2] = -7.0
+    # Peaks that no other sample of their trace matches, of either sign.
+    peak_first, peak_last = walk.copy(), walk.copy()
+    peak_first[0] = -2.0
+    peak_last[-1] = 2.0
+    step = 1.0 / (2 ** (bits - 1) - 1)  # Of a trace with a peak of 1.
+    under_half = np.full(nt, 0.499999 * step)
+    under_half[0] = 1.0
+    noise = rng.normal(size=nt)
+    noise /= np.abs(noise).max()
+    # A signal in the first half, then zeros, or its last value, to the end.
+    then_zeros, then_constant = noise.copy(), noise.copy()
+    then_zeros[nt // 2 :] = 0.0
+    then_constant[nt // 2 :] = then_constant[nt // 2]
+    traces = {
+        "all zeros": np.zeros(nt),
+        "a positive constant": np.full(nt, 2.5),
+        "a negative constant": np.full(nt, -3.5),
+        "a single spike": spike,
+        "a peak at the first sample": peak_first,
+        "a peak at the last sample": peak_last,
+        "a peak of 3.4e38": 3.4e38 * walk,
+        "a peak of float32's largest value": np.finfo(np.float32).max * walk,
+        "about 1e-39, below float32's normal numbers": 1e-39 * walk,
+        "subnormal multiples of 1.4e-45": rng.integers(-5, 6, nt) * 1.4e-45,
+        "1e30 beside 1e-30": np.where(np.arange(nt) % 2 == 0, 1e30, 1e-30),
+        "a constant just under half a step": under_half,
+        "within 1e-7 of the peak": 1.0 - 1e-7 * rng.random(nt),
+        "noise on one side of zero": np.abs(noise),
+        "the peak and minus the peak": np.sign(noise),
+        "noise of a few steps": np.where(np.arange(nt) == 0, 1.0, 3 * step * noise),
+        "noise, then zeros": then_zeros,
+        "noise, then its last value": then_constant,
+    }
+    return {name: trace.astype(np.float32) for name, trace in traces.items()}
+
+
 def partial_of(path: Path) -> Path:
     return Path(f"{path}.partial")
 
@@ -426,3 +473,29 @@ def within_one_step_of_the_setting(
     original = original.astype(np.float64)
     step = np.abs(original).max(axis=2, keepdims=True) / (2 ** (bits - 1) - 1)
     return np.all(np.abs(decoded - original) <= step * (1 + 1e-9), axis=2)
+
+
+def within_carried_limits_of_the_setting(
+    original: np.ndarray, decoded: np.ndarray, bits: int
+) -> np.ndarray:
+    """Say, for each trace, whether carried rounding's two limits hold.
+
+    With the step of the setting, and the spacing of float32 values at the trace's
+    peak, every sample is within their sum, and the running total of the errors within
+    half of it, at every sample. The slack is 1e-8 on the first and 1e-6 on the second,
+    as the README promises. A trace of zeros has to come back as exact zeros.
+    """
+    original = original.astype(np.float64)
+    peak = np.abs(original).max(axis=-1, keepdims=True)
+    spacing = np.zeros_like(peak)
+    for at in np.ndindex(peak.shape):
+        if peak[at] != 0:
+            # The peak is in [2 ** (e - 1), 2 ** e). float32 has 24 significant bits,
+            # and nothing smaller than 2 ** -149.
+            e = math.frexp(peak[at])[1]
+            spacing[at] = 2.0 ** max(e - 24, -149)
+    limit = peak / (2 ** (bits - 1) - 1) + spacing
+    error = original - decoded
+    samples = np.all(np.abs(error) <= limit * (1 + 1e-8), axis=-1)
+    total = np.abs(np.cumsum(error, axis=-1))
+    return samples & np.all(total <= limit / 2 * (1 + 1e-6), axis=-1)
