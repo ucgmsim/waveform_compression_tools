@@ -71,14 +71,14 @@ A file whose stations are all real isn't compressed, so that it stays exact as i
 There is no PyPI release. Install from a release tag, with pip:
 
 ```bash
-pip install "waveform_compression_tools @ git+https://github.com/ucgmsim/waveform_compression_tools@v1.2.0"
+pip install "waveform_compression_tools @ git+https://github.com/ucgmsim/waveform_compression_tools@v1.3.0"
 ```
 
 or with uv:
 
 ```bash
-uv pip install "waveform_compression_tools @ git+https://github.com/ucgmsim/waveform_compression_tools@v1.2.0"
-uv add git+https://github.com/ucgmsim/waveform_compression_tools --tag v1.2.0  # as a dependency of a uv project
+uv pip install "waveform_compression_tools @ git+https://github.com/ucgmsim/waveform_compression_tools@v1.3.0"
+uv add git+https://github.com/ucgmsim/waveform_compression_tools --tag v1.3.0  # as a dependency of a uv project
 ```
 
 It needs Python 3.11 or newer, and git, to fetch the tag. pyflac 3.0.0, which the package pins, is published only as source, so installing it compiles two small extension modules: the machine needs a C compiler and Python's headers. pyflac brings its own libFLAC, so no FLAC library needs to be installed.
@@ -433,7 +433,7 @@ q = decode_flac(stream)  # any FLAC decoder, to int32 samples
 trace = (q.astype(np.float64) / gain + offset).astype(np.float32)
 ```
 
-## Limits in 1.2.0
+## Limits in 1.3.0
 
 - A file that holds an HDF5 group besides its root is refused: xarray reads only the root group, so its compressed file would go without the group.
 - `decompress_file` holds the whole waveform in memory: 4 bytes a sample, and some working space. For a file whose waveform doesn't fit there, `decompress` and `decompress_to` write it to a netCDF file a block at a time, and `open_dataset` reads only the part that is selected (see [Reading a few stations](#reading-a-few-stations)).
