@@ -156,6 +156,14 @@ def test_hard_traces_come_back_within_the_carried_limits(bits: int) -> None:
     assert within_carried_limits(block, back, gains, bits)
 
 
+@pytest.mark.parametrize("bits", [24, 8])
+def test_long_traces_pass_the_carried_check(bits: int) -> None:
+    # What the check adds up along a trace is exact enough for its slack.
+    block = np.stack(list(hard_traces(400_000, bits).values()))[np.newaxis]
+    back, gains = round_trip(block, bits, "carried")
+    assert within_carried_limits(block, back, gains, bits)
+
+
 def test_carried_traces_don_t_depend_on_those_beside_them(
     real_traces: RealTraces,
 ) -> None:

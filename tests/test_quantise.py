@@ -86,11 +86,12 @@ def carried_one_at_a_time(trace: np.ndarray, gain: float, bits: int) -> list[int
 def test_carried_matches_its_definition(bits: int, nt: int) -> None:
     # A sample at a time and a trace at a time, so neither the traces beside one nor
     # the stretches of time that are worked together can matter.
-    traces = np.stack(list(hard_traces(nt, bits).values()))
+    hard = hard_traces(nt, bits)
+    traces = np.stack([*hard.values(), *(-trace for trace in hard.values())])
     gains = gains_of(traces, bits)
     q = quantise_carried(traces, gains, bits)
     assert q.dtype == np.int32 and q.shape == traces.shape
-    for name, trace, gain, row in zip(hard_traces(nt), traces, gains, q, strict=True):
+    for name, trace, gain, row in zip([*hard, *hard], traces, gains, q, strict=True):
         assert row.tolist() == carried_one_at_a_time(trace, gain, bits), name
 
 
